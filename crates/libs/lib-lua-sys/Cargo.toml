@@ -1,0 +1,23 @@
+[package]
+name = "lib-lua-sys"
+version = "0.1.0"
+edition = "2021"
+links = "lua54"
+build = "build.rs"
+categories = ["external-ffi-bindings"]
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = "0.2"
+
+[features]
+lua54 = []
+
+[build-dependencies]
+cc = "1.0"

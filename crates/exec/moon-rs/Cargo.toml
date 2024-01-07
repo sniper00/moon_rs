@@ -1,0 +1,20 @@
+[package]
+name = "moon_rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
+
+[dependencies]
+lib-core = { path = "../../libs/lib-core"}
+lib-lualib-rs = { path = "../../libs/lib-lualib-rs"}
+lib-lua = {package = "lib-lua-sys", path = "../../libs/lib-lua-sys",features = ["lua54"]}
+lib-common = {package= "lib-common-sys", path = "../../libs/lib-common-sys", version = "0.1.0"}
+mimalloc = "0.1.39"
+tokio = { version = "1", features = ["full"] }
+log = "0.4.0"
+env_logger = "0.9.0"
+chrono = { version = "0.4.19", features = ["serde"] }

@@ -1,0 +1,23 @@
+[package]
+name = "lib-core"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lib-lua = {package = "lib-lua-sys", path = "../../libs/lib-lua-sys",features = ["lua54"]}
+lib-common = {package= "lib-common-sys", path = "../../libs/lib-common-sys", version = "0.1.0"}
+tokio = { version = "1", features = ["full"] }
+dashmap = "5.5.3"
+lazy_static = "1.4.0"
+log = "0.4.0"
+env_logger = "0.9.0"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"],default-features = false}
+serde = { version = "1.0", features = ["derive"]}
+serde_json = {version = "1.0"}

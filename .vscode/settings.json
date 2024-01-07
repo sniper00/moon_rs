@@ -1,0 +1,13 @@
+{
+    "files.associations": {
+        "xstring": "cpp",
+        "charconv": "cpp",
+        "yyjson.h": "c",
+        "lualib.h": "c",
+        "lauxlib.h": "c",
+        "winsock2.h": "c",
+        "process.h": "c",
+        "stdio.h": "c",
+        "stdarg.h": "c"
+    }
+}
