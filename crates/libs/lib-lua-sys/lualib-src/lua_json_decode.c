@@ -29,7 +29,7 @@ static const char *l_str2int(const char *s, size_t len, lua_Integer *result) {
         if(!lisdigit(cast_uchar(s[i]))){
             return nullptr;
         }
-        int d = *s - '0';
+        int d = s[i] - '0';
         if (a >= MAXBY10 && (a > MAXBY10 || d > MAXLASTD + neg))  /* overflow? */
             return nullptr;  /* do not accept it (as integer) */
         a = a * 10 + d;

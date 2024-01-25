@@ -444,7 +444,7 @@ fn push_value(state: *mut ffi::lua_State, br: &mut ReadBlock, type_: u8, cookie:
             ffi::lua_pushnil(state);
         },
         TYPE_BOOLEAN => unsafe {
-            ffi::lua_pushboolean(state, if type_ != 0 { 1 } else { 0 });
+            ffi::lua_pushboolean(state, if cookie != 0 { 1 } else { 0 });
         },
         TYPE_NUMBER => {
             if cookie == TYPE_NUMBER_REAL {
