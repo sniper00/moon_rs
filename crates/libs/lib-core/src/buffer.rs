@@ -1,3 +1,5 @@
+use std::fmt;
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Buffer {
@@ -14,6 +16,31 @@ impl Buffer {
     pub fn new() -> Buffer {
         let mut raw = Vec::<u8>::with_capacity(DEFAULT_RESERVE + DEFAULT_HEAD_RESERVE);
         raw.resize(DEFAULT_HEAD_RESERVE, 0);
+        Buffer {
+            data: raw,
+            rpos: DEFAULT_HEAD_RESERVE,
+            head_reserved: DEFAULT_HEAD_RESERVE,
+        }
+    }
+
+    // pub fn from_ptr(ptr: *mut u8, len: usize) -> Buffer {
+    //     let mut raw = Vec::<u8>::with_capacity(len + DEFAULT_HEAD_RESERVE);
+    //     raw.resize(DEFAULT_HEAD_RESERVE, 0);
+    //     unsafe {
+    //         std::ptr::copy_nonoverlapping(ptr, raw.as_mut_ptr().add(DEFAULT_HEAD_RESERVE), len);
+    //         raw.set_len(len + DEFAULT_HEAD_RESERVE);
+    //     }
+    //     Buffer {
+    //         data: raw,
+    //         rpos: DEFAULT_HEAD_RESERVE,
+    //         head_reserved: DEFAULT_HEAD_RESERVE,
+    //     }
+    // }
+
+    pub fn from_bytes(data: &[u8]) -> Buffer {
+        let mut raw = Vec::<u8>::with_capacity(data.len() + DEFAULT_HEAD_RESERVE);
+        raw.resize(DEFAULT_HEAD_RESERVE, 0);
+        raw.extend_from_slice(data);
         Buffer {
             data: raw,
             rpos: DEFAULT_HEAD_RESERVE,
@@ -70,6 +97,17 @@ impl Buffer {
                 self.data.as_mut_ptr().add(self.rpos),
                 len,
             );
+        }
+        true
+    }
+
+    pub fn write_front_byte(&mut self, c: u8) -> bool {
+        if self.rpos == 0 {
+            return false;
+        }
+        self.rpos -= 1;
+        unsafe {
+            *self.data.get_unchecked_mut(self.rpos) = c;
         }
         true
     }
@@ -198,7 +236,11 @@ impl Buffer {
         unsafe { self.data.as_ptr().add(self.rpos) }
     }
 
-    pub fn read_i16(&mut self, pos: usize, le: bool) -> i16 {
+    pub fn read_u8(&self, pos: usize) -> u8 {
+        self.data[self.rpos + pos]
+    }
+
+    pub fn read_i16(&self, pos: usize, le: bool) -> i16 {
         let mut v = 0i16;
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -214,7 +256,7 @@ impl Buffer {
         }
     }
 
-    pub fn read_u16(&mut self, pos: usize, le: bool) -> u16 {
+    pub fn read_u16(&self, pos: usize, le: bool) -> u16 {
         let mut v = 0u16;
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -230,7 +272,7 @@ impl Buffer {
         }
     }
 
-    pub fn read_i32(&mut self, pos: usize, le: bool) -> i32 {
+    pub fn read_i32(&self, pos: usize, le: bool) -> i32 {
         let mut v = 0i32;
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -246,7 +288,7 @@ impl Buffer {
         }
     }
 
-    pub fn read_u32(&mut self, pos: usize, le: bool) -> u32 {
+    pub fn read_u32(&self, pos: usize, le: bool) -> u32 {
         let mut v = 0u32;
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -272,6 +314,10 @@ impl Buffer {
 
     pub fn as_pointer(&mut self) -> *mut Buffer {
         self as *mut Buffer
+    }
+
+    pub fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.as_slice()) }
     }
 }
 
@@ -318,5 +364,11 @@ impl From<String> for Buffer {
 impl Default for Buffer {
     fn default() -> Self {
         Buffer::new()
+    }
+}
+
+impl fmt::Display for Buffer {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }

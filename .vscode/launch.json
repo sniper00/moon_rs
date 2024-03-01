@@ -8,7 +8,7 @@
             "name": "(Macos) Launch",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceRoot}/target/debug/ltask_rs",
+            "program": "${workspaceRoot}/target/debug/moon_rs",
             "args": ["assets/main.lua"],
             "cwd": "${workspaceRoot}",
         },

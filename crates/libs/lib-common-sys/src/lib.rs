@@ -1,13 +1,21 @@
 //! Low level bindings to common.
 
-#[cfg(any(target_os = "windows"))]
+#[cfg(target_os = "windows")]
 pub type DWORD = u32;
-#[cfg(any(target_os = "windows"))]
+#[cfg(target_os = "windows")]
 pub type ConsoleHandlerRoutine = extern "system" fn(DWORD)->i32;
 
-#[cfg(any(target_os = "windows"))]
-extern "C-unwind" {
-    pub fn set_console_title(title: *const i8);
+#[cfg(target_os = "windows")]
+pub fn set_console_title(title: *const i8){
+    extern "system" {
+        fn SetConsoleTitleA(
+            title: *const i8
+        ) -> i32;
+    }
+
+    unsafe{
+        SetConsoleTitleA(title);
+    }
 }
 
 #[cfg(target_os = "windows")]

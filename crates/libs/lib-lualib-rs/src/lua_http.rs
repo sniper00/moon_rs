@@ -1,33 +1,19 @@
+use lib_core::actor::LuaActor;
+use lib_core::buffer::Buffer;
+use lib_core::lua_rawsetfield;
 use lib_lua::{ffi, ffi::luaL_Reg};
 use reqwest::header::HeaderMap;
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
-use std::ffi::c_int;
+use std::error::Error;
 use std::str::FromStr;
-use std::{collections::HashMap, error::Error};
+use std::{collections::HashMap, ffi::c_int};
 
 use lib_core::{
     c_str,
     context::{self, Message, CONTEXT},
-    laux::{self, LuaScopePop},
+    laux::{self, LuaScopePop, LuaValue},
     lreg, lreg_null,
 };
-
-#[derive(Serialize, Deserialize)]
-struct HttpResponse {
-    status_code: u16,
-    version: String,
-    headers: HashMap<String, String>,
-    body: String,
-}
-
-fn header_map_to_hash_map(header_map: &HeaderMap) -> HashMap<String, String> {
-    let mut hash_map = HashMap::new();
-    for (key, value) in header_map.iter() {
-        hash_map.insert(key.to_string(), value.to_str().unwrap_or("").to_string());
-    }
-    hash_map
-}
 
 fn version_to_string(version: &reqwest::Version) -> &str {
     match *version {
@@ -57,14 +43,32 @@ async fn http_request(
         .send()
         .await?;
 
-    let response = HttpResponse {
-        status_code: response.status().as_u16(),
-        version: version_to_string(&response.version()).to_string(),
-        headers: header_map_to_hash_map(response.headers()),
-        body: response.text().await?,
-    };
+    let mut buffer = Buffer::with_head_reserve(256, 4);
+    buffer.write_str(
+        format!(
+            "{} {} {}\r\n",
+            version_to_string(&response.version()),
+            response.status().as_u16(),
+            response.status().canonical_reason().unwrap_or("")
+        )
+        .as_str(),
+    );
 
-    let json_str = serde_json::to_string(&response)?;
+    for (key, value) in response.headers().iter() {
+        buffer.write_str(
+            format!(
+                "{}: {}\r\n",
+                key.to_string().to_lowercase(),
+                value.to_str().unwrap_or("")
+            )
+            .as_str(),
+        );
+    }
+
+    buffer.write_front((buffer.len() as u32).to_le_bytes().as_ref());
+
+    let body = response.bytes().await?;
+    buffer.write_slice(body.as_ref());
 
     if let Some(sender) = CONTEXT.get(id) {
         let _ = sender.send(Message {
@@ -72,7 +76,7 @@ async fn http_request(
             from: 0,
             to: id,
             session,
-            data: Some(Box::new(json_str.into())),
+            data: Some(Box::new(buffer)),
         });
     }
     Ok(())
@@ -83,11 +87,13 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
         ffi::luaL_checktype(state, 1, ffi::LUA_TTABLE);
     }
 
-    let id: i64 = laux::opt_field(state, 1, "id", 0);
-    let session: i64 = laux::opt_field(state, 1, "session", 0);
-    let method: String = laux::opt_field(state, 1, "method", "GET".to_string());
-    let uri: String = laux::opt_field(state, 1, "uri", "".to_string());
-    let content: String = laux::opt_field(state, 1, "content", "".to_string());
+    let method: String = laux::opt_field(state, 1, "method").unwrap_or("GET".to_string());
+    let uri: String = laux::opt_field(state, 1, "uri").unwrap_or_default();
+    let content: String = laux::opt_field(state, 1, "content").unwrap_or_default();
+
+    let actor = LuaActor::from_lua_state(state);
+    let id = actor.id;
+    let session = actor.next_uuid();
 
     let mut headers = HeaderMap::new();
 
@@ -135,11 +141,88 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
         }
     });
 
+    i64::push_lua(state, session);
     1
 }
 
+pub struct ResponseParser;
+
+impl ResponseParser {
+    pub fn parse(sv: &str) -> Result<(String, String, HashMap<String, String>), &'static str> {
+        let mut lines = sv.lines();
+        let line = match lines.next() {
+            Some(line) => line,
+            None => return Err("No input"),
+        };
+
+        let mut parts = line.splitn(3, ' ');
+        let version = match parts.next() {
+            Some(part) => part[5..].to_string(),
+            None => return Err("No version"),
+        };
+
+        let status_code = match parts.next() {
+            Some(part) => part.to_string(),
+            None => return Err("No status code"),
+        };
+
+        let mut header = HashMap::new();
+        for line in lines {
+            let mut parts = line.splitn(2, ':');
+            let key = match parts.next() {
+                Some(part) => part.trim().to_string(),
+                None => continue,
+            };
+
+            let value = match parts.next() {
+                Some(part) => part.trim().to_string(),
+                None => continue,
+            };
+
+            header.insert(key, value);
+        }
+
+        Ok((version, status_code, header))
+    }
+}
+
+extern "C-unwind" fn lua_http_parse_response(state: *mut ffi::lua_State) -> c_int {
+    let raw_response = laux::check_str(state, 1);
+    if let Ok((version, status_code, header)) = ResponseParser::parse(raw_response) {
+        unsafe {
+            ffi::lua_createtable(state, 0, 6);
+            lua_rawsetfield!(state, -3, "version", laux::push_string(state, &version));
+            lua_rawsetfield!(
+                state,
+                -3,
+                "status_code",
+                i32::push_lua(state, i32::from_str(status_code.as_str()).unwrap_or(-2))
+            );
+            ffi::lua_pushliteral(state, "headers");
+            ffi::lua_createtable(state, 0, header.len() as c_int);
+            for (key, value) in header {
+                laux::push_string(state, &key.to_lowercase());
+                laux::push_string(state, &value);
+                ffi::lua_rawset(state, -3);
+            }
+            ffi::lua_rawset(state, -3);
+            1
+        }
+    } else {
+        unsafe {
+            ffi::lua_pushboolean(state, 0);
+            ffi::lua_pushstring(state, c_str!("parse response error"));
+            2
+        }
+    }
+}
+
 pub unsafe extern "C-unwind" fn luaopen_http(state: *mut ffi::lua_State) -> c_int {
-    let l = [lreg!("request", lua_http_request), lreg_null!()];
+    let l = [
+        lreg!("request", lua_http_request),
+        lreg!("parse_response", lua_http_parse_response),
+        lreg_null!(),
+    ];
 
     ffi::lua_createtable(state, 0, l.len() as c_int);
     ffi::luaL_setfuncs(state, l.as_ptr(), 0);

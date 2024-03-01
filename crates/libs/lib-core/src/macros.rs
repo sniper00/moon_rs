@@ -25,3 +25,14 @@ macro_rules! lreg_null {
         }
     };
 }
+
+#[macro_export]
+macro_rules! lua_rawsetfield {
+    ($state:expr, $tbindex:expr, $kname:expr, $valueexp:expr) => {
+        unsafe {
+            ffi::lua_pushliteral($state, $kname);
+            $valueexp;
+            ffi::lua_rawset($state, $tbindex);
+        }
+    };
+}

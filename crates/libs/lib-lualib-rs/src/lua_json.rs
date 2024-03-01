@@ -10,9 +10,9 @@ use lib_core::{
     lreg, lreg_null,
 };
 
-const JSON_NULL: &'static str = "null";
-const JSON_TRUE: &'static str = "true";
-const JSON_FALSE: &'static str = "false";
+const JSON_NULL: &str = "null";
+const JSON_TRUE: &str = "true";
+const JSON_FALSE: &str = "false";
 const CHAR2ESCAPE: [u8; 256] = [
     b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'b', b't', b'n', b'u', b'f', b'r', b'u', b'u',
     b'u', b'u', b'u', b'u', // 0~19
@@ -450,7 +450,7 @@ unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
 
     ffi::lua_pushlightuserdata(state, Box::into_raw(writer) as *mut c_void);
 
-    0
+    1
 }
 
 pub unsafe extern "C-unwind" fn luaopen_json(state: *mut ffi::lua_State) -> c_int {

@@ -1,43 +1,14 @@
+use crate::laux::{LuaState, LuaThread};
+
 use super::context::Message;
 pub use lib_lua as ffi;
 use tokio::sync::mpsc;
-
-#[derive(PartialEq)]
-pub struct LuaState(pub *mut ffi::lua_State);
-
-unsafe impl Send for LuaState {}
-
-impl LuaState {
-    fn new(l: *mut ffi::lua_State) -> Self {
-        LuaState(l)
-    }
-}
-
-impl Drop for LuaState {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.0.is_null() {
-                ffi::lua_close(self.0);
-            }
-        }
-    }
-}
-
-#[derive(PartialEq)]
-pub struct LuaThread(pub *mut ffi::lua_State);
-
-unsafe impl Send for LuaThread {}
-
-impl LuaThread {
-    fn new(l: *mut ffi::lua_State) -> Self {
-        LuaThread(l)
-    }
-}
 
 pub struct LuaActor {
     pub ok: bool,
     pub unique: bool,
     pub id: i64,
+    uuid: i64,
     pub name: String,
     pub tx: mpsc::UnboundedSender<Message>,
     pub rx: mpsc::UnboundedReceiver<Message>,
@@ -55,6 +26,7 @@ impl LuaActor {
             ok: false,
             unique,
             id: 0,
+            uuid: 0,
             name,
             tx,
             rx,
@@ -73,6 +45,11 @@ impl LuaActor {
 
     pub fn from_lua_state(state: *mut ffi::lua_State) -> &'static mut Self {
         get_extra_object::<Self>(state)
+    }
+
+    pub fn next_uuid(&mut self) -> i64 {
+        self.uuid += 1;
+        self.uuid
     }
 }
 

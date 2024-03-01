@@ -67,11 +67,3 @@ typedef _W64 int ssize_t;
 #include <unistd.h>
 #define vsnprintf_ vsnprintf
 #endif
-
-void set_console_title(const char* title)
-{
-    (void)title;
-#if TARGET_PLATFORM == PLATFORM_WINDOWS
-    SetConsoleTitle(title);
-#endif
-}

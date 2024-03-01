@@ -8,10 +8,13 @@ end)
 
 
 moon.async(function()
+    print(moon.hash("md5", "12"))
+
     print("before sleep")
     moon.sleep(1000)
     print("end sleep")
-    print(moon.send("lua", moon.id, {a=1,b=2}))
+    -- send to self
+    moon.send("lua", moon.id, {a=1,b=2})
 
     local workerid = moon.new_service({
         name = "worker",
@@ -20,22 +23,24 @@ moon.async(function()
 
     print(workerid)
 
+    -- send to other actor
+    moon.send("lua", workerid, "test_send", 1, 2)
+
     local bt = moon.clock()
     for i=1,100000 do
         moon.call("lua", workerid, "add", 1, 2)
     end
 
-    print("cost", moon.clock()-bt)
+    print("10w times call cost", moon.clock()-bt)
 
     print(moon.call("lua", workerid, "sub", 1, 2))
 
-    moon.kill(workerid)
-
+    print(moon.call("lua", workerid, "call_then_quit"))
     print(moon.call("lua", workerid, "helloworld"))
 
-    moon.quit()
+    -- print_r(httpc.get("https://www.baidu.com/").status_code)
 
-    -- print_r(httpc.get("https://192.168.1.111"))
+    -- print("retry")
 
     -- local form = { username = "wang", passwd = "456", age = 110 }
     -- print_r(httpc.post_form("http://127.0.0.1:9991/login",form))

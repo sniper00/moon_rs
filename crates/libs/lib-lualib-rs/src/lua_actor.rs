@@ -1,5 +1,8 @@
 use base64::{engine, Engine};
+use lib_core::context::LOGGER;
+use lib_core::log::Logger;
 use lib_lua::{ffi, ffi::luaL_Reg};
+use sha2::digest::DynDigest;
 use std::alloc::{self, Layout};
 // use regex::Regex;
 use std::ffi::{c_char, c_int, c_void, CString};
@@ -11,7 +14,7 @@ use lib_core::{
     actor::LuaActor,
     c_str,
     context::{self, LuaActorParam, Message, CONTEXT},
-    laux::{self, LuaValue},
+    laux::{self, LuaStateRef, LuaValue},
     lreg, lreg_null,
 };
 
@@ -27,12 +30,12 @@ unsafe extern "C-unwind" fn lua_actor_protect_init(state: *mut ffi::lua_State) -
     luaopen_custom_libs(state);
 
     let source = CString::new((*param).source.as_str()).unwrap();
-    if ffi::luaL_loadfile(state, source.as_ptr() as *const c_char) != ffi::LUA_OK {
+    if ffi::luaL_loadfile(state, source.as_ptr()) != ffi::LUA_OK {
         return 1;
     }
 
     let params = CString::new((*param).params.as_str()).unwrap();
-    if ffi::luaL_dostring(state, params.as_ptr() as *const c_char) != ffi::LUA_OK {
+    if ffi::luaL_dostring(state, params.as_ptr()) != ffi::LUA_OK {
         return 1;
     }
 
@@ -72,7 +75,9 @@ unsafe extern "C-unwind" fn allocator(
             actor.mem_limit
         );
         return std::ptr::null_mut();
-    } else if actor.mem > actor.mem_warning {
+    } 
+    
+    if actor.mem > actor.mem_warning {
         actor.mem_warning *= 2;
         log::warn!(
             "Actor id:{:?} name:{:?} memory warning: {:.2}MB",
@@ -129,14 +134,10 @@ pub fn new_actor(params: LuaActorParam) {
                 }
 
                 loop {
-                    let msg = actor.rx.recv().await;
-                    match msg {
-                        Some(msg) => {
-                            handle(&mut actor, msg);
-                        }
-                        None => {
-                            break;
-                        }
+                    if let Some(m) = actor.rx.recv().await {
+                        handle(&mut actor, m);
+                    }else{
+                        break;
                     }
                 }
 
@@ -211,20 +212,6 @@ pub fn init(actor: &mut LuaActor, params: &LuaActorParam) -> Result<(), String> 
     Ok(())
 }
 
-fn response_error(from: i64, to: i64, session: i64, err: String) {
-    if session >= 0 {
-        log::debug!("{}. ({}:{})", err, file!(), line!());
-    } else {
-        CONTEXT.send(Message {
-            ptype: context::PTYPE_ERROR,
-            from,
-            to,
-            session: -session,
-            data: Some(Box::new(err.into_bytes().into())),
-        });
-    }
-}
-
 fn handle(actor: &mut LuaActor, mut m: Message) {
     if !actor.ok {
         return;
@@ -241,7 +228,7 @@ fn handle(actor: &mut LuaActor, mut m: Message) {
         let err = "actor quited";
 
         while let Ok(m) = actor.rx.try_recv() {
-            response_error(m.to, m.from, m.session, err.to_string());
+            CONTEXT.response_error(m.to, m.from, m.session, err.to_string());
         }
         actor.rx.close();
         return;
@@ -259,7 +246,7 @@ fn handle(actor: &mut LuaActor, mut m: Message) {
             ffi::lua_pushlightuserdata(actor.callback_state.0, data.as_ptr() as *mut c_void);
             ffi::lua_pushinteger(actor.callback_state.0, data.len() as ffi::lua_Integer);
         } else {
-            ffi::lua_pushlightuserdata(actor.callback_state.0, std::ptr::null_mut() as *mut c_void);
+            ffi::lua_pushlightuserdata(actor.callback_state.0, std::ptr::null_mut());
             ffi::lua_pushinteger(actor.callback_state.0, 0 as ffi::lua_Integer);
         }
 
@@ -302,7 +289,7 @@ fn handle(actor: &mut LuaActor, mut m: Message) {
         };
 
         ffi::lua_pop(actor.callback_state.0, 1);
-        response_error(m.to, m.from, m.session, err.to_string());
+        CONTEXT.response_error(m.to, m.from, m.session, err.to_string());
     }
 }
 
@@ -323,32 +310,33 @@ pub fn remove_actor(id: i64) -> Result<(), String> {
 }
 
 extern "C-unwind" fn lua_actor_query(state: *mut ffi::lua_State) -> c_int {
-    let name = laux::check_str(state, 1);
-    let addr = CONTEXT.query(name);
-    match addr {
-        Some(addr) => {
-            i64::push_lua(state, *addr.value());
-            1
-        }
-        None => {
-            i64::push_lua(state, 0);
-            1
-        }
+    let lua = LuaStateRef::new(state);
+    let name = lua.get(1);
+
+    if let Some(addr) = CONTEXT.query(name) {
+        lua.push(*addr.value());
+    } else {
+        lua.push(0);
     }
+    1
 }
 
 extern "C-unwind" fn lua_actor_send(state: *mut ffi::lua_State) -> c_int {
-    let ptype = i64::from_lua_check(state, 1) as i8;
+    let lua = LuaStateRef::new(state);
+
+    let ptype = lua.get(1);
     unsafe { ffi::luaL_argcheck(state, (ptype > 0) as i32, 1, c_str!("PTYPE must > 0")) }
 
-    let to: i64 = i64::from_lua_check(state, 2);
+    let to: i64 = lua.get(2);
     unsafe { ffi::luaL_argcheck(state, (to > 0) as i32, 2, c_str!("receiver must > 0")) }
 
-    let session = i64::from_lua_check(state, 3);
+    let data = laux::check_buffer(state, 3);
 
-    let data = laux::check_buffer(state, 4);
+    let actor = LuaActor::from_lua_state(state);
 
-    let from = LuaActor::from_lua_state(state).id;
+    let from = actor.id;
+
+    let session = lua.opt(4).unwrap_or(actor.next_uuid());
 
     if let Some(m) = CONTEXT.send(Message {
         ptype,
@@ -357,7 +345,7 @@ extern "C-unwind" fn lua_actor_send(state: *mut ffi::lua_State) -> c_int {
         session: -session,
         data,
     }) {
-        response_error(
+        CONTEXT.response_error(
             m.to,
             m.from,
             m.session,
@@ -373,41 +361,47 @@ extern "C-unwind" fn lua_actor_send(state: *mut ffi::lua_State) -> c_int {
         );
     }
 
-    0
+    lua.push(session);
+    lua.push(to);
+
+    2
 }
 
 extern "C-unwind" fn lua_kill_actor(state: *mut ffi::lua_State) -> c_int {
-    let who = i64::from_lua_check(state, 1);
+    let lua = LuaStateRef::new(state);
+
+    let who = lua.get(1);
     let res = remove_actor(who);
     match res {
         Ok(_) => {
-            bool::push_lua(state, true);
+            lua.push(true);
             1
         }
         Err(err) => {
-            bool::push_lua(state, false);
-            laux::push_str(state, err.as_str());
+            lua.push(false);
+            lua.push(err);
             2
         }
     }
 }
 
 extern "C-unwind" fn lua_new_actor(state: *mut ffi::lua_State) -> c_int {
-    unsafe {
-        ffi::luaL_checktype(state, 2, ffi::LUA_TTABLE);
-    }
+    let lua = LuaStateRef::new(state);
 
-    let session = i64::from_lua_check(state, 1);
+    lua.checktype(1, ffi::LUA_TTABLE);
 
-    let creator = LuaActor::from_lua_state(state).id;
-    let name: String = laux::opt_field(state, 2, "name", "").to_string();
-    let source = laux::opt_field(state, 2, "source", "").to_string();
-    let memlimit: i64 = laux::opt_field(state, 2, "memlimit", 0);
-    let unique: bool = laux::opt_field(state, 2, "unique", false);
+    let actor = LuaActor::from_lua_state(state);
 
-    let mut params = String::from_lua_check(state, 3);
-    if let Some(p) = CONTEXT.env.get("PATH") {
-        params = p.value().clone() + params.as_str();
+    let creator = actor.id;
+    let session = actor.next_uuid();
+    let name: String = laux::opt_field(state, 1, "name").unwrap_or_default();
+    let source = laux::opt_field(state, 1, "source").unwrap_or_default();
+    let memlimit: i64 = laux::opt_field(state, 1, "memlimit").unwrap_or_default();
+    let unique: bool = laux::opt_field(state, 1, "unique").unwrap_or_default();
+
+    let mut params: String = lua.get(2);
+    if let Some(p) = CONTEXT.get_env("PATH") {
+        params = p.clone() + params.as_str();
     }
 
     new_actor(LuaActorParam {
@@ -420,7 +414,9 @@ extern "C-unwind" fn lua_new_actor(state: *mut ffi::lua_State) -> c_int {
         params,
     });
 
-    0
+    lua.push(session);
+
+    1
 }
 
 unsafe extern "C-unwind" fn lua_actor_callback(state: *mut ffi::lua_State) -> c_int {
@@ -438,7 +434,9 @@ unsafe extern "C-unwind" fn lua_actor_callback(state: *mut ffi::lua_State) -> c_
 }
 
 extern "C-unwind" fn lua_timeout(state: *mut ffi::lua_State) -> c_int {
-    let interval = u64::from_lua_check(state, 1);
+    let lua = LuaStateRef::new(state);
+
+    let interval = lua.get(1);
     let id = LuaActor::from_lua_state(state).id;
     let timer_id = CONTEXT.next_timer_id();
     tokio::spawn(async move {
@@ -455,101 +453,89 @@ extern "C-unwind" fn lua_timeout(state: *mut ffi::lua_State) -> c_int {
         });
     });
 
-    unsafe {
-        ffi::lua_pushinteger(state, timer_id);
-    }
+    lua.push(timer_id);
 
     1
 }
 
-unsafe extern "C-unwind" fn lua_actor_log(state: *mut ffi::lua_State) -> c_int {
-    let log_level = i64::from_lua_check(state, 1);
-    let stack_level = i64::from_lua_check(state, 2);
+extern "C-unwind" fn lua_actor_log(state: *mut ffi::lua_State) -> c_int {
+    let lua = LuaStateRef::new(state);
 
-    let top = ffi::lua_gettop(state);
-    let mut content = String::new();
+    let log_level = lua.get(1);
+    let stack_level: i32 = lua.get(2);
+    let actor = LuaActor::from_lua_state(state);
+
+    let mut content = LOGGER.make_line(true, Logger::u8_to_level(log_level), 256);
+    content.write_str(format!("{:0>8} | ", actor.id).as_str());
+
+    let top = lua.top();
     for i in 3..=top {
-        let mut len: usize = 0;
-        let s = ffi::luaL_tolstring(state, i, &mut len as *mut usize);
         if i > 3 {
-            content.push_str("    ");
+            content.write_str("    ");
         }
-        let sl: &[u8] = slice::from_raw_parts(s as *mut u8, len);
-        content.push_str(std::str::from_utf8_unchecked(sl));
-        ffi::lua_pop(state, 1);
+
+        content.write_slice(lua.to_slice(i));
+        lua.pop(1);
     }
 
     let mut debug: ffi::lua_Debug = unsafe { std::mem::zeroed() };
-    if ffi::lua_getstack(state, stack_level as c_int, &mut debug) != 0
-        && ffi::lua_getinfo(state, c_str!("Sl"), &mut debug) != 0
-    {
-        content.push_str("    ");
-        content.push('(');
+    if unsafe {
+        ffi::lua_getstack(state, stack_level as c_int, &mut debug) != 0
+            && ffi::lua_getinfo(state, c_str!("Sl"), &mut debug) != 0
+    } {
+        content.write_str("    ");
+        content.write(b'(');
         if debug.srclen > 1 {
-            let sl = slice::from_raw_parts(debug.source as *mut u8, debug.srclen);
-            content.push_str(std::str::from_utf8_unchecked(sl));
+            let file_name_and_line_no = unsafe {
+                slice::from_raw_parts(debug.source as *mut u8, debug.srclen)
+            };
+            content.write_slice(file_name_and_line_no);
         }
-        content.push(':');
-        content.push_str(debug.currentline.to_string().as_str());
-        content.push(')');
+        content.write(b':');
+        content.write_str(debug.currentline.to_string().as_str());
+        content.write(b')');
     }
 
-    let actor = LuaActor::from_lua_state(state);
+    LOGGER.write(content);
 
-    match log_level {
-        1 => {
-            log::error!("{:0>8} | {}", actor.id, content);
-        }
-        2 => {
-            log::warn!("{:0>8} | {}", actor.id, content);
-        }
-        3 => {
-            log::info!("{:0>8} | {}", actor.id, content);
-        }
-        4 => {
-            log::debug!("{:0>8} | {}", actor.id, content);
-        }
-        5 => {
-            log::trace!("{:0>8}| {}", actor.id, content);
-        }
-        _ => {
-            log::info!("{:0>8} | {}", actor.id, content);
-        }
-    }
     0
 }
 
 extern "C-unwind" fn lua_actor_exit(state: *mut ffi::lua_State) -> c_int {
-    let exit_code = u32::from_lua_check(state, 1);
+    let lua = LuaStateRef::new(state);
+    let exit_code = lua.get(1);
     CONTEXT.shutdown(exit_code);
     0
 }
 
 extern "C-unwind" fn num_cpus(state: *mut ffi::lua_State) -> c_int {
-    usize::push_lua(state, num_cpus::get());
+    let lua = LuaStateRef::new(state);
+    lua.push(num_cpus::get());
     1
 }
 
 extern "C-unwind" fn env(state: *mut ffi::lua_State) -> c_int {
-    if unsafe { ffi::lua_gettop(state) == 2 } {
-        let key = laux::check_str(state, 1);
-        let value = laux::check_str(state, 2);
+    let lua = LuaStateRef::new(state);
+
+    if lua.top() == 2 {
+        let key = lua.get(1);
+        let value = lua.get(2);
         CONTEXT.set_env(key, value);
         0
     } else {
-        let key = laux::check_str(state, 1);
-        match CONTEXT.get_env(key) {
-            Some(value) => {
-                laux::push_str(state, &value);
-                1
-            }
-            None => 0,
+        let key = lua.get( 1);
+        if let Some(value) = CONTEXT.get_env(key) {
+            lua.push(value);
+            1
+        } else {
+            0
         }
     }
 }
 
 extern "C-unwind" fn clock(state: *mut ffi::lua_State) -> c_int {
-    f64::push_lua(state, CONTEXT.clock());
+    let lua = LuaStateRef::new(state);
+    lua.push(CONTEXT.clock());
     1
 }
 
@@ -577,43 +563,37 @@ fn get_message_pointer(state: *mut ffi::lua_State) -> &'static mut Message {
 }
 
 extern "C-unwind" fn lua_message_decode(state: *mut ffi::lua_State) -> c_int {
+    let lua = LuaStateRef::new(state);
+
     let m = get_message_pointer(state);
     let opt = laux::check_str(state, 2);
     let top = unsafe { ffi::lua_gettop(state) };
     for c in opt.chars() {
         match c {
             'T' => {
-                i64::push_lua(state, m.ptype as i64);
+                lua.push(m.ptype);
             }
             'S' => {
-                i64::push_lua(state, m.from);
+                lua.push(m.from);
             }
             'R' => {
-                i64::push_lua(state, m.to);
+                lua.push(m.to);
             }
             'E' => {
-                i64::push_lua(state, m.session);
+                lua.push(m.session);
             }
             'Z' => {
                 if let Some(data) = &m.data {
-                    unsafe {
-                        ffi::lua_pushlstring(state, data.as_ptr() as *const i8, data.len());
-                    }
+                    lua.push(data.as_slice());
                 } else {
-                    unsafe {
-                        ffi::lua_pushnil(state);
-                    }
+                    lua.push_nil();
                 }
             }
             'N' => {
                 if let Some(data) = &m.data {
-                    unsafe {
-                        ffi::lua_pushinteger(state, data.len() as i64);
-                    }
+                    lua.push(data.len());
                 } else {
-                    unsafe {
-                        ffi::lua_pushinteger(state, 0);
-                    }
+                    lua.push(0);
                 }
             }
             'B' => {
@@ -625,9 +605,7 @@ extern "C-unwind" fn lua_message_decode(state: *mut ffi::lua_State) -> c_int {
                         );
                     }
                 } else {
-                    unsafe {
-                        ffi::lua_pushnil(state);
-                    }
+                    lua.push_nil();
                 }
             }
             'C' => {
@@ -651,6 +629,57 @@ extern "C-unwind" fn lua_message_decode(state: *mut ffi::lua_State) -> c_int {
     unsafe { ffi::lua_gettop(state) - top }
 }
 
+extern "C-unwind" fn next_uuid(state: *mut ffi::lua_State) -> c_int {
+    let lua = LuaStateRef::new(state);
+    lua.push(LuaActor::from_lua_state(state).next_uuid());
+    1
+}
+
+// Dynamic hash function
+fn use_hasher(hasher: &mut dyn DynDigest, data: &[u8]) -> Box<[u8]> {
+    hasher.update(data);
+    hasher.finalize_reset()
+}
+
+// You can use something like this when parsing user input, CLI arguments, etc.
+// DynDigest needs to be boxed here, since function return should be sized.
+fn select_hasher(s: &str) -> Option<Box<dyn DynDigest>> {
+    match s {
+        "md5" => Some(Box::<md5::Md5>::default()),
+        "sha1" => Some(Box::<sha1::Sha1>::default()),
+        "sha224" => Some(Box::<sha2::Sha224>::default()),
+        "sha256" => Some(Box::<sha2::Sha256>::default()),
+        "sha384" => Some(Box::<sha2::Sha384>::default()),
+        "sha512" => Some(Box::<sha2::Sha512>::default()),
+        _ => None,
+    }
+}
+
+fn to_hex_string(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        use std::fmt::Write;
+        write!(&mut s, "{:02x}", byte).expect("Writing to a String cannot fail");
+    }
+    s
+}
+
+extern "C-unwind" fn hash(state: *mut ffi::lua_State) -> c_int {
+    let hasher_type = laux::check_str(state, 1);
+    let data = laux::check_slice(state, 2);
+    if let Some(mut hasher) = select_hasher(hasher_type) {
+        let res = use_hasher(&mut *hasher, data);
+        laux::push_str(state, &to_hex_string(res.as_ref()));
+        return 1;
+    }
+
+    laux::push_str(
+        state,
+        format!("unsupported hasher {}", hasher_type).as_str(),
+    );
+    unsafe { ffi::lua_error(state) };
+}
+
 unsafe extern "C-unwind" fn luaopen_core(state: *mut ffi::lua_State) -> c_int {
     let l = [
         lreg!("new_service", lua_new_actor),
@@ -667,6 +696,8 @@ unsafe extern "C-unwind" fn luaopen_core(state: *mut ffi::lua_State) -> c_int {
         lreg!("env", env),
         lreg!("clock", clock),
         lreg!("tostring", tostring),
+        lreg!("next_uuid", next_uuid),
+        lreg!("hash", hash),
         lreg_null!(),
     ];
 

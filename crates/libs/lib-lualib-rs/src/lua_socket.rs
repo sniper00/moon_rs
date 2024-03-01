@@ -17,7 +17,7 @@ use lib_core::{
     actor::LuaActor,
     c_str,
     context::{self, Message, NetChannel, NetOp, CONTEXT},
-    laux::{self, LuaValue},
+    laux::{self, LuaStateRef},
     lreg, lreg_null,
 };
 
@@ -223,7 +223,7 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
     };
 }
 
-fn listen(addr: String) -> Result<i64> {
+fn listen(addr: &str) -> Result<i64> {
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(listener)?;
@@ -258,25 +258,28 @@ fn listen(addr: String) -> Result<i64> {
 }
 
 extern "C-unwind" fn lua_socket_listen(state: *mut ffi::lua_State) -> c_int {
-    let addr = String::from_lua_check(state, 1);
+    let lua = LuaStateRef::new(state);
+    let addr: &str = lua.get(1);
     match listen(addr) {
-        Ok(fd) => unsafe {
-            ffi::lua_pushinteger(state, fd);
+        Ok(fd) => {
+            lua.push(fd);
             1
-        },
+        }
         Err(err) => {
-            bool::push_lua(state, false);
-            laux::push_str(state, format!("socket_listen error: {}", err).as_str());
+            lua.push(false);
+            lua.push(format!("socket_listen error: {}", err));
             2
         }
     }
 }
 
 extern "C-unwind" fn lua_socket_accept(state: *mut ffi::lua_State) -> c_int {
-    let fd = i64::from_lua_check(state, 1);
-    let session = i64::from_lua_check(state, 2);
+    let lua = LuaStateRef::new(state);
 
-    let owner = LuaActor::from_lua_state(state).id;
+    let fd = lua.get(1);
+    let actor = LuaActor::from_lua_state(state);
+    let owner = actor.id;
+    let session = actor.next_uuid();
 
     if let Some(channel) = CONTEXT.net.get(&fd) {
         match channel.value().0.try_send(NetOp::Accept(owner, session)) {
@@ -296,66 +299,43 @@ extern "C-unwind" fn lua_socket_accept(state: *mut ffi::lua_State) -> c_int {
             format!("socket_accept error: fd not found: {}", fd).into_bytes(),
         );
     }
-    0
+    lua.push(session);
+    1
 }
 
 extern "C-unwind" fn lua_socket_read(state: *mut ffi::lua_State) -> c_int {
-    let fd = i64::from_lua_check(state, 1);
-    let session = i64::from_lua_check(state, 2);
-    let ltype = unsafe { ffi::lua_type(state, 3) };
-    let max_size;
-    let mut delim_len = 0;
-    let mut delim_pointer = std::ptr::null();
-    let read_timeout;
-    if ltype == ffi::LUA_TNUMBER {
-        max_size = usize::from_lua_check(state, 3);
-        read_timeout = u64::from_lua_opt(state, 4, 0);
-    } else {
-        unsafe {
-            delim_pointer = ffi::luaL_checklstring(state, 3, &mut delim_len);
-            if delim_len == 0 {
-                ffi::luaL_error(state, c_str!("socket_read error: delim is empty"));
-            }
-        }
-        max_size = usize::from_lua_opt(state, 4, 0xFFFFFFFF);
-        read_timeout = u64::from_lua_opt(state, 5, 0);
-    }
+    let lua = LuaStateRef::new(state);
+
+    let fd = lua.get(1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
+    let session = actor.next_uuid();
+
+    let op = if lua.ltype(2) == ffi::LUA_TNUMBER {
+        let max_size = lua.get(2);
+        let read_timeout = lua.opt(3).unwrap_or(0);
+
+        NetOp::ReadBytes(owner, session, max_size, read_timeout)
+    } else {
+        let delim = lua.check_slice(2);
+        if delim.is_empty() {
+            lua.error("socket_read error: delim is empty");
+        }
+
+        let max_size = lua.opt(3).unwrap_or(0xFFFFFFFF);
+        let read_timeout = lua.opt(4).unwrap_or(0);
+
+        NetOp::ReadUntil(owner, session, max_size, delim.to_vec(), read_timeout)
+    };
 
     if let Some(channel) = CONTEXT.net.get(&fd) {
-        if ltype == ffi::LUA_TNUMBER {
-            if let Err(err) =
-                channel
-                    .value()
-                    .0
-                    .try_send(NetOp::ReadBytes(owner, session, max_size, read_timeout))
-            {
-                response_error(
-                    owner,
-                    session,
-                    format!("socket_read channel send error: {}", err).into_bytes(),
-                );
-            }
-        } else {
-            let delim = unsafe {
-                let slice = std::slice::from_raw_parts(delim_pointer as *const u8, delim_len);
-                slice.to_vec()
-            };
-            if let Err(err) = channel.value().0.try_send(NetOp::ReadUntil(
+        if let Err(err) = channel.value().0.try_send(op) {
+            response_error(
                 owner,
                 session,
-                max_size,
-                delim,
-                read_timeout,
-            )) {
-                response_error(
-                    owner,
-                    session,
-                    format!("socket_read channel send error: {}", err).into_bytes(),
-                );
-            }
+                format!("socket_read channel send error: {}", err).into_bytes(),
+            );
         }
     } else {
         response_error(
@@ -365,16 +345,18 @@ extern "C-unwind" fn lua_socket_read(state: *mut ffi::lua_State) -> c_int {
         );
     }
 
-    0
+    lua.push(session);
+
+    1
 }
 
 extern "C-unwind" fn lua_socket_write(state: *mut ffi::lua_State) -> c_int {
+    let lua = LuaStateRef::new(state);
     let actor = LuaActor::from_lua_state(state);
-    let fd = i64::from_lua_check(state, 1);
 
+    let fd = lua.get(1);
     let data = laux::check_buffer(state, 2);
-
-    let close = bool::from_lua_opt(state, 3, false);
+    let close = lua.opt(3).unwrap_or_default();
 
     if let Some(channel) = CONTEXT.net.get(&fd) {
         match channel
@@ -383,33 +365,30 @@ extern "C-unwind" fn lua_socket_write(state: *mut ffi::lua_State) -> c_int {
             .try_send(NetOp::Write(actor.id, data.unwrap(), close))
         {
             Ok(_) => {
-                bool::push_lua(state, true);
+                lua.push(true);
                 return 1;
             }
             Err(err) => {
-                bool::push_lua(state, false);
-                laux::push_str(
-                    state,
-                    format!("socket_write channel send error: {}", err).as_str(),
-                );
+                lua.push(false);
+                lua.push(format!("socket_write channel send error: {}", err));
             }
         }
     } else {
-        bool::push_lua(state, false);
-        laux::push_str(
-            state,
-            format!("socket_write error: fd not found: {}", fd).as_str(),
-        );
+        lua.push(false);
+        lua.push(format!("socket_write error: fd not found: {}", fd));
     }
     2
 }
 
 extern "C-unwind" fn lua_socket_connect(state: *mut ffi::lua_State) -> c_int {
-    let session = unsafe { ffi::luaL_checkinteger(state, 1) };
-    let addr = laux::check_str(state, 2);
-    let connect_timeout = unsafe { ffi::luaL_optinteger(state, 3, 5000) } as u64;
+    let lua = LuaStateRef::new(state);
 
-    let owner = LuaActor::from_lua_state(state).id;
+    let addr: &str = lua.get(1);
+    let connect_timeout: u64 = lua.opt(2).unwrap_or(5000);
+
+    let actor = LuaActor::from_lua_state(state);
+    let owner = actor.id;
+    let session = actor.next_uuid();
 
     tokio::spawn(async move {
         match timeout(
@@ -440,17 +419,22 @@ extern "C-unwind" fn lua_socket_connect(state: *mut ffi::lua_State) -> c_int {
         }
     });
 
-    0
+    lua.push(session);
+
+    1
 }
 
 extern "C-unwind" fn lua_socket_close(state: *mut ffi::lua_State) -> c_int {
-    let fd = unsafe { ffi::luaL_checkinteger(state, 1) };
+    let lua = LuaStateRef::new(state);
+
+    let fd = lua.get(1);
+
     if let Some(channel) = CONTEXT.net.get(&fd) {
         match channel.value().1.try_send(NetOp::Close()) {
-            Ok(_) => unsafe {
-                ffi::lua_pushboolean(state, 1);
+            Ok(_) => {
+                lua.push(true);
                 return 1;
-            },
+            }
             Err(_) => {
                 return 0;
             }

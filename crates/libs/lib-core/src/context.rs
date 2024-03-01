@@ -2,12 +2,12 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use reqwest::ClientBuilder;
 use std::{
-    sync::atomic::{AtomicI64, AtomicU32, Ordering},
+    sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
-use super::{actor::LuaActor, buffer::Buffer};
+use super::{actor::LuaActor, buffer::Buffer, log::Logger};
 
 pub const PTYPE_SYSTEM: i8 = 1;
 pub const PTYPE_TEXT: i8 = 2;
@@ -54,15 +54,16 @@ lazy_static! {
             timer_uuid: AtomicI64::new(1),
             net_uuid: AtomicI64::new(1),
             actor_counter: AtomicU32::new(0),
-            exit_code: AtomicU32::new(u32::MAX),
+            exit_code: AtomicI32::new(i32::MAX),
             actors: DashMap::new(),
             unique_actors: DashMap::new(),
             clock: Instant::now(),
-            http_client: client_builder.build().unwrap_or(reqwest::Client::new()),
+            http_client: client_builder.build().unwrap_or_default(),
             env: DashMap::new(),
             net: DashMap::new(),
         }
     };
+    pub static ref LOGGER: Logger = Logger::new();
 }
 
 pub struct LuaActorServer {
@@ -70,12 +71,12 @@ pub struct LuaActorServer {
     timer_uuid: AtomicI64,
     net_uuid: AtomicI64,
     actor_counter: AtomicU32,
-    exit_code: AtomicU32,
+    exit_code: AtomicI32,
     actors: DashMap<i64, mpsc::UnboundedSender<Message>>,
     unique_actors: DashMap<String, i64>,
     clock: Instant,
     pub http_client: reqwest::Client,
-    pub env: DashMap<String, String>,
+    env: DashMap<String, String>,
     pub net: DashMap<i64, NetChannel>,
 }
 
@@ -115,6 +116,21 @@ impl LuaActorServer {
             self.unique_actors.remove(&id.to_string());
         }
         self.actor_counter.fetch_sub(1, Ordering::AcqRel);
+
+        //notify actor exit to unique actor and bootstrap actor
+        self.unique_actors.iter().for_each(|v| {
+            self.send(Message {
+                ptype: PTYPE_SYSTEM,
+                from: id,
+                to: *v.value(),
+                session: 0,
+                data: Some(Box::new(
+                    format!("_service_exit,Actor id:{} quited", id)
+                        .into_bytes()
+                        .into(),
+                )),
+            });
+        });
     }
 
     pub fn set_env(&self, key: &str, value: &str) {
@@ -122,10 +138,11 @@ impl LuaActorServer {
     }
 
     pub fn get_env(&self, key: &str) -> Option<String> {
+        //mark
         self.env.get(key).map(|v| v.value().clone())
     }
 
-    pub fn exit_code(&self) -> u32 {
+    pub fn exit_code(&self) -> i32 {
         self.exit_code.load(Ordering::Acquire)
     }
 
@@ -133,8 +150,13 @@ impl LuaActorServer {
         self.actor_counter.load(Ordering::Acquire) == 0
     }
 
-    pub fn shutdown(&self, exit_code: u32) {
-        if self.exit_code.load(Ordering::Acquire) != u32::MAX {
+    pub fn shutdown(&self, exit_code: i32) {
+        if self.exit_code.compare_exchange(
+            i32::MAX,
+            exit_code,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_err() {
             return;
         }
 
@@ -186,6 +208,20 @@ impl LuaActorServer {
 
     pub fn clock(&self) -> f64 {
         self.clock.elapsed().as_secs_f64()
+    }
+
+    pub fn response_error(&self, from: i64, to: i64, session: i64, err: String) {
+        if session >= 0 {
+            log::debug!("{}. ({}:{})", err, file!(), line!());
+        } else {
+            self.send(Message {
+                ptype: PTYPE_ERROR,
+                from,
+                to,
+                session: -session,
+                data: Some(Box::new(err.into_bytes().into())),
+            });
+        }
     }
 }
 

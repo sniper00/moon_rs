@@ -120,7 +120,6 @@ setmetatable(
     }
 )
 
-local uuid = 0
 local session_id_coroutine = {}
 local protocol = {}
 local session_watcher = {}
@@ -136,54 +135,6 @@ local function coresume(co, ...)
     return ok, err
 end
 
-local make_session
-
-local function make_session_check_rewind(receiver)
-    uuid = uuid + 1
-    if uuid > 0x7FFFFFFF then uuid = 1 end
-
-    if nil ~= session_id_coroutine[uuid] then
-        while true do
-            uuid = uuid + 1
-            if uuid > 0x7FFFFFFF then uuid = math.random(1, 1000) end
-            if nil == session_id_coroutine[uuid] then
-                break
-            end
-        end
-    end
-
-    if receiver then
-        session_watcher[uuid] = receiver
-    end
-
-    session_id_coroutine[uuid] = co_running()
-    return uuid
-end
-
---- 给当前协程映射一个session id, 用于稍后`resume`关联的协程。
---- 可选参数`receiver`用于`moon.call`在接收消息的服务退出时，`resume`关联的协程并附带错误信息。
----@param receiver? integer @ receiver's service id
----@return integer @ session id
-function make_session(receiver)
-    uuid = uuid + 1
-    if uuid > 0x7FFFFFFF then
-        uuid = 0
-        make_session = make_session_check_rewind
-        return make_session(receiver)
-    end
-
-    if receiver then
-        session_watcher[uuid] = receiver
-    end
-
-    session_id_coroutine[uuid] = co_running()
-    return uuid
-end
-
-function moon.make_session(receiver)
-    return make_session(receiver)
-end
-
 ---
 ---向指定服务发送消息,消息内容会根据`PTYPE`类型调用对应的`pack`函数。
 ---@param PTYPE string @protocol type. e. "lua"
@@ -193,7 +144,7 @@ function moon.send(PTYPE, receiver, ...)
     if not p then
         error(string.format("moon send unknown PTYPE[%s] message", PTYPE))
     end
-    _send(p.PTYPE, receiver, 0, p.pack(...))
+    _send(p.PTYPE, receiver, p.pack(...), 0)
 end
 
 ---向指定服务发送消息, 不会调用对应的`pack`函数。
@@ -207,7 +158,7 @@ function moon.raw_send(PTYPE, receiver, data, sessionid)
         error(string.format("moon send unknown PTYPE[%s] message", PTYPE))
     end
     sessionid = sessionid or 0
-    _send(p.PTYPE, receiver, sessionid, data)
+    _send(p.PTYPE, receiver, data, sessionid)
 end
 
 ---@class service_params
@@ -220,9 +171,7 @@ end
 ---@param params service_params @创建服务的配置, 除了基本配置, 也可以用来传递额外的参数到新创建的服务中。
 ---@return integer @ 返回创建的服务ID, 如果ID为0则表示服务创建失败。
 function moon.new_service(params)
-    local sessionid = make_session()
-    _newservice(sessionid, params, "return " .. print_r(params, true))
-    return moon.wait(sessionid)
+    return moon.wait(_newservice(params, "return " .. print_r(params, true)))
 end
 
 --- 使当前服务退出
@@ -329,7 +278,15 @@ end
 
 --- 使一个协程挂起
 ---@param session? integer @用于wakeup取消映射的协程
-function moon.wait(session)
+---@param receiver? integer @ receiver's service id
+function moon.wait(session, receiver)
+    if session then
+        session_id_coroutine[session] = co_running()
+        if receiver then
+            session_watcher[session] = receiver
+        end
+    end
+
     local a, b, c = co_yield()
     if a then
         -- sz,len,PTYPE
@@ -369,13 +326,13 @@ end
 
 ------------------------------------------
 
----获取指定线程中所有的服务name和id, json格式
----@return string
-function moon.scan_services(workerid)
-    local sessionid = make_session()
-    _scan_services(workerid, sessionid)
-    return moon.wait(sessionid)
-end
+-- ---获取指定线程中所有的服务name和id, json格式
+-- ---@return string
+-- function moon.scan_services(workerid)
+--     local sessionid = make_session()
+--     _scan_services(workerid, sessionid)
+--     return moon.wait(sessionid)
+-- end
 
 --- 向目标服务发送消息, 然后等待返回值, 接收方必须调用`moon.response`返回结果
 ---  - 如果请求成功, 返回值为`moon.response(id, response, params...)`中`params`部分。
@@ -395,9 +352,7 @@ function moon.call(PTYPE, receiver, ...)
         error("moon call receiver == 0")
     end
 
-    local sessionid = make_session(receiver)
-    _send(p.PTYPE, receiver, sessionid, p.pack(...))
-    return moon.wait(sessionid)
+    return moon.wait(_send(p.PTYPE, receiver, p.pack(...)))
 end
 
 --- 用来响应moon.call的请求
@@ -415,7 +370,7 @@ function moon.response(PTYPE, receiver, sessionid, ...)
         error("moon response receiver == 0")
     end
 
-    _send(p.PTYPE, receiver, sessionid, p.pack(...))
+    _send(p.PTYPE, receiver, p.pack(...), sessionid)
 end
 
 ------------------------------------
@@ -609,9 +564,8 @@ reg_protocol {
         if cb_shutdown then
             cb_shutdown()
         else
-            local name = moon.name
-            --- bootstrap or not unique service
-            if name == "bootstrap" or 0 == moon.queryservice(moon.name) then
+            --- bootstrap or not unique service will quit immediately
+            if moon.name == "bootstrap" or 0 == moon.queryservice(moon.name) then
                 moon.quit()
             end
         end
@@ -713,6 +667,15 @@ reg_protocol {
         else
             moon.response("debug", sender, session, "unknow debug cmd " .. cmd)
         end
+    end
+}
+
+reg_protocol {
+    name = "httpc",
+    PTYPE = moon.PTYPE_HTTP,
+    unpack = moon.tostring,
+    dispatch = function(sender, session, cmd, ...)
+        error("PTYPE_HTTP dispatch not implemented")
     end
 }
 

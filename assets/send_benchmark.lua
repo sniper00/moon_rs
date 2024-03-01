@@ -19,7 +19,6 @@ if conf.recever then
         end
     end)
 
-
     -- moon.shutdown(function ()
     --     moon.quit()
     -- end)
@@ -34,7 +33,7 @@ local counter = 0
 local times = 100
 
 local nreceiver = 16
-local ncount = 100
+local ncount = 1000
 
 local avg = 0
 

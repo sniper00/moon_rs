@@ -611,7 +611,7 @@ unsafe extern "C-unwind" fn peek_one(state: *mut ffi::lua_State) -> c_int {
         ffi::luaL_argerror(state, 1, c_str!("peek_one need lightuserdata"));
     }
 
-    let seek = bool::from_lua_opt(state, 2, false);
+    let seek = bool::from_lua_opt(state, 2).unwrap_or(false);
 
     let buf = unsafe { ffi::lua_touserdata(state, 1) as *mut Buffer };
     if buf.is_null() {
