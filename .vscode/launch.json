@@ -9,7 +9,7 @@
             "type": "lldb",
             "request": "launch",
             "program": "${workspaceRoot}/target/debug/moon_rs",
-            "args": ["assets/main.lua"],
+            "args": ["assets/test_json.lua"],
             "cwd": "${workspaceRoot}",
         },
         {

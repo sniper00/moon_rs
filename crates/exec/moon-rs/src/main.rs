@@ -1,21 +1,22 @@
-use lib_core::laux::{LuaState, LuaValue};
-use lib_core::{c_str, laux};
+use lib_core::{
+    c_str, context,
+    context::{LuaActorParam, CONTEXT, LOGGER},
+    error::Error,
+    laux::{self, LuaState},
+};
+use lib_lua::ffi;
+use lib_lualib_rs::lua_actor;
 use mimalloc::MiMalloc;
+use std::{
+    env,
+    ffi::CString,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-
-use lib_lua::ffi;
-
-use std::error::Error;
-use std::ffi::CString;
-use std::path::PathBuf;
-use std::time::Duration;
-use std::{env, fs};
-use std::{fmt, path::Path};
-
-use lib_core::context::{LuaActorParam, CONTEXT, LOGGER};
-use lib_lualib_rs::lua_actor;
 
 fn print_usage() {
     println!("Usage:");
@@ -23,17 +24,6 @@ fn print_usage() {
     println!("Examples:");
     println!("    moon_rs main.lua hello\n");
 }
-
-#[derive(Debug)]
-struct ReturnError(String);
-
-impl fmt::Display for ReturnError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "There is an error: {}", self.0)
-    }
-}
-
-impl Error for ReturnError {}
 
 fn setup_signal() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -99,27 +89,24 @@ fn setup_signal() {
 
         lib_common::set_concole_ctrl_handler(console_ctrl_handler);
         let args: Vec<String> = env::args().collect();
-        let mut str = String::new();
+        let mut title = String::new();
         for (i, arg) in args.iter().enumerate() {
-            str.push_str(arg.as_str());
+            title.push_str(arg.as_str());
             if i == 0 {
-                str.push_str("(PID: ");
-                str.push_str(&std::process::id().to_string());
-                str.push(')');
+                title.push_str("(PID: ");
+                title.push_str(&std::process::id().to_string());
+                title.push(')');
             }
-            str.push(' ');
+            title.push(' ');
         }
-        let cstr = std::ffi::CString::new(str).expect("CString::new failed");
+
+        let cstr = std::ffi::CString::new(title).expect("CString::new failed");
         lib_common::set_console_title(cstr.as_ptr());
     }
 }
 
-fn make_error(error: String) -> Result<(), Box<dyn Error>> {
-    Err(Box::new(ReturnError(error)))
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_signal();
 
     unsafe {
@@ -134,19 +121,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut argn = 1;
     if args.len() <= argn {
         print_usage();
-        return make_error("invalid arguments".to_string());
+        return Error::from_string("invalid arguments".to_string());
     }
 
     let mut bootstrap = args[argn].clone();
     let path = Path::new(&bootstrap);
     if !path.is_file() {
         print_usage();
-        return make_error(format!("bootstrap file not found: {}", bootstrap));
+        return Error::from_string(format!("bootstrap file not found: {}", bootstrap));
     }
 
     if path.extension().and_then(std::ffi::OsStr::to_str) != Some("lua") {
         print_usage();
-        return make_error(format!("bootstrap is not a lua file: {}", bootstrap));
+        return Error::from_string(format!("bootstrap is not a lua file: {}", bootstrap));
     }
 
     argn += 1;
@@ -174,26 +161,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if ffi::LUA_OK
                 != ffi::luaL_loadfile(lua_state, CString::new(bootstrap.as_str())?.as_ptr())
             {
-                return make_error(format!(
+                return Error::from_string(format!(
                     "loadfile {}",
-                    String::from_lua_opt(lua_state, -1).unwrap_or("unknown error".to_string())
+                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string())
                 ));
             }
 
             if ffi::LUA_OK != ffi::luaL_dostring(lua_state, CString::new(arg.as_str())?.as_ptr()) {
-                return make_error(
-                    String::from_lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
+                return Error::from_string(
+                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
                 );
             }
 
             if ffi::LUA_OK != ffi::lua_pcall(lua_state, 1, 1, 1) {
-                return make_error(
-                    String::from_lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
+                return Error::from_string(
+                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
                 );
             }
 
             if ffi::LUA_TTABLE != ffi::lua_type(lua_state, -1) {
-                return make_error("init code must return a table".to_string());
+                return Error::from_string("init code must return a table".to_string());
             }
 
             logfile = laux::opt_field(lua_state, -1, "logfile");
@@ -214,7 +201,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         if !search_path.is_dir() {
-            return make_error(format!(
+            return Error::from_string(format!(
                 "lualib dir not found: {}",
                 search_path.to_str().unwrap_or("")
             ));
@@ -245,10 +232,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     CONTEXT.set_env("ARG", &arg);
 
     if let Err(err) = LOGGER.setup_logger(enable_stdout, logfile, loglevel) {
-        return make_error(err.to_string());
+        return Error::from_string(err.to_string());
     }
 
-    let mut package_path = CONTEXT.get_env("PATH").unwrap_or_default();
+    let package_path = CONTEXT.get_env("PATH").unwrap_or_default();
+    let mut package_path = (*package_path).clone();
 
     package_path.push_str(&arg);
 
@@ -262,10 +250,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         name: "bootstrap".to_string(),
         source: bootstrap,
         params: package_path,
+        block: true,
     });
 
+    context::run_monitor();
+
     loop {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         if CONTEXT.exit_code() != i32::MAX && CONTEXT.stopped() {
             break;
         }
@@ -289,7 +280,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if error_code != 0 {
-        return make_error(error_code.to_string());
+        return Error::from_string(error_code.to_string());
     }
 
     Ok(())

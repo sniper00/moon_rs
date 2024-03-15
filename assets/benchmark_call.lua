@@ -39,14 +39,14 @@ else
         for i=1,nsender do
             local receiver = moon.new_service({
                 name="test",
-                source = "call_benchmark.lua",
+                source = "benchmark_call.lua",
                 runner = true,
                 type = "receiver"
             })
 
             local addr = moon.new_service({
                 name="test",
-                source = "call_benchmark.lua",
+                source = "benchmark_call.lua",
                 runner = true,
                 type = "sender",
                 target = receiver,

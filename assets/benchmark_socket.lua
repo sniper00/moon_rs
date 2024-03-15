@@ -28,23 +28,6 @@ end
 
 moon.async(function()
 
-    -- local fd = socket.connect("baidu.com:443")
-
-    -- moon.async(function ()
-    --     local data, err = socket.read(fd,"\r\n", 100000, 500)
-    --     if not data then
-    --         moon.error("read error", err)
-    --         return
-    --     end
-    --     print(data)
-    -- end)
-
-    -- moon.sleep(1000)
-
-    -- print("close result", socket.close(fd))
-
-    -- print(socket.read(fd,"\r\n"))
-
     local listenfd  = socket.listen(conf.host..":"..conf.port)
 
     print(string.format([[

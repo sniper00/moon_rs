@@ -2,11 +2,11 @@ use lib_lua::ffi::{self, luaL_Reg, lua_Integer};
 use std::ffi::{c_int, c_void};
 
 use lib_core::{
-    buffer::Buffer,
-    c_str,
-    laux::{self, LuaValue},
-    lreg, lreg_null,
+    buffer::{self, Buffer},
+    c_str, laux, lreg, lreg_null,
 };
+
+const MAX_DEPTH: i32 = 32;
 
 fn concat_table(
     state: *mut ffi::lua_State,
@@ -40,7 +40,7 @@ fn concat_one(
     index: i32,
     depth: i32,
 ) -> Result<(), String> {
-    if depth > 32 {
+    if depth > MAX_DEPTH {
         return Err("buffer.concat too depth table".into());
     }
 
@@ -69,12 +69,10 @@ fn concat_one(
             concat_table(state, writer, index, depth + 1)?;
         }
         t => {
-            let tname = unsafe {
-                std::ffi::CStr::from_ptr(ffi::lua_typename(state, t))
-                    .to_str()
-                    .unwrap_or_default()
-            };
-            return Err(format!("table.concat unsupport type :{}", tname));
+            return Err(format!(
+                "buffer.concat unsupport type :{}",
+                laux::type_name(state, t)
+            ));
         }
     }
 
@@ -87,12 +85,19 @@ extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
         return 0;
     }
 
+    let mut has_error = false;
     let mut buf = Box::new(Buffer::new());
     for i in 1..=n {
         if let Err(err) = concat_one(state, buf.as_mut(), i, 0) {
-            drop(buf);
-            laux::lua_error(state, &err);
+            laux::lua_push(state, err);
+            has_error = true;
+            break;
         }
+    }
+
+    if has_error {
+        drop(buf);
+        laux::throw_error(state);
     }
 
     unsafe {
@@ -108,12 +113,19 @@ extern "C-unwind" fn concat_string(state: *mut ffi::lua_State) -> c_int {
         return 0;
     }
 
+    let mut has_error = false;
     let mut buf = Buffer::new();
     for i in 1..=n {
         if let Err(err) = concat_one(state, &mut buf, i, 0) {
-            drop(buf);
-            laux::lua_error(state, &err);
+            has_error = true;
+            laux::lua_push(state, err);
+            break;
         }
+    }
+
+    if has_error {
+        drop(buf);
+        laux::throw_error(state);
     }
 
     unsafe {
@@ -122,7 +134,7 @@ extern "C-unwind" fn concat_string(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-fn get_pointer(state: *mut ffi::lua_State) -> &'static mut Buffer {
+fn get_mut_buffer(state: *mut ffi::lua_State) -> &'static mut Buffer {
     let buf = unsafe { ffi::lua_touserdata(state, 1) as *mut Buffer };
     if buf.is_null() {
         unsafe { ffi::luaL_argerror(state, 1, c_str!("null buffer pointer")) };
@@ -131,12 +143,12 @@ fn get_pointer(state: *mut ffi::lua_State) -> &'static mut Buffer {
 }
 
 extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
+    let buf = get_mut_buffer(state);
     let top = unsafe { ffi::lua_gettop(state) };
 
     unsafe {
         if laux::lua_type(state, 2) == ffi::LUA_TSTRING {
-            let opt = laux::opt_str(state, 2, "");
+            let opt: &str = laux::lua_opt(state, 2).unwrap_or_default();
             let mut pos = ffi::luaL_optinteger(state, 3, 0) as usize;
             let len = buf.len();
             if pos > len {
@@ -202,8 +214,34 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
     unsafe { ffi::lua_gettop(state) - top }
 }
 
+extern "C-unwind" fn buffer_new(state: *mut ffi::lua_State) -> c_int {
+    let capacity = laux::lua_opt::<usize>(state, 1).unwrap_or(buffer::DEFAULT_RESERVE);
+    unsafe {
+        ffi::luaL_argcheck(
+            state,
+            if capacity < (usize::MAX / 2) { 1 } else { 0 },
+            1,
+            c_str!("invalid capacity"),
+        )
+    };
+    let heade_reserve = laux::lua_opt::<usize>(state, 2).unwrap_or(buffer::DEFAULT_HEAD_RESERVE);
+    unsafe {
+        ffi::luaL_argcheck(
+            state,
+            if heade_reserve < 1024 * 1024 { 1 } else { 0 },
+            2,
+            c_str!("invalid heade reserve size"),
+        )
+    };
+    let buf = Box::new(Buffer::with_head_reserve(capacity, heade_reserve));
+    unsafe {
+        ffi::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);
+    }
+    1
+}
+
 extern "C-unwind" fn buffer_drop(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
+    let buf = get_mut_buffer(state);
     unsafe {
         let _ = Box::from_raw(buf);
     }
@@ -211,8 +249,8 @@ extern "C-unwind" fn buffer_drop(state: *mut ffi::lua_State) -> c_int {
 }
 
 extern "C-unwind" fn read(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
-    let len = usize::from_lua_check(state, 2);
+    let buf = get_mut_buffer(state);
+    let len = laux::lua_get(state, 2);
     if len > buf.len() {
         unsafe {
             ffi::luaL_argerror(state, 2, c_str!("out of range"));
@@ -227,10 +265,10 @@ extern "C-unwind" fn read(state: *mut ffi::lua_State) -> c_int {
 }
 
 extern "C-unwind" fn write_front(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
+    let buf = get_mut_buffer(state);
     let top = unsafe { ffi::lua_gettop(state) };
     for i in (2..=top).rev() {
-        let s = laux::check_slice(state, i);
+        let s = laux::lua_get::<&[u8]>(state, i);
         if !buf.write_front(s) {
             unsafe {
                 ffi::luaL_error(state, c_str!("no more front space"));
@@ -240,11 +278,11 @@ extern "C-unwind" fn write_front(state: *mut ffi::lua_State) -> c_int {
     0
 }
 
-fn write_string(state: *mut ffi::lua_State, buf: &mut Buffer, index: i32) {
+fn write_string(state: *mut ffi::lua_State, buf: &mut Buffer, index: i32) -> Result<(), String> {
     match laux::lua_type(state, index) {
         ffi::LUA_TNIL => {}
         ffi::LUA_TSTRING => {
-            buf.write_slice(laux::check_slice(state, index));
+            buf.write_slice(laux::lua_get::<&[u8]>(state, index));
         }
         ffi::LUA_TNUMBER => {
             if unsafe { ffi::lua_isinteger(state, index) } != 0 {
@@ -258,49 +296,58 @@ fn write_string(state: *mut ffi::lua_State, buf: &mut Buffer, index: i32) {
             let s = if n != 0 { "true" } else { "false" };
             buf.write_slice(s.as_bytes());
         }
-        ltype => laux::lua_error(
-            state,
-            &format!("unsupport type :{}", laux::type_name(state, ltype)),
-        ),
+        ltype => {
+            return Err(format!("unsupport type :{}", laux::type_name(state, ltype)));
+        }
     }
+    Ok(())
 }
 
 extern "C-unwind" fn write(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
+    let buf = get_mut_buffer(state);
     let top = unsafe { ffi::lua_gettop(state) };
+    let mut has_error = false;
     for i in 2..=top {
-        write_string(state, buf, i)
+        if let Err(err) = write_string(state, buf, i) {
+            has_error = true;
+            laux::lua_push(state, err);
+            break;
+        }
     }
+
+    if has_error {
+        laux::throw_error(state);
+    }
+
     0
 }
 
 extern "C-unwind" fn seek(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
-    let pos = usize::from_lua_check(state, 2);
-    if !buf.seek(pos) {
-        unsafe {
-            ffi::luaL_argerror(state, 2, c_str!("out of range"));
-        }
-    }
-    0
+    let buf = get_mut_buffer(state);
+    let pos = laux::lua_get(state, 2);
+    laux::lua_push(state, buf.seek(pos));
+    1
 }
 
 extern "C-unwind" fn commit(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
-    let len = usize::from_lua_check(state, 2);
-    buf.commit(len);
-    0
+    let buf = get_mut_buffer(state);
+    let len = laux::lua_get(state, 2);
+    laux::lua_push(state, buf.commit(len));
+    1
 }
 
 extern "C-unwind" fn prepare(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
-    let len = usize::from_lua_check(state, 2);
-    buf.prepare(len);
-    0
+    let buf = get_mut_buffer(state);
+    let len = laux::lua_get(state, 2);
+    let space: *mut u8 = buf.prepare(len).as_mut_ptr();
+    unsafe {
+        ffi::lua_pushlightuserdata(state, space as *mut c_void);
+    }
+    1
 }
 
 extern "C-unwind" fn size(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
+    let buf = get_mut_buffer(state);
     unsafe {
         ffi::lua_pushinteger(state, buf.len() as lua_Integer);
     }
@@ -308,17 +355,18 @@ extern "C-unwind" fn size(state: *mut ffi::lua_State) -> c_int {
 }
 
 extern "C-unwind" fn clear(state: *mut ffi::lua_State) -> c_int {
-    let buf = get_pointer(state);
+    let buf = get_mut_buffer(state);
     buf.clear();
     0
 }
 
 pub unsafe extern "C-unwind" fn luaopen_buffer(state: *mut ffi::lua_State) -> c_int {
     let l = [
+        lreg!("new", buffer_new),
+        lreg!("drop", buffer_drop),
         lreg!("concat", concat),
         lreg!("concat_string", concat_string),
         lreg!("unpack", unpack),
-        lreg!("drop", buffer_drop),
         lreg!("read", read),
         lreg!("write", write),
         lreg!("write_front", write_front),

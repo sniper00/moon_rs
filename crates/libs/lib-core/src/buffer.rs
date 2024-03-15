@@ -3,13 +3,13 @@ use std::fmt;
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Buffer {
-    data: Vec<u8>,
     rpos: usize,
     head_reserved: usize,
+    data: Vec<u8>,
 }
 
-const DEFAULT_HEAD_RESERVE: usize = 16;
-const DEFAULT_RESERVE: usize = 128 - DEFAULT_HEAD_RESERVE;
+pub const DEFAULT_HEAD_RESERVE: usize = 16;
+pub const DEFAULT_RESERVE: usize = 128 - DEFAULT_HEAD_RESERVE;
 
 #[allow(dead_code)]
 impl Buffer {
@@ -23,20 +23,6 @@ impl Buffer {
         }
     }
 
-    // pub fn from_ptr(ptr: *mut u8, len: usize) -> Buffer {
-    //     let mut raw = Vec::<u8>::with_capacity(len + DEFAULT_HEAD_RESERVE);
-    //     raw.resize(DEFAULT_HEAD_RESERVE, 0);
-    //     unsafe {
-    //         std::ptr::copy_nonoverlapping(ptr, raw.as_mut_ptr().add(DEFAULT_HEAD_RESERVE), len);
-    //         raw.set_len(len + DEFAULT_HEAD_RESERVE);
-    //     }
-    //     Buffer {
-    //         data: raw,
-    //         rpos: DEFAULT_HEAD_RESERVE,
-    //         head_reserved: DEFAULT_HEAD_RESERVE,
-    //     }
-    // }
-
     pub fn from_bytes(data: &[u8]) -> Buffer {
         let mut raw = Vec::<u8>::with_capacity(data.len() + DEFAULT_HEAD_RESERVE);
         raw.resize(DEFAULT_HEAD_RESERVE, 0);
@@ -48,8 +34,8 @@ impl Buffer {
         }
     }
 
-    pub fn with_reserve(reserve: usize) -> Buffer {
-        let mut raw = Vec::<u8>::with_capacity(reserve + DEFAULT_HEAD_RESERVE);
+    pub fn with_capacity(capacity: usize) -> Buffer {
+        let mut raw = Vec::<u8>::with_capacity(capacity + DEFAULT_HEAD_RESERVE);
         raw.resize(DEFAULT_HEAD_RESERVE, 0);
         Buffer {
             data: raw,
@@ -58,8 +44,8 @@ impl Buffer {
         }
     }
 
-    pub fn with_head_reserve(reserve: usize, head_reserve: usize) -> Buffer {
-        let mut raw = Vec::<u8>::with_capacity(reserve + head_reserve);
+    pub fn with_head_reserve(capacity: usize, head_reserve: usize) -> Buffer {
+        let mut raw = Vec::<u8>::with_capacity(capacity + head_reserve);
         raw.resize(head_reserve, 0);
         Buffer {
             data: raw,
@@ -144,11 +130,19 @@ impl Buffer {
         self.rpos += count;
     }
 
-    pub fn seek(&mut self, pos: usize) -> bool {
-        if self.data.len() < pos {
+    pub fn seek(&mut self, pos: isize) -> bool {
+        if pos < 0 {
+            if self.rpos < pos.abs() as usize {
+                return false;
+            }
+            self.rpos -= pos.abs() as usize;
+            return true;
+        }
+
+        if self.data.len() < self.rpos + pos as usize {
             return false;
         }
-        self.rpos = pos;
+        self.rpos += pos as usize;
         true
     }
 
@@ -168,53 +162,48 @@ impl Buffer {
         self.data.len() == self.rpos
     }
 
-    pub fn prepare(&mut self, size: usize) -> std::option::Option<(*mut u8, usize)> {
+    pub fn prepare(&mut self, size: usize) -> &mut [u8] {
         let tail_free_space = self.data.capacity() - self.data.len();
-        if tail_free_space >= size {
-            return None;
-        }
-
-        let count = self.data.len() - self.rpos;
-        if tail_free_space + self.rpos >= size + self.head_reserved {
-            unsafe {
-                if count != 0 {
-                    //println!("move data");
-                    std::ptr::copy(
-                        self.data.as_ptr().add(self.rpos),
-                        self.data.as_mut_ptr().add(self.head_reserved),
-                        count,
-                    );
+        if tail_free_space < size {
+            let count = self.data.len() - self.rpos;
+            if tail_free_space + self.rpos >= size + self.head_reserved {
+                unsafe {
+                    if count != 0 {
+                        let ptr = self.data.as_mut_ptr();
+                        std::ptr::copy(ptr.add(self.rpos), ptr.add(self.head_reserved), count);
+                    }
+                    self.rpos = self.head_reserved;
+                    self.data.set_len(self.rpos + count);
                 }
-                self.rpos = self.head_reserved;
-                self.data.set_len(self.rpos + count);
-            }
-        } else {
-            //println!("copy data");
-            let required_size = self.data.len() + size;
-            let mut new_vec = Vec::<u8>::with_capacity(required_size);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.data.as_ptr(),
-                    new_vec.as_mut_ptr(),
-                    self.data.len(),
-                );
-                new_vec.set_len(self.data.len());
-                self.data = new_vec;
+            } else {
+                let required_size = self.data.len() + size;
+                let mut new_vec = Vec::<u8>::with_capacity(required_size);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.data.as_ptr(),
+                        new_vec.as_mut_ptr(),
+                        self.data.len(),
+                    );
+                    new_vec.set_len(self.data.len());
+                    self.data = new_vec;
+                }
             }
         }
 
-        unsafe { Some((self.data.as_mut_ptr().add(self.data.len()), size)) }
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr().add(self.data.len()), size) }
     }
 
-    pub fn commit(&mut self, size: usize) {
+    pub fn commit(&mut self, size: usize)->bool {
         let len = self.data.len() + size;
-        assert!(
-            len <= self.data.capacity(),
-            "commit size is larger than prepare size",
-        );
+        if len > self.data.capacity() {
+            return false;
+        }
+
         unsafe {
             self.data.set_len(len);
         }
+
+        true
     }
 
     pub fn revert(&mut self, size: usize) {
@@ -308,8 +297,16 @@ impl Buffer {
         unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
     }
 
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.as_ptr() as *mut u8, self.len()) }
+    }
+
     pub fn as_mut_vec(&mut self) -> &mut Vec<u8> {
         &mut self.data
+    }
+
+    pub fn as_vec(&mut self) -> &Vec<u8> {
+        &self.data
     }
 
     pub fn as_pointer(&mut self) -> *mut Buffer {
@@ -371,4 +368,78 @@ impl fmt::Display for Buffer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new() {
+        let buffer = Buffer::new();
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.is_empty(), true);
+    }
+
+    #[test]
+    fn test_from_bytes() {
+        let buffer = Buffer::from_bytes(&[1, 2, 3]);
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer.is_empty(), false);
+    }
+
+    #[test]
+    fn test_with_capacity() {
+        let buffer = Buffer::with_capacity(100);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.is_empty(), true);
+    }
+
+    #[test]
+    fn test_write_slice() {
+        let mut buffer = Buffer::new();
+        buffer.write_slice(&[1, 2, 3]);
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer.is_empty(), false);
+    }
+
+    #[test]
+    fn test_write() {
+        let mut buffer = Buffer::new();
+        buffer.write(1);
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.is_empty(), false);
+    }
+
+    #[test]
+    fn test_read() {
+        let mut buffer = Buffer::from_bytes(&[1, 2, 3]);
+        let read_data = buffer.read(2).unwrap();
+        assert_eq!(read_data, vec![1, 2]);
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_consume() {
+        let mut buffer = Buffer::from_bytes(&[1, 2, 3]);
+        buffer.consume(2);
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_seek() {
+        let mut buffer = Buffer::from_bytes(&[1, 2, 3]);
+        assert_eq!(buffer.seek(2), true);
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut buffer = Buffer::from_bytes(&[1, 2, 3]);
+        buffer.clear();
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.is_empty(), true);
+    }
+
+    // Add more tests for other methods...
 }

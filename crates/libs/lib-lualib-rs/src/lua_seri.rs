@@ -5,7 +5,7 @@ use lib_lua::ffi::{self, luaL_Reg, LUA_TLIGHTUSERDATA, LUA_TSTRING};
 use lib_core::{
     buffer::Buffer,
     c_str,
-    laux::{self, LuaValue},
+    laux::{self},
     lreg, lreg_null,
 };
 
@@ -264,7 +264,8 @@ fn pack_one(
                     index = ffi::lua_gettop(state) + index + 1
                 }
                 if write_table(state, buf, index, depth + 1)? != 0 {
-                    return Err(laux::opt_str(state, -1, "no error message").to_string());
+                    return Err(laux::lua_opt::<String>(state, -1)
+                        .unwrap_or("no error message".to_string()));
                 }
             }
             _ => {
@@ -281,14 +282,10 @@ fn pack_one(
 
 fn invalid_stream_line(state: *mut ffi::lua_State, rb: &mut ReadBlock, line: i32) {
     let len = rb.len();
-    unsafe {
-        ffi::luaL_error(
-            state,
-            c_str!("Invalid serialize stream %d (line:%d)"),
-            len as i32,
-            line,
-        );
-    }
+    laux::lua_error(
+        state,
+        format!("Invalid serialize stream {} (line:{})", len, line).as_str(),
+    );
 }
 
 macro_rules! invalid_stream {
@@ -519,12 +516,19 @@ extern "C-unwind" fn pack(state: *mut ffi::lua_State) -> c_int {
         return 0;
     }
 
+    let mut has_error = false;
     let mut buf = Box::new(Buffer::new());
     for i in 1..=n {
         if let Err(err) = pack_one(state, buf.as_mut_vec(), i, 0) {
-            drop(buf);
-            laux::lua_error(state, &err);
+            has_error = true;
+            laux::lua_push(state, err);
+            break;
         }
+    }
+
+    if has_error {
+        drop(buf);
+        laux::throw_error(state);
     }
 
     unsafe {
@@ -540,12 +544,19 @@ extern "C-unwind" fn pack_string(state: *mut ffi::lua_State) -> c_int {
         return 0;
     }
 
+    let mut has_error = false;
     let mut buf = Box::new(Buffer::new());
     for i in 1..=n {
         if let Err(err) = pack_one(state, buf.as_mut_vec(), i, 0) {
-            drop(buf);
-            laux::lua_error(state, &err);
+            has_error = true;
+            laux::lua_push(state, err);
+            break;
         }
+    }
+
+    if has_error {
+        drop(buf);
+        laux::throw_error(state);
     }
 
     unsafe {
@@ -611,7 +622,7 @@ unsafe extern "C-unwind" fn peek_one(state: *mut ffi::lua_State) -> c_int {
         ffi::luaL_argerror(state, 1, c_str!("peek_one need lightuserdata"));
     }
 
-    let seek = bool::from_lua_opt(state, 2).unwrap_or(false);
+    let seek = laux::lua_opt(state, 2).unwrap_or(false);
 
     let buf = unsafe { ffi::lua_touserdata(state, 1) as *mut Buffer };
     if buf.is_null() {

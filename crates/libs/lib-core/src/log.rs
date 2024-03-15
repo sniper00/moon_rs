@@ -1,15 +1,19 @@
 use chrono::Local;
 use colored::*;
 use log::{Level, Metadata, Record};
-use std::error::Error;
-use std::fs::{self, File, OpenOptions};
-use std::io::prelude::*;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::{
+    error::Error,
+    fs::{self, File, OpenOptions},
+    io::prelude::*,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        mpsc::{self, Sender},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use crate::buffer::Buffer;
 
@@ -98,6 +102,7 @@ impl Logger {
                                     Level::Debug => line.to_string().green(),
                                     Level::Trace => line.to_string().normal(),
                                 };
+
                                 println!("{}", console_str);
                             }
 
@@ -206,6 +211,10 @@ impl Logger {
             .store(Logger::level_to_u8(level), Ordering::Release);
     }
 
+    pub fn get_log_level(&self) -> Level {
+        Logger::u8_to_level(self.state.level.load(Ordering::Acquire))
+    }
+
     pub fn setup_logger(
         &'static self,
         enable_stdout: bool,
@@ -220,7 +229,7 @@ impl Logger {
             if let Ok(file) = OpenOptions::new()
                 .create(true)
                 .write(true)
-                .append(true)
+                .truncate(true)
                 .open(file.clone())
             {
                 let _ = self.sender.send(LogMessage::File(file));
@@ -236,7 +245,7 @@ impl Logger {
             }
         }
 
-        log::set_logger(self)?;
+        log::set_logger(self).expect("set logger failed");
         log::set_max_level(Level::Debug.to_level_filter());
         Ok(())
     }

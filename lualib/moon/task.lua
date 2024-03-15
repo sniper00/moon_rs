@@ -1,7 +1,6 @@
 local moon = require("moon")
 local corunning = coroutine.running
 local costatus = coroutine.status
-local coyield = coroutine.yield
 
 local traceback = debug.traceback
 
@@ -11,8 +10,6 @@ local xpcall = xpcall
 
 local _M = {}
 
----
---- 等待多个异步调用，并获取结果
 function _M.wait_all(fnlist)
     local n = #fnlist
     local res = {}
@@ -37,7 +34,7 @@ function _M.wait_all(fnlist)
             end)
         end
     end)
-    coyield()
+    moon.wait()
     return res
 end
 

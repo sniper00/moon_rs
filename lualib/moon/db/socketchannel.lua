@@ -8,6 +8,7 @@ local setmetatable = setmetatable
 local read = socket.read
 
 ---@class socketchannel
+---@field _opts table
 local socketchannel = {}
 
 socketchannel.__index = socketchannel

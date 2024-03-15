@@ -1,12 +1,15 @@
 use lib_lua::{ffi, ffi::luaL_Reg};
 use serde_json::Value;
-use std::error::Error;
-use std::ffi::{c_char, c_int, c_void};
+use std::{
+    ffi::{c_char, c_int, c_void},
+    hash::{DefaultHasher, Hasher},
+    mem::size_of,
+};
 
 use lib_core::{
     buffer::Buffer,
     c_str,
-    laux::{self},
+    laux::{self, LuaStateRaw},
     lreg, lreg_null,
 };
 
@@ -35,13 +38,84 @@ const HEX_DIGITS: [u8; 16] = [
     b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'A', b'B', b'C', b'D', b'E', b'F',
 ];
 
+struct JsonOptions {
+    empty_as_array: bool,
+    enable_number_key: bool,
+    enable_sparse_array: bool,
+}
+
+fn init_options(state: LuaStateRaw) {
+    unsafe {
+        let ptr = ffi::lua_newuserdatauv(state, size_of::<JsonOptions>(), 0) as *mut JsonOptions;
+        ptr.write(JsonOptions {
+            empty_as_array: true,
+            enable_number_key: true,
+            enable_sparse_array: false,
+        });
+
+        ffi::lua_newtable(state);
+        ffi::lua_pushcfunction(state, drop_options);
+        ffi::lua_setfield(state, -2, c_str!("__gc"));
+        ffi::lua_setmetatable(state, -2);
+    }
+}
+
+extern "C-unwind" fn drop_options(state: LuaStateRaw) -> i32 {
+    unsafe {
+        let ptr = ffi::lua_touserdata(state, -1);
+        if !ptr.is_null() {
+            let ptr = ptr as *mut JsonOptions;
+            ptr.drop_in_place();
+        }
+    }
+    0
+}
+
+extern "C-unwind" fn set_options(state: LuaStateRaw) -> i32 {
+    let options = fetch_options(state);
+    let key = laux::lua_get::<&str>(state, 1);
+    match key {
+        "encode_empty_as_array" => {
+            let v = options.empty_as_array;
+            options.empty_as_array = laux::lua_opt(state, 2).unwrap_or(true);
+            laux::lua_push(state, v);
+        }
+        "enable_number_key" => {
+            let v = options.enable_number_key;
+            options.enable_number_key = laux::lua_opt(state, 2).unwrap_or(true);
+            laux::lua_push(state, v);
+        }
+        "enable_sparse_array" => {
+            let v = options.enable_sparse_array;
+            options.enable_sparse_array = laux::lua_opt(state, 2).unwrap_or(false);
+            laux::lua_push(state, v);
+        }
+        _ => {
+            laux::lua_error(state, format!("invalid json option key: {}", key).as_str());
+        }
+    }
+
+    1
+}
+
+fn fetch_options(state: LuaStateRaw) -> &'static mut JsonOptions {
+    unsafe {
+        let ptr = ffi::lua_touserdata(state, ffi::lua_upvalueindex(1));
+        if ptr.is_null() {
+            ffi::luaL_error(state, c_str!("expect json options"));
+        }
+        &mut *(ptr as *mut JsonOptions)
+    }
+}
+
 unsafe fn encode_one(
     state: *mut ffi::lua_State,
     writer: &mut Vec<u8>,
     idx: i32,
     depth: i32,
     fmt: bool,
-) -> Result<(), Box<dyn Error>> {
+    options: &JsonOptions,
+) -> Result<(), String> {
     let t = ffi::lua_type(state, idx);
     match t {
         ffi::LUA_TBOOLEAN => {
@@ -84,7 +158,7 @@ unsafe fn encode_one(
             writer.push(b'\"');
         }
         ffi::LUA_TTABLE => {
-            encode_table(state, writer, idx, depth, fmt)?;
+            encode_table(state, writer, idx, depth, fmt, options)?;
         }
         ffi::LUA_TNIL => {
             writer.extend_from_slice(JSON_NULL.as_bytes());
@@ -94,26 +168,25 @@ unsafe fn encode_one(
                 writer.extend_from_slice(JSON_NULL.as_bytes());
             }
         }
-        _ => {
-            let tname = std::ffi::CStr::from_ptr(ffi::lua_typename(state, t))
-                .to_str()
-                .unwrap_or_default();
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("json encode: unsupport value type :{}", tname),
-            )));
+        ltype => {
+            return Err(format!(
+                "json encode: unsupport value type :{}",
+                laux::type_name(state, ltype)
+            ));
         }
     }
 
     Ok(())
 }
 
+#[inline]
 fn format_new_line(writer: &mut Vec<u8>, fmt: bool) {
     if fmt {
         writer.push(b'\n');
     }
 }
 
+#[inline]
 fn format_space(writer: &mut Vec<u8>, fmt: bool, n: i32) {
     if fmt {
         for _ in 0..n {
@@ -123,14 +196,15 @@ fn format_space(writer: &mut Vec<u8>, fmt: bool, n: i32) {
     }
 }
 
-unsafe fn encode_table_array(
+unsafe fn encode_array(
     state: *mut ffi::lua_State,
     size: usize,
     writer: &mut Vec<u8>,
     idx: i32,
     depth: i32,
     fmt: bool,
-) -> Result<(), Box<dyn Error>> {
+    options: &JsonOptions,
+) -> Result<(), String> {
     let bsize = writer.len();
     writer.push(b'[');
     for i in 1..=size {
@@ -139,12 +213,12 @@ unsafe fn encode_table_array(
         }
         format_space(writer, fmt, depth);
         ffi::lua_rawgeti(state, idx, i as ffi::lua_Integer);
-        if ffi::lua_isnil(state, -1) != 0 {
+        if ffi::lua_isnil(state, -1) != 0 && !options.enable_sparse_array {
             ffi::lua_pop(state, 1);
             writer.truncate(bsize);
-            return encode_table_object(state, writer, idx, depth, fmt);
+            return encode_object(state, writer, idx, depth, fmt, options);
         }
-        encode_one(state, writer, -1, depth, fmt)?;
+        encode_one(state, writer, -1, depth, fmt, options)?;
         ffi::lua_pop(state, 1);
         if i != size {
             writer.push(b',');
@@ -156,13 +230,14 @@ unsafe fn encode_table_array(
     Ok(())
 }
 
-unsafe fn encode_table_object(
+unsafe fn encode_object(
     state: *mut ffi::lua_State,
     writer: &mut Vec<u8>,
     idx: i32,
     depth: i32,
     fmt: bool,
-) -> Result<(), Box<dyn Error>> {
+    options: &JsonOptions,
+) -> Result<(), String> {
     let mut i = 0;
     writer.push(b'{');
     ffi::lua_pushnil(state);
@@ -177,15 +252,15 @@ unsafe fn encode_table_object(
             ffi::LUA_TSTRING => {
                 format_space(writer, fmt, depth);
                 writer.push(b'\"');
-                writer.extend_from_slice(laux::check_str(state, -2).as_bytes());
+                writer.extend_from_slice(laux::lua_get::<&str>(state, -2).as_bytes());
                 writer.extend_from_slice(b"\":");
                 if fmt {
                     writer.push(b' ');
                 }
-                encode_one(state, writer, -1, depth, fmt)?;
+                encode_one(state, writer, -1, depth, fmt, options)?;
             }
             ffi::LUA_TNUMBER => {
-                if ffi::lua_isinteger(state, -2) != 0 {
+                if ffi::lua_isinteger(state, -2) != 0 && options.enable_number_key{
                     format_space(writer, fmt, depth);
                     let key = ffi::lua_tointeger(state, -2);
                     writer.push(b'\"');
@@ -194,12 +269,9 @@ unsafe fn encode_table_object(
                     if fmt {
                         writer.push(b' ');
                     }
-                    encode_one(state, writer, -1, depth, fmt)?;
+                    encode_one(state, writer, -1, depth, fmt, options)?;
                 } else {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "json encode: unsupport number key type.",
-                    )));
+                    return Err("json encode: unsupport number key type.".to_string());
                 }
             }
             _ => {}
@@ -207,12 +279,14 @@ unsafe fn encode_table_object(
         ffi::lua_pop(state, 1);
     }
 
-    if i == 0 {
+    if i == 0 && options.empty_as_array {
         writer.pop();
         writer.extend_from_slice(b"[]");
     } else {
-        format_new_line(writer, fmt);
-        format_space(writer, fmt, depth - 1);
+        if i > 0 {
+            format_new_line(writer, fmt);
+            format_space(writer, fmt, depth - 1);
+        }
         writer.push(b'}');
     }
 
@@ -225,13 +299,11 @@ unsafe fn encode_table(
     mut idx: i32,
     depth: i32,
     fmt: bool,
-) -> Result<(), Box<dyn Error>> {
+    options: &JsonOptions,
+) -> Result<(), String> {
     let depth = depth + 1;
     if depth > 64 {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "json encode: too depth",
-        )));
+        return Err("json encode: too depth".to_string());
     }
 
     if idx < 0 {
@@ -241,9 +313,9 @@ unsafe fn encode_table(
     ffi::luaL_checkstack(state, 6, c_str!("json.encode.table"));
     let arr_size = lua_array_size(state, idx);
     if arr_size > 0 {
-        encode_table_array(state, arr_size, writer, idx, depth, fmt)?;
+        encode_array(state, arr_size, writer, idx, depth, fmt, options)?;
     } else {
-        encode_table_object(state, writer, idx, depth, fmt)?;
+        encode_object(state, writer, idx, depth, fmt, options)?;
     }
 
     Ok(())
@@ -303,24 +375,28 @@ unsafe fn lua_array_size(state: *mut ffi::lua_State, idx: i32) -> usize {
 }
 
 unsafe extern "C-unwind" fn encode(state: *mut ffi::lua_State) -> c_int {
-    let mut writer = Vec::new();
-    let fmt = ffi::lua_toboolean(state, 2) != 0;
-    match encode_one(state, &mut writer, 1, 0, fmt) {
-        Ok(_) => {
-            ffi::lua_pushlstring(state, writer.as_ptr() as *const c_char, writer.len());
-            1
-        }
-        Err(err) => {
-            unsafe {
-                ffi::lua_pushnil(state);
-                ffi::lua_pushstring(state, err.to_string().as_ptr() as *const c_char);
+    ffi::luaL_checkany(state, 1);
+
+    {
+        let options = fetch_options(state);
+        let fmt: bool = laux::lua_opt(state, 2).unwrap_or_default();
+        let mut writer = Vec::new();
+        match encode_one(state, &mut writer, 1, 0, fmt, options) {
+            Ok(_) => {
+                laux::lua_push(state, writer.as_slice());
+                return 1;
             }
-            2
+            Err(err) => {
+                laux::lua_push(state, err.to_string());
+            }
         }
     }
+
+    laux::throw_error(state)
 }
 
-unsafe fn decode_one(state: *mut ffi::lua_State, val: &Value) -> Result<(), Box<dyn Error>> {
+#[inline]
+unsafe fn decode_one(state: *mut ffi::lua_State, val: &Value, options: &JsonOptions) {
     match val {
         Value::Object(map) => {
             ffi::luaL_checkstack(state, 6, c_str!("json.decode.object"));
@@ -328,20 +404,17 @@ unsafe fn decode_one(state: *mut ffi::lua_State, val: &Value) -> Result<(), Box<
             for (k, v) in map {
                 if !k.is_empty() {
                     let c = k.as_bytes()[0];
-                    if c.is_ascii_digit() || c == b'-' {
-                        // k to integer
-                        match k.parse::<ffi::lua_Integer>() {
-                            Ok(n) => {
-                                ffi::lua_pushinteger(state, n);
-                            }
-                            Err(_) => {
-                                ffi::lua_pushlstring(state, k.as_ptr() as *const c_char, k.len());
-                            }
+                    if (c.is_ascii_digit() || c == b'-') && options.enable_number_key{
+                        if let Ok(n) = k.parse::<ffi::lua_Integer>() {
+                            //try convert k to integer
+                            ffi::lua_pushinteger(state, n);
+                        } else {
+                            ffi::lua_pushlstring(state, k.as_ptr() as *const c_char, k.len());
                         }
                     } else {
                         ffi::lua_pushlstring(state, k.as_ptr() as *const c_char, k.len());
                     }
-                    decode_one(state, v)?;
+                    decode_one(state, v, options);
                     ffi::lua_rawset(state, -3);
                 }
             }
@@ -350,7 +423,7 @@ unsafe fn decode_one(state: *mut ffi::lua_State, val: &Value) -> Result<(), Box<
             ffi::luaL_checkstack(state, 6, c_str!("json.decode.array"));
             ffi::lua_createtable(state, arr.len() as i32, 0);
             for (i, v) in arr.iter().enumerate() {
-                decode_one(state, v)?;
+                decode_one(state, v, options);
                 ffi::lua_rawseti(state, -2, (i + 1) as ffi::lua_Integer);
             }
         }
@@ -377,34 +450,33 @@ unsafe fn decode_one(state: *mut ffi::lua_State, val: &Value) -> Result<(), Box<
             ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len());
         }
     }
-
-    Ok(())
 }
 
 extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
-    let str = laux::check_str(state, 1);
-    match serde_json::from_str::<Value>(str) {
+    let options = fetch_options(state);
+    let str = laux::lua_get(state, 1);
+    match serde_json::from_slice::<Value>(str) {
         Ok(val) => {
             unsafe {
-                decode_one(state, &val).unwrap_or_default();
+                decode_one(state, &val, options);
             }
             1
         }
         Err(e) => {
-            unsafe {
-                ffi::lua_pushnil(state);
-                ffi::lua_pushstring(state, e.to_string().as_ptr() as *const c_char);
-            }
+            laux::lua_pushnil(state);
+            laux::lua_push(state, e.to_string());
             2
         }
     }
 }
 
 unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
+    let options = fetch_options(state);
+
     let ltype = laux::lua_type(state, 1);
     if ltype == ffi::LUA_TSTRING {
-        let slc = laux::check_slice(state, 1);
-        let mut buf = Box::new(Buffer::with_reserve(slc.len()));
+        let slc = laux::lua_get::<&[u8]>(state, 1);
+        let mut buf = Box::new(Buffer::with_capacity(slc.len()));
         buf.write_slice(slc);
         ffi::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);
         return 1;
@@ -415,13 +487,14 @@ unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
 
     let mut writer = Box::new(Buffer::new());
     let array_len = ffi::lua_rawlen(state, 1);
+    let mut has_error = false;
 
     for i in 1..=array_len {
         ffi::lua_rawgeti(state, 1, i as ffi::lua_Integer);
         let ltype = ffi::lua_type(state, -1);
         match ltype {
             ffi::LUA_TSTRING => {
-                let slc = laux::check_slice(state, -1);
+                let slc = laux::lua_get::<&[u8]>(state, -1);
                 writer.write_slice(slc);
             }
             ffi::LUA_TNUMBER => {
@@ -439,18 +512,166 @@ unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
                 }
             }
             ffi::LUA_TTABLE => {
-                if let Err(err) = encode_one(state, writer.as_mut_vec(), -1, 0, false) {
-                    drop(writer);
-                    laux::lua_error(state, &err.to_string());
+                if let Err(err) = encode_one(state, writer.as_mut_vec(), -1, 0, false, options) {
+                    has_error = true;
+                    laux::lua_push(state, err);
+                    break;
                 }
             }
-            _ => {}
+            _ => {
+                has_error = true;
+                laux::lua_push(state, format!(
+                    "concat: unsupport value type :{}",
+                    laux::type_name(state, ltype)
+                ));
+                break;
+            }
         }
+        laux::lua_pop(state, 1);
+    }
+
+    if has_error {
+        drop(writer);
+        laux::throw_error(state);
     }
 
     ffi::lua_pushlightuserdata(state, Box::into_raw(writer) as *mut c_void);
 
     1
+}
+
+fn hash_string(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(s.as_bytes());
+    hasher.finish()
+}
+
+#[inline]
+fn write_resp(writer: &mut Buffer, cmd: &str) {
+    writer.write_slice(b"\r\n$");
+    writer.write_chars(cmd.len());
+    writer.write_slice(b"\r\n");
+    writer.write_str(cmd);
+}
+
+fn concat_resp_one(
+    writer: &mut Buffer,
+    state: *mut ffi::lua_State,
+    index: i32,
+    options: &JsonOptions,
+) -> Result<(), String> {
+    // let lua = LuaStateRef::new(state);
+    let ltype = laux::lua_type(state, index);
+    match ltype {
+        ffi::LUA_TNIL => {
+            writer.write_slice(b"\r\n$-1");
+        }
+        ffi::LUA_TNUMBER => {
+            if laux::is_integer(state, index) {
+                write_resp(
+                    writer,
+                    laux::lua_to::<i64>(state, index).to_string().as_str(),
+                );
+            } else {
+                write_resp(
+                    writer,
+                    laux::lua_to::<f64>(state, index).to_string().as_str(),
+                );
+            }
+        }
+        ffi::LUA_TBOOLEAN => {
+            if laux::lua_opt::<bool>(state, index).unwrap_or_default() {
+                write_resp(writer, JSON_TRUE);
+            } else {
+                write_resp(writer, JSON_FALSE);
+            }
+        }
+        ffi::LUA_TSTRING => {
+            let slc = laux::lua_get(state, index);
+            write_resp(writer, slc);
+        }
+        ffi::LUA_TTABLE => {
+            if unsafe { ffi::luaL_getmetafield(state, index, c_str!("__redis")) != ffi::LUA_TNIL } {
+                laux::lua_pop(state, 1);
+                let size = laux::lua_rawlen(state, index);
+                for n in 1..=size {
+                    laux::lua_rawgeti(state, index, n);
+                    concat_resp_one(writer, state, -1, options)?;
+                    laux::lua_pop(state, 1);
+                }
+            } else {
+                let mut w = Buffer::new();
+                unsafe { encode_one(state, w.as_mut_vec(), index, 0, false, options)? };
+                write_resp(writer, w.as_str());
+            }
+        }
+        _ => {
+            return Err(format!(
+                "concat_resp_one: unsupport value type :{}",
+                laux::type_name(state, ltype)
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+extern "C-unwind" fn concat_resp(state: *mut ffi::lua_State) -> c_int {
+    let n = laux::lua_top(state);
+    if n == 0 {
+        return 0;
+    }
+
+    let options = fetch_options(state);
+
+    let mut writer = Box::new(Buffer::new());
+    let mut has_error = false;
+    let mut hash = 1;
+    if laux::lua_type(state, 1) == ffi::LUA_TSTRING {
+        let key: &str = laux::lua_get(state, 1);
+        if !key.is_empty() {
+            let mut hash_part = String::new();
+            if n > 1 {
+                let field: &str = laux::lua_get(state, 2);
+                if !field.is_empty() {
+                    hash_part = field.to_string();
+                }
+            }
+
+            if n > 2 && (key.starts_with('h') || key.starts_with('H')) {
+                let field: &str = laux::lua_get(state, 3);
+                if !field.is_empty() {
+                    hash_part = field.to_string();
+                }
+            }
+
+            if !hash_part.is_empty() {
+                hash = hash_string(&hash_part);
+            }
+        }
+    }
+
+    writer.write(b'*');
+    writer.write_chars(n);
+    for i in 1..=n {
+        if let Err(err) = concat_resp_one(&mut writer, state, i, options) {
+            has_error = true;
+            laux::lua_push(state, err);
+            break;
+        }
+    }
+
+    if has_error {
+        drop(writer);
+        laux::throw_error(state);
+    }
+
+    writer.write_slice(b"\r\n");
+
+    laux::lua_pushlightuserdata(state, Box::into_raw(writer) as *mut c_void);
+    laux::lua_push(state, hash);
+
+    2
 }
 
 pub unsafe extern "C-unwind" fn luaopen_json(state: *mut ffi::lua_State) -> c_int {
@@ -459,11 +680,17 @@ pub unsafe extern "C-unwind" fn luaopen_json(state: *mut ffi::lua_State) -> c_in
         lreg!("decode_v2", decode),
         lreg!("encode", encode),
         lreg!("concat", concat),
+        lreg!("concat_resp", concat_resp),
+        lreg!("options", set_options),
         lreg_null!(),
     ];
 
     ffi::lua_createtable(state, 0, l.len() as c_int);
-    ffi::luaL_setfuncs(state, l.as_ptr(), 0);
+    init_options(state);
+    ffi::luaL_setfuncs(state, l.as_ptr(), 1);
+
+    ffi::lua_pushlightuserdata(state, std::ptr::null_mut());
+    ffi::lua_setfield(state, -2, c_str!("null"));
 
     1
 }

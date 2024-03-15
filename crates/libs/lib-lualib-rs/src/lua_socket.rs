@@ -1,5 +1,7 @@
+use lib_core::buffer::{self, Buffer};
 use lib_lua::{ffi, ffi::luaL_Reg};
 use std::ffi::c_int;
+use std::net::TcpStream;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -17,7 +19,7 @@ use lib_core::{
     actor::LuaActor,
     c_str,
     context::{self, Message, NetChannel, NetOp, CONTEXT},
-    laux::{self, LuaStateRef},
+    laux::{self},
     lreg, lreg_null,
 };
 
@@ -26,34 +28,21 @@ use lib_core::{
 // pub const SOCKET_WRITE: i8 = 3;
 // pub const SOCKET_CONNECT: i8 = 4;
 
-fn response_error(owner: i64, session: i64, err: Vec<u8>) {
-    if session == 0 {
-        log::error!("error: {:?}", String::from_utf8_lossy(err.as_ref()));
-        return;
-    }
-    tokio::spawn(async move {
-        CONTEXT.send(Message {
-            ptype: context::PTYPE_ERROR,
-            from: 0,
-            to: owner,
-            session,
-            data: Some(Box::new(err.into())),
-        });
-    });
-}
-
 async fn handle_read(reader: OwnedReadHalf, rx: &mut mpsc::Receiver<NetOp>) {
     let mut reader = BufReader::new(reader);
     while let Some(op) = rx.recv().await {
         match op {
             NetOp::ReadUntil(owner, session, max_size, delim, read_timeout) => {
-                let mut buffer = Vec::<u8>::with_capacity(512);
+                let mut buffer = Box::new(Buffer::with_capacity(std::cmp::min(
+                    max_size,
+                    512 - buffer::DEFAULT_HEAD_RESERVE,
+                )));
                 loop {
                     let read_res;
                     if read_timeout > 0 {
                         match timeout(
                             Duration::from_millis(read_timeout),
-                            reader.read_until(*delim.last().unwrap(), &mut buffer),
+                            reader.read_until(*delim.last().unwrap(), buffer.as_mut_vec()),
                         )
                         .await
                         {
@@ -61,37 +50,45 @@ async fn handle_read(reader: OwnedReadHalf, rx: &mut mpsc::Receiver<NetOp>) {
                                 read_res = res;
                             }
                             Err(err) => {
-                                response_error(
+                                CONTEXT.response_error(
+                                    0,
                                     owner,
-                                    session,
-                                    format!("read timeout: {}", err).into_bytes(),
+                                    -session,
+                                    format!("read timeout: {}", err),
                                 );
                                 return;
                             }
                         }
                     } else {
-                        read_res = reader.read_until(*delim.last().unwrap(), &mut buffer).await;
+                        read_res = reader
+                            .read_until(*delim.last().unwrap(), buffer.as_mut_vec())
+                            .await;
                     }
 
                     match read_res {
                         Ok(0) => {
-                            response_error(owner, session, b"eof".to_vec());
+                            CONTEXT.response_error(0, owner, -session, "eof".to_string());
                             return;
                         }
                         Ok(_) => {
                             if buffer.len() >= max_size {
-                                response_error(owner, session, b"max read size limit".to_vec());
+                                CONTEXT.response_error(
+                                    0,
+                                    owner,
+                                    -session,
+                                    "max read size limit".to_string(),
+                                );
                                 return;
                             }
-                            if buffer.ends_with(delim.as_ref()) {
-                                buffer.truncate(buffer.len() - delim.len());
+                            if buffer.as_vec().ends_with(delim.as_ref()) {
+                                buffer.revert(delim.len());
                                 if CONTEXT
                                     .send(Message {
                                         ptype: context::PTYPE_SOCKET_TCP,
                                         from: 0,
                                         to: owner,
                                         session,
-                                        data: Some(Box::new(buffer.into())),
+                                        data: Some(buffer),
                                     })
                                     .is_some()
                                 {
@@ -99,22 +96,32 @@ async fn handle_read(reader: OwnedReadHalf, rx: &mut mpsc::Receiver<NetOp>) {
                                 }
                                 break;
                             }
-                            log::warn!("continue read {}", session);
+                            //log::warn!("continue read {}", session);
                         }
                         Err(err) => {
-                            response_error(owner, session, err.to_string().into_bytes());
+                            CONTEXT.response_error(0, owner, -session, err.to_string());
                             return;
                         }
                     }
                 }
             }
             NetOp::ReadBytes(owner, session, size, read_timeout) => {
-                let mut buffer = vec![0; size];
+                if size == 0 {
+                    CONTEXT.response_error(
+                        0,
+                        owner,
+                        -session,
+                        "socket op:ReadBytes size must be greater than 0".to_string(),
+                    );
+                    return;
+                }
+                let mut buffer = Box::new(Buffer::with_capacity(size));
+                let space = buffer.prepare(size);
                 let read_res;
                 if read_timeout > 0 {
                     match timeout(
                         Duration::from_millis(read_timeout),
-                        reader.read_exact(&mut buffer),
+                        reader.read_exact(space),
                     )
                     .await
                     {
@@ -122,30 +129,33 @@ async fn handle_read(reader: OwnedReadHalf, rx: &mut mpsc::Receiver<NetOp>) {
                             read_res = res;
                         }
                         Err(err) => {
-                            response_error(
+                            CONTEXT.response_error(
+                                0,
                                 owner,
-                                session,
-                                format!("read timeout: {}", err).into_bytes(),
+                                -session,
+                                format!("read timeout: {}", err),
                             );
                             return;
                         }
                     }
                 } else {
-                    read_res = reader.read_exact(&mut buffer).await;
+                    read_res = reader.read_exact(space).await;
                 }
 
                 if let Err(err) = read_res {
-                    response_error(owner, session, err.to_string().into_bytes());
+                    CONTEXT.response_error(0, owner, -session, err.to_string());
                     return;
-                } else {
-                    CONTEXT.send(Message {
-                        ptype: context::PTYPE_SOCKET_TCP,
-                        from: 0,
-                        to: owner,
-                        session,
-                        data: Some(Box::new(buffer.into())),
-                    });
                 }
+
+                buffer.commit(size);
+
+                CONTEXT.send(Message {
+                    ptype: context::PTYPE_SOCKET_TCP,
+                    from: 0,
+                    to: owner,
+                    session,
+                    data: Some(buffer),
+                });
             }
             _ => {}
         }
@@ -157,7 +167,7 @@ async fn handle_write(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<NetOp>)
         match op {
             NetOp::Write(owner, data, close) => {
                 if let Err(err) = writer.write_all(data.as_slice()).await {
-                    response_error(owner, 0, format!("socket write error {}", err).into_bytes());
+                    CONTEXT.response_error(0, owner, 0, format!("socket write error {}", err));
                     return;
                 }
                 if close {
@@ -205,10 +215,10 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
         for op in left {
             match op {
                 NetOp::ReadUntil(owner, session, _, _, _) => {
-                    response_error(owner, session, b"closed".to_vec());
+                    CONTEXT.response_error(0, owner, -session, "closed".to_string());
                 }
                 NetOp::ReadBytes(owner, session, _, _) => {
-                    response_error(owner, session, b"closed".to_vec());
+                    CONTEXT.response_error(0, owner, -session, "closed".to_string());
                 }
                 _ => {}
             }
@@ -258,25 +268,22 @@ fn listen(addr: &str) -> Result<i64> {
 }
 
 extern "C-unwind" fn lua_socket_listen(state: *mut ffi::lua_State) -> c_int {
-    let lua = LuaStateRef::new(state);
-    let addr: &str = lua.get(1);
+    let addr: &str = laux::lua_get(state, 1);
     match listen(addr) {
         Ok(fd) => {
-            lua.push(fd);
+            laux::lua_push(state, fd);
             1
         }
         Err(err) => {
-            lua.push(false);
-            lua.push(format!("socket_listen error: {}", err));
+            laux::lua_push(state, false);
+            laux::lua_push(state, format!("socket_listen error: {}", err));
             2
         }
     }
 }
 
 extern "C-unwind" fn lua_socket_accept(state: *mut ffi::lua_State) -> c_int {
-    let lua = LuaStateRef::new(state);
-
-    let fd = lua.get(1);
+    let fd = laux::lua_get(state, 1);
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
     let session = actor.next_uuid();
@@ -285,78 +292,67 @@ extern "C-unwind" fn lua_socket_accept(state: *mut ffi::lua_State) -> c_int {
         match channel.value().0.try_send(NetOp::Accept(owner, session)) {
             Ok(_) => {}
             Err(err) => {
-                response_error(
-                    owner,
-                    session,
-                    format!("socket_accept channel send error: {}", err).into_bytes(),
-                );
+                laux::lua_push(state, false);
+                laux::lua_push(state, format!("socket_accept channel send error: {}", err));
+                return 2;
             }
         }
     } else {
-        response_error(
-            owner,
-            session,
-            format!("socket_accept error: fd not found: {}", fd).into_bytes(),
-        );
+        laux::lua_push(state, false);
+        laux::lua_push(state, format!("socket_accept error fd not found: {}", fd));
+        return 2;
     }
-    lua.push(session);
+    laux::lua_push(state, session);
     1
 }
 
 extern "C-unwind" fn lua_socket_read(state: *mut ffi::lua_State) -> c_int {
-    let lua = LuaStateRef::new(state);
-
-    let fd = lua.get(1);
+    let fd = laux::lua_get(state, 1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
     let session = actor.next_uuid();
 
-    let op = if lua.ltype(2) == ffi::LUA_TNUMBER {
-        let max_size = lua.get(2);
-        let read_timeout = lua.opt(3).unwrap_or(0);
+    let op = if laux::lua_type(state, 2) == ffi::LUA_TNUMBER {
+        let max_size = laux::lua_get(state, 2);
+        let read_timeout = laux::lua_opt(state, 3).unwrap_or(0);
 
         NetOp::ReadBytes(owner, session, max_size, read_timeout)
     } else {
-        let delim = lua.check_slice(2);
+        let delim = laux::lua_get::<&[u8]>(state, 2);
         if delim.is_empty() {
-            lua.error("socket_read error: delim is empty");
+            laux::lua_error(state, "socket_read error: delim is empty");
         }
 
-        let max_size = lua.opt(3).unwrap_or(0xFFFFFFFF);
-        let read_timeout = lua.opt(4).unwrap_or(0);
+        let max_size = laux::lua_opt(state, 3).unwrap_or(0xFFFFFFFF);
+        let read_timeout = laux::lua_opt(state, 4).unwrap_or(0);
 
         NetOp::ReadUntil(owner, session, max_size, delim.to_vec(), read_timeout)
     };
 
     if let Some(channel) = CONTEXT.net.get(&fd) {
         if let Err(err) = channel.value().0.try_send(op) {
-            response_error(
-                owner,
-                session,
-                format!("socket_read channel send error: {}", err).into_bytes(),
-            );
+            laux::lua_push(state, false);
+            laux::lua_push(state, format!("socket_read channel send error: {}", err));
+            return 2;
         }
     } else {
-        response_error(
-            owner,
-            session,
-            format!("socket_read error: fd not found: {}", fd).into_bytes(),
-        );
+        laux::lua_push(state, false);
+        laux::lua_push(state, format!("socket_read error: fd not found: {}", fd));
+        return 2;
     }
 
-    lua.push(session);
+    laux::lua_push(state, session);
 
     1
 }
 
 extern "C-unwind" fn lua_socket_write(state: *mut ffi::lua_State) -> c_int {
-    let lua = LuaStateRef::new(state);
     let actor = LuaActor::from_lua_state(state);
 
-    let fd = lua.get(1);
+    let fd = laux::lua_get(state, 1);
     let data = laux::check_buffer(state, 2);
-    let close = lua.opt(3).unwrap_or_default();
+    let close = laux::lua_opt(state, 3).unwrap_or_default();
 
     if let Some(channel) = CONTEXT.net.get(&fd) {
         match channel
@@ -365,26 +361,24 @@ extern "C-unwind" fn lua_socket_write(state: *mut ffi::lua_State) -> c_int {
             .try_send(NetOp::Write(actor.id, data.unwrap(), close))
         {
             Ok(_) => {
-                lua.push(true);
+                laux::lua_push(state, true);
                 return 1;
             }
             Err(err) => {
-                lua.push(false);
-                lua.push(format!("socket_write channel send error: {}", err));
+                laux::lua_push(state, false);
+                laux::lua_push(state, format!("socket_write channel send error: {}", err));
             }
         }
     } else {
-        lua.push(false);
-        lua.push(format!("socket_write error: fd not found: {}", fd));
+        laux::lua_push(state, false);
+        laux::lua_push(state, format!("socket_write error: fd not found: {}", fd));
     }
     2
 }
 
 extern "C-unwind" fn lua_socket_connect(state: *mut ffi::lua_State) -> c_int {
-    let lua = LuaStateRef::new(state);
-
-    let addr: &str = lua.get(1);
-    let connect_timeout: u64 = lua.opt(2).unwrap_or(5000);
+    let addr: &str = laux::lua_get(state, 1);
+    let connect_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(5000);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
@@ -403,40 +397,42 @@ extern "C-unwind" fn lua_socket_connect(state: *mut ffi::lua_State) -> c_int {
                 });
             }
             Ok(Err(err)) => {
-                response_error(
-                    owner,
-                    session,
-                    format!("connect error: {}", err).into_bytes(),
-                );
+                CONTEXT.response_error(0, owner, -session, format!("connect error: {}", err));
             }
             Err(err) => {
-                response_error(
-                    owner,
-                    session,
-                    format!("connect timeout: {}", err).into_bytes(),
-                );
+                CONTEXT.response_error(0, owner, -session, format!("connect timeout: {}", err));
             }
         }
     });
 
-    lua.push(session);
+    laux::lua_push(state, session);
 
     1
 }
 
 extern "C-unwind" fn lua_socket_close(state: *mut ffi::lua_State) -> c_int {
-    let lua = LuaStateRef::new(state);
-
-    let fd = lua.get(1);
+    let fd = laux::lua_get(state, 1);
 
     if let Some(channel) = CONTEXT.net.get(&fd) {
         match channel.value().1.try_send(NetOp::Close()) {
             Ok(_) => {
-                lua.push(true);
+                laux::lua_push(state, true);
                 return 1;
             }
             Err(_) => {
                 return 0;
+            }
+        }
+    }
+    0
+}
+
+extern "C-unwind" fn lua_host(state: *mut ffi::lua_State) -> c_int {
+    if let Ok(addr) = laux::lua_opt(state, 1).unwrap_or("1.1.1.1:80").parse() {
+        if let Ok(socket) = TcpStream::connect_timeout(&addr, Duration::from_millis(1000)) {
+            if let Ok(local_addr) = socket.local_addr() {
+                laux::lua_push(state, local_addr.ip().to_string());
+                return 1;
             }
         }
     }
@@ -451,6 +447,7 @@ pub unsafe extern "C-unwind" fn luaopen_socket(state: *mut ffi::lua_State) -> c_
         lreg!("write", lua_socket_write),
         lreg!("connect", lua_socket_connect),
         lreg!("close", lua_socket_close),
+        lreg!("host", lua_host),
         lreg_null!(),
     ];
 

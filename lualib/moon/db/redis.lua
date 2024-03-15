@@ -1,6 +1,5 @@
 -- This file is modified version from https://github.com/cloudwu/skynet/blob/master/lualib/skynet/db/redis.lua
 
-local moon = require "moon"
 local buffer = require "buffer"
 local socket = require "moon.socket"
 

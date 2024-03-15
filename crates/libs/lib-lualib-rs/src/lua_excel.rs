@@ -18,7 +18,7 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
         Ok(mut reader) => {
             unsafe {
                 ffi::lua_createtable(state, 0, 2);
-                laux::push_str(
+                laux::lua_push(
                     state,
                     path.file_stem()
                         .unwrap_or_default()
@@ -36,7 +36,7 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
                     Ok(record) => unsafe {
                         ffi::lua_createtable(state, 0, record.len() as i32);
                         for (i, field) in record.iter().enumerate() {
-                            laux::push_str(state, field);
+                            laux::lua_push(state, field);
                             ffi::lua_rawseti(state, -2, (i + 1) as i64);
                         }
                         idx += 1;
@@ -44,7 +44,7 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
                     },
                     Err(err) => unsafe {
                         ffi::lua_pushboolean(state, 0);
-                        laux::push_str(
+                        laux::lua_push(
                             state,
                             format!("read csv '{}' error: {}", path.to_string_lossy(), err)
                                 .as_str(),
@@ -65,7 +65,7 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
                 ffi::lua_pushboolean(state, 0);
             }
 
-            laux::push_str(
+            laux::lua_push(
                 state,
                 format!("open file '{}' error: {}", path.to_string_lossy(), err).as_str(),
             );
@@ -86,7 +86,7 @@ fn read_xlxs(state: *mut ffi::lua_State, path: &Path) -> c_int {
                 if let Some(Ok(range)) = workbook.worksheet_range(sheet) {
                     unsafe {
                         ffi::lua_createtable(state, 0, 2);
-                        laux::push_str(state, sheet.as_str());
+                        laux::lua_push(state, sheet.as_str());
 
                         ffi::lua_setfield(state, -2, c_str!("name"));
 
@@ -103,11 +103,11 @@ fn read_xlxs(state: *mut ffi::lua_State, path: &Path) -> c_int {
                                         ffi::lua_pushinteger(state, *v as ffi::lua_Integer)
                                     }
                                     DataType::Float(v) => ffi::lua_pushnumber(state, *v),
-                                    DataType::String(v) => laux::push_str(state, v.as_str()),
+                                    DataType::String(v) => laux::lua_push(state, v.as_str()),
                                     DataType::Bool(v) => ffi::lua_pushboolean(state, *v as i32),
-                                    DataType::Error(v) => laux::push_str(state, &v.to_string()),
+                                    DataType::Error(v) => laux::lua_push(state, v.to_string()),
                                     DataType::Empty => ffi::lua_pushnil(state),
-                                    DataType::DateTime(v) => laux::push_str(state, &v.to_string()),
+                                    DataType::DateTime(v) => laux::lua_push(state, v.to_string()),
                                     _ => ffi::lua_pushnil(state),
                                 }
                                 ffi::lua_rawseti(state, -2, (j + 1) as i64);
@@ -126,14 +126,14 @@ fn read_xlxs(state: *mut ffi::lua_State, path: &Path) -> c_int {
         }
         Err(err) => unsafe {
             ffi::lua_pushboolean(state, 0);
-            laux::push_str(state, format!("{}", err).as_str());
+            laux::lua_push(state, format!("{}", err).as_str());
             2
         },
     }
 }
 
 extern "C-unwind" fn lua_excel_read(state: *mut ffi::lua_State) -> c_int {
-    let filename = laux::check_str(state, 1);
+    let filename: &str = laux::lua_get(state, 1);
     let path = Path::new(filename);
 
     match path.extension() {
@@ -144,16 +144,16 @@ extern "C-unwind" fn lua_excel_read(state: *mut ffi::lua_State) -> c_int {
                 "xlsx" => read_xlxs(state, path),
                 _ => unsafe {
                     ffi::lua_pushboolean(state, 0);
-                    laux::push_str(state, format!("unsupport file type: {}", ext).as_str());
+                    laux::lua_push(state, format!("unsupport file type: {}", ext));
                     2
                 },
             }
         }
         None => unsafe {
             ffi::lua_pushboolean(state, 0);
-            laux::push_str(
+            laux::lua_push(
                 state,
-                format!("unsupport file type: {}", path.to_string_lossy()).as_str(),
+                format!("unsupport file type: {}", path.to_string_lossy()),
             );
             2
         },

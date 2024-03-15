@@ -19,3 +19,5 @@ local v1, v2 = seri.unpack(str)
 assert(v1 == true)
 assert(v2 == "hello")
 
+moon.quit()
+

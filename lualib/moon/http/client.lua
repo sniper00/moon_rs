@@ -2,12 +2,7 @@ local moon = require "moon"
 local json = require "json"
 local core = require "http.core"
 
----@class HttpResponse
----@field public version string @ http version
----@field public status_code integer @ Integer Code of responded HTTP Status, e.g. 404 or 200. -1 means socket error and content is error message
----@field public headers table<string,any> @in lower-case key
----@field public body string|table @ raw body string| json table
-
+---@return table
 local function tojson(response)
     if response.status_code ~= 200 then return {} end
     return json.decode(response.body)
@@ -42,7 +37,15 @@ end
 
 local json_content_type = { ["Content-Type"] = "application/json" }
 ---@return HttpResponse
-function client.post_json(uri, tb)
+function client.post_json(uri, tb, headers)
+    if not headers then
+        headers = json_content_type
+    else
+        if not headers['Content-Type'] then
+            headers['Content-Type'] = "application/json"
+        end
+    end
+
     local res = parse_raw_response(moon.wait(core.request({
         uri = uri,
         method = "POST",
@@ -56,24 +59,34 @@ function client.post_json(uri, tb)
     return res
 end
 
-local function escape(s)
-    return (string.gsub(s, "([^A-Za-z0-9_])", function(c)
-        return string.format("%%%02X", string.byte(c))
-    end))
+function client.post(uri, content, headers)
+    return parse_raw_response(moon.wait(core.request({
+        uri = uri,
+        method = "POST",
+        content = content,
+        headers = headers
+    })))
 end
 
-local form_content_type = { ["Content-Type"] = "application/x-www-form-urlencoded" }
-function client.post_form(uri, tb)
-    local body = {}
-    for k, v in pairs(tb) do
-        table.insert(body, string.format("%s=%s", escape(k), escape(v)))
+local form_headers = { ["Content-Type"] = "application/x-www-form-urlencoded" }
+
+function client.post_form(uri, form, headers)
+    if not headers then
+        headers = form_headers
+    else
+        if not headers['Content-Type'] then
+            headers['Content-Type'] = "application/x-www-form-urlencoded"
+        end
+    end
+    for k, v in pairs(form) do
+        form[k] = tostring(v)
     end
 
     return parse_raw_response(moon.wait(core.request({
         uri = uri,
         method = "POST",
-        content = table.concat(body, "&"),
-        headers = form_content_type
+        content = core.encode_query_string(form),
+        headers = headers
     })))
 end
 

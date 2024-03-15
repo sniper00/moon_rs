@@ -67,7 +67,7 @@ moon.async(function()
     for i=1, nreceiver do
         local id = moon.new_service( {
             name = "receiver"..i,
-            source = "send_benchmark.lua",
+            source = "benchmark_send.lua",
             recever = true,
         })
 
