@@ -741,7 +741,7 @@ pub fn push_c_string(state: LuaStateRaw, s: *const i8) {
 ///stack +1
 #[inline]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn lua_as_string(state: LuaStateRaw, index: i32) -> &'static str {
+pub fn lua_as_str(state: LuaStateRaw, index: i32) -> &'static str {
     unsafe {
         let mut len = 0;
         let ptr = ffi::luaL_tolstring(state, index, &mut len);
