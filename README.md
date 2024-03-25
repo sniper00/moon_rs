@@ -6,6 +6,13 @@ This project is a reimplementation of `moon` in Rust. It's currently under devel
 
 Please note that this project is still in the early stages of development. Contributions and feedback are welcome.
 
+## Test
+
+```
+cargo run --release assets/example.lua
+cargo run --release assets/benchmark_send.lua
+```
+
 ## Development Status
 
 The project is currently in the development phase. Many features from the original Moon are yet to be implemented.
