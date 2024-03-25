@@ -2,7 +2,6 @@ use lib_lua::{ffi, ffi::luaL_Reg};
 use serde_json::Value;
 use std::{
     ffi::{c_char, c_int, c_void},
-    hash::{DefaultHasher, Hasher},
     mem::size_of,
 };
 
@@ -260,7 +259,7 @@ unsafe fn encode_object(
                 encode_one(state, writer, -1, depth, fmt, options)?;
             }
             ffi::LUA_TNUMBER => {
-                if ffi::lua_isinteger(state, -2) != 0 && options.enable_number_key{
+                if ffi::lua_isinteger(state, -2) != 0 && options.enable_number_key {
                     format_space(writer, fmt, depth);
                     let key = ffi::lua_tointeger(state, -2);
                     writer.push(b'\"');
@@ -404,7 +403,7 @@ unsafe fn decode_one(state: *mut ffi::lua_State, val: &Value, options: &JsonOpti
             for (k, v) in map {
                 if !k.is_empty() {
                     let c = k.as_bytes()[0];
-                    if (c.is_ascii_digit() || c == b'-') && options.enable_number_key{
+                    if (c.is_ascii_digit() || c == b'-') && options.enable_number_key {
                         if let Ok(n) = k.parse::<ffi::lua_Integer>() {
                             //try convert k to integer
                             ffi::lua_pushinteger(state, n);
@@ -520,10 +519,13 @@ unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
             }
             _ => {
                 has_error = true;
-                laux::lua_push(state, format!(
-                    "concat: unsupport value type :{}",
-                    laux::type_name(state, ltype)
-                ));
+                laux::lua_push(
+                    state,
+                    format!(
+                        "concat: unsupport value type :{}",
+                        laux::type_name(state, ltype)
+                    ),
+                );
                 break;
             }
         }
@@ -540,10 +542,32 @@ unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
+pub fn hash_combine_u64(h: &mut u64, k: u64) {
+    let m = 0xc6a4a7935bd1e995;
+    let r = 47;
+
+    let mut k = k;
+    k = k.wrapping_mul(m);
+    k ^= k >> r;
+    k = k.wrapping_mul(m);
+
+    *h ^= k;
+    *h = h.wrapping_mul(m);
+
+    // Completely arbitrary number, to prevent 0's
+    // from hashing to 0.
+    *h = h.wrapping_add(0xe6546b64);
+}
+
 fn hash_string(s: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(s.as_bytes());
-    hasher.finish()
+    let mut seed = 0;
+    let mut basis: u64 = 14695981039346656037;
+    for b in s.bytes() {
+        basis ^= b as u64;
+        basis = basis.wrapping_mul(1099511628211);
+        hash_combine_u64(&mut seed, basis);
+    }
+    seed
 }
 
 #[inline]
@@ -587,7 +611,7 @@ fn concat_resp_one(
             }
         }
         ffi::LUA_TSTRING => {
-            let slc = laux::lua_get(state, index);
+            let slc = laux::lua_to(state, index);
             write_resp(writer, slc);
         }
         ffi::LUA_TTABLE => {
@@ -627,26 +651,20 @@ extern "C-unwind" fn concat_resp(state: *mut ffi::lua_State) -> c_int {
     let mut writer = Box::new(Buffer::new());
     let mut has_error = false;
     let mut hash = 1;
-    if laux::lua_type(state, 1) == ffi::LUA_TSTRING {
+    if laux::lua_type(state, 2) != ffi::LUA_TTABLE {
         let key: &str = laux::lua_get(state, 1);
         if !key.is_empty() {
-            let mut hash_part = String::new();
+            let mut hash_part = None;
             if n > 1 {
-                let field: &str = laux::lua_get(state, 2);
-                if !field.is_empty() {
-                    hash_part = field.to_string();
-                }
+                hash_part = Some(laux::lua_to::<&str>(state, 2));
             }
 
             if n > 2 && (key.starts_with('h') || key.starts_with('H')) {
-                let field: &str = laux::lua_get(state, 3);
-                if !field.is_empty() {
-                    hash_part = field.to_string();
-                }
+                hash_part = Some(laux::lua_to::<&str>(state, 3));
             }
 
-            if !hash_part.is_empty() {
-                hash = hash_string(&hash_part);
+            if !hash_part.is_none() {
+                hash = hash_string(hash_part.unwrap());
             }
         }
     }
@@ -669,7 +687,7 @@ extern "C-unwind" fn concat_resp(state: *mut ffi::lua_State) -> c_int {
     writer.write_slice(b"\r\n");
 
     laux::lua_pushlightuserdata(state, Box::into_raw(writer) as *mut c_void);
-    laux::lua_push(state, hash);
+    laux::lua_push(state, (hash as ffi::lua_Integer).abs());
 
     2
 }
