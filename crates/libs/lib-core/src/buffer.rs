@@ -132,10 +132,10 @@ impl Buffer {
 
     pub fn seek(&mut self, pos: isize) -> bool {
         if pos < 0 {
-            if self.rpos < pos.abs() as usize {
+            if self.rpos < pos.unsigned_abs() {
                 return false;
             }
-            self.rpos -= pos.abs() as usize;
+            self.rpos -= pos.unsigned_abs();
             return true;
         }
 
