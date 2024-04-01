@@ -663,7 +663,7 @@ extern "C-unwind" fn concat_resp(state: *mut ffi::lua_State) -> c_int {
                 hash_part = Some(laux::lua_to::<&str>(state, 3));
             }
 
-            if !hash_part.is_none() {
+            if hash_part.is_some() {
                 hash = hash_string(hash_part.unwrap());
             }
         }

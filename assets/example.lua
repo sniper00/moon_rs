@@ -5,7 +5,7 @@ local conf = ...
 if conf.worker then
     local CMD = {}
 
-    function CMD.test_send(a, b)
+    function CMD.print(a, b)
         print("recv", a, b)
     end
 
@@ -24,10 +24,6 @@ if conf.worker then
 
     moon.dispatch("lua", function(sender, session, cmd, ...)
         --moon.print("dispatch", sender, session)
-        --print_r(cmd, ...)
-
-        -- print(cmd, ...)
-
         moon.response("lua", sender, session, CMD[cmd](...))
     end)
 
@@ -40,8 +36,6 @@ moon.dispatch("lua", function(sender, session, arg)
 end)
 
 moon.async(function()
-    print(moon.hash("md5", "12"))
-
     print("before sleep")
     moon.sleep(1000)
     print("end sleep")
@@ -49,14 +43,15 @@ moon.async(function()
     -- send to self
     moon.send("lua", moon.id, { a = 1, b = 2 })
 
+    -- create service
     local workerid = moon.new_service({
         name = "example",
         source = "example.lua",
-        worker = true,
+        worker = true, -- see line 5
     })
 
     -- send to other actor
-    moon.send("lua", workerid, "test_send", 1, 2)
+    moon.send("lua", workerid, "print", 1, 2, 3, {a=1, b= 1.5, c= true}, "hello world")
 
     local bt = moon.clock()
     for i = 1, 100000 do
@@ -65,7 +60,7 @@ moon.async(function()
 
     print("10w times call cost", moon.clock() - bt)
 
-    --- test error
+    --- test call error
     local ok, err = moon.call("lua", workerid, "sub", 1, 2)
     assert(not ok)
 
@@ -73,7 +68,7 @@ moon.async(function()
     print(moon.call("lua", workerid, "call_then_quit"))
 
     --- test not exist
-    print(moon.call("lua", workerid, "helloworld"))
+    print(moon.call("lua", workerid, "hello_world"))
 
     moon.exit(0)
 end)
