@@ -240,6 +240,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     package_path.push_str(&arg);
 
+    context::run_monitor();
+
+    context::run_timer();
+
     log::info!("system start. ({}:{})", file!(), line!());
 
     lua_actor::new_actor(LuaActorParam {
@@ -253,7 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         block: true,
     });
 
-    context::run_monitor();
+
 
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;

@@ -16,7 +16,6 @@ use std::{
     slice,
     time::Duration,
 };
-use tokio::time::sleep;
 
 unsafe extern "C-unwind" fn lua_actor_protect_init(state: *mut ffi::lua_State) -> c_int {
     let param = ffi::lua_touserdata(state, 1) as *mut LuaActorParam;
@@ -426,21 +425,10 @@ unsafe extern "C-unwind" fn lua_actor_callback(state: *mut ffi::lua_State) -> c_
 
 extern "C-unwind" fn lua_timeout(state: *mut ffi::lua_State) -> c_int {
     let interval = laux::lua_get(state, 1);
-    let id = LuaActor::from_lua_state(state).id;
+    let owner = LuaActor::from_lua_state(state).id;
     let timer_id = CONTEXT.next_timer_id();
-    tokio::spawn(async move {
-        if interval > 0 {
-            sleep(Duration::from_millis(interval)).await;
-        }
 
-        CONTEXT.send(Message {
-            ptype: context::PTYPE_TIMER,
-            from: timer_id,
-            to: id,
-            session: 0,
-            data: None,
-        });
-    });
+    context::insert_timer(owner, timer_id, interval);
 
     laux::lua_push(state, timer_id);
 

@@ -1,7 +1,9 @@
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use reqwest::ClientBuilder;
 use std::{
+    collections::BTreeSet,
     sync::{
         atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering},
         Arc,
@@ -9,7 +11,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, Mutex},
+    time::timeout,
+};
 
 use super::{actor::LuaActor, buffer::Buffer, log::Logger};
 
@@ -37,6 +42,8 @@ lazy_static! {
             .use_rustls_tls()
             .tcp_nodelay(true);
 
+        let (tx, rx) = mpsc::unbounded_channel();
+
         LuaActorServer {
             actor_uuid: AtomicI64::new(1),
             timer_uuid: AtomicI64::new(1),
@@ -50,6 +57,10 @@ lazy_static! {
             env: DashMap::new(),
             net: DashMap::new(),
             monitor: DashMap::new(),
+            timer_tx: tx,
+            timer_rx: Mutex::new(rx),
+            now: Utc::now(),
+            time_offset: AtomicU64::new(0),
         }
     };
     pub static ref LOGGER: Logger = Logger::new();
@@ -95,10 +106,14 @@ pub struct LuaActorServer {
     actors: DashMap<i64, mpsc::UnboundedSender<Message>>,
     unique_actors: DashMap<String, i64>,
     clock: Instant,
-    pub http_client: reqwest::Client,
     env: DashMap<String, Arc<String>>,
-    pub net: DashMap<i64, NetChannel>,
     monitor: DashMap<u64, Monitor>,
+    timer_tx: mpsc::UnboundedSender<Timer>,
+    timer_rx: Mutex<mpsc::UnboundedReceiver<Timer>>,
+    now: DateTime<Utc>,
+    time_offset: AtomicU64,
+    pub net: DashMap<i64, NetChannel>,
+    pub http_client: reqwest::Client,
 }
 
 impl LuaActorServer {
@@ -212,8 +227,8 @@ impl LuaActorServer {
 
     pub fn next_net_fd(&self) -> i64 {
         let fd = self.net_uuid.fetch_add(1, Ordering::AcqRel);
-        if fd == 0 {
-            self.net_uuid.fetch_add(1, Ordering::AcqRel);
+        if fd == i64::MAX {
+            panic!("net fd overflow");
         }
         fd
     }
@@ -221,13 +236,25 @@ impl LuaActorServer {
     pub fn next_timer_id(&self) -> i64 {
         let id = self.timer_uuid.fetch_add(1, Ordering::AcqRel);
         if id == 0 {
-            self.timer_uuid.fetch_add(1, Ordering::AcqRel);
+            panic!("timer fd overflow");
         }
         id
     }
 
     pub fn clock(&self) -> f64 {
         self.clock.elapsed().as_secs_f64()
+    }
+
+    pub fn now_clock(&self) -> Duration {
+        self.clock.elapsed() + Duration::from_millis(self.time_offset.load(Ordering::Acquire))
+    }
+
+    pub fn now(&self) -> DateTime<Utc> {
+        self.now + self.now_clock()
+    }
+
+    pub fn set_time_offset(&self, offset: u64) {
+        self.time_offset.fetch_add(offset, Ordering::Release);
     }
 
     pub fn response_error(&self, from: i64, to: i64, session: i64, err: String) {
@@ -284,6 +311,57 @@ pub fn run_monitor() {
         }
         thread::sleep(Duration::from_secs(5));
         CONTEXT.check_monitor();
+    });
+}
+
+#[derive(Ord, PartialOrd, Eq, PartialEq, Debug)]
+struct Timer {
+    expiry_clock: i64,
+    timer_id: i64,
+    owner: i64,
+}
+
+pub fn insert_timer(owner: i64, timer_id: i64, interval: u64) {
+    let expiry_clock = CONTEXT.now_clock() + Duration::from_millis(interval);
+    let _ = CONTEXT.timer_tx.send(Timer {
+        timer_id,
+        expiry_clock: expiry_clock.as_millis() as i64,
+        owner,
+    });
+}
+
+pub fn run_timer() {
+    tokio::spawn(async move {
+        let mut btree_map = BTreeSet::new();
+        let mut rc = CONTEXT.timer_rx.lock().await;
+        loop {
+            match timeout(Duration::from_millis(1), rc.recv()).await {
+                Ok(Some(timer)) => {
+                    //println!("insert timer: {:?} {:?}", timer, CONTEXT.now_clock());
+                    btree_map.insert(timer);
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(_) => {} //timeout
+            }
+
+            while let Some(timer) = btree_map.first() {
+                if timer.expiry_clock <= CONTEXT.now_clock().as_millis() as i64 {
+                    //println!("timer timeout: {:?} {:?}", timer, CONTEXT.now_clock());
+                    CONTEXT.send(Message {
+                        ptype: PTYPE_TIMER,
+                        from: timer.timer_id,
+                        to: timer.owner,
+                        session: 0,
+                        data: None,
+                    });
+                    btree_map.pop_first();
+                } else {
+                    break;
+                }
+            }
+        }
     });
 }
 

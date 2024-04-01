@@ -158,14 +158,14 @@ end
 --- @param PTYPE string @ The protocol type.
 --- @param receiver integer @ The service ID of the receiver.
 --- @param data? string|buffer_ptr @ The message content.
---- @param sessionid? integer @ The session ID.
-function moon.raw_send(PTYPE, receiver, data, sessionid)
+--- @param session? integer @ The session ID.
+function moon.raw_send(PTYPE, receiver, data, session)
     local p = protocol[PTYPE]
     if not p then
         error(string.format("moon send unknown PTYPE[%s] message", PTYPE))
     end
-    sessionid = sessionid or 0
-    _send(p.PTYPE, receiver, data, sessionid)
+    session = session or 0
+    _send(p.PTYPE, receiver, data, session)
 end
 
 --- @class service_params
@@ -306,7 +306,7 @@ function moon.wait(session, receiver)
             session_id_coroutine[session] = false
         end
 
-        if c then -- moon.wakeup 传递的额外参数
+        if c then -- Extra parameters passed to moon.wakeup
             return table.unpack(c)
         else
             return a, b --- false, "BREAK"

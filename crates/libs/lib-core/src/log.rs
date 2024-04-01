@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use crate::buffer::Buffer;
+use crate::{buffer::Buffer, context::CONTEXT};
 
 const STATE_INIT: u8 = 0;
 const STATE_RUNNING: u8 = 1;
@@ -182,7 +182,7 @@ impl Logger {
         line.write(Logger::level_to_u8(level));
 
         line.write_str(
-            Local::now()
+                CONTEXT.now().with_timezone(&Local)
                 .format("%Y-%m-%d %H:%M:%S.%3f | ")
                 .to_string()
                 .as_str(),
