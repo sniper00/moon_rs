@@ -424,14 +424,23 @@ unsafe extern "C-unwind" fn lua_actor_callback(state: *mut ffi::lua_State) -> c_
 }
 
 extern "C-unwind" fn lua_timeout(state: *mut ffi::lua_State) -> c_int {
-    let interval = laux::lua_get(state, 1);
+    let interval: i64 = laux::lua_get(state, 1);
     let owner = LuaActor::from_lua_state(state).id;
     let timer_id = CONTEXT.next_timer_id();
 
-    context::insert_timer(owner, timer_id, interval);
+    if interval <= 0 {
+        CONTEXT.send(Message {
+            ptype: context::PTYPE_TIMER,
+            from: timer_id,
+            to: owner,
+            session: 0,
+            data: None,
+        });
+    } else {
+        context::insert_timer(owner, timer_id, interval as u64);
+    }
 
     laux::lua_push(state, timer_id);
-
     1
 }
 
