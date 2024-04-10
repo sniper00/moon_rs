@@ -5,7 +5,7 @@ local core = require "net.core"
 local socket = {
     ---@type fun(addr: string):integer @ Listens on the specified address. return listenfd
     listen = core.listen,
-    ---@type fun(fd: integer, data: string, close?: boolean) @ Writes data to the socket.
+    ---@type fun(fd: integer, data: string|buffer_ptr, close?: boolean) @ Writes data to the socket.
     write = core.write,
     ---@type fun(fd: integer) Closes the socket.
     close = core.close,
