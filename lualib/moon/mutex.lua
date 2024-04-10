@@ -18,6 +18,7 @@ local function mutex()
 		end
 	end})
 
+    ---@nodiscard
 	return function(refcount)
 		if refcount then
 			return ref
