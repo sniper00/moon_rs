@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use reqwest::ClientBuilder;
@@ -287,10 +287,10 @@ impl LuaActorServer {
 
     pub fn check_monitor(&self) {
         self.monitor.iter().for_each(|v| {
-            // log::info!("check_monitor thread id: {:?}", v.key());
             let w = v.value();
-            if w.tm > 0.0 && self.clock() >= 5.0 {
-                let s =  format!("endless_loop,A message PTYPE {} from {:08X} to {:08X} maybe in an endless loop (tm={})", v.ptype, v.from, v.to, v.tm);
+            //log::info!("check_monitor thread id: {:?} tm: {:?} clock: {}. diff {}", v.key(), w.tm, self.clock(), self.clock() - w.tm);
+            if w.tm > 0.0 && self.clock() - w.tm >= 1.0 {
+                let s =  format!("endless_loop,A message PTYPE {} from {:08X} to {:08X} maybe in an endless loop (tm={})", v.ptype, v.from, v.to, (self.now + Duration::from_secs_f64(v.tm)).with_timezone(&Local));
                 log::error!("{}", s);
                 self.send(Message {
                     ptype: PTYPE_SYSTEM,
