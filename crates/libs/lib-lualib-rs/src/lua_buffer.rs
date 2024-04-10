@@ -224,16 +224,7 @@ extern "C-unwind" fn buffer_new(state: *mut ffi::lua_State) -> c_int {
             c_str!("invalid capacity"),
         )
     };
-    let heade_reserve = laux::lua_opt::<usize>(state, 2).unwrap_or(buffer::DEFAULT_HEAD_RESERVE);
-    unsafe {
-        ffi::luaL_argcheck(
-            state,
-            if heade_reserve < 1024 * 1024 { 1 } else { 0 },
-            2,
-            c_str!("invalid heade reserve size"),
-        )
-    };
-    let buf = Box::new(Buffer::with_head_reserve(capacity, heade_reserve));
+    let buf = Box::new(Buffer::with_capacity(capacity));
     unsafe {
         ffi::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);
     }

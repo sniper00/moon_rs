@@ -176,13 +176,14 @@ impl Logger {
             self_enable_stdout
         };
 
-        let mut line =
-            Buffer::with_head_reserve(if data_size > 0 { 64 + data_size } else { 256 }, 0);
+        let mut line = Buffer::with_capacity(if data_size > 0 { 64 + data_size } else { 256 });
         line.write(if enable_stdout { 1 } else { 0 });
         line.write(Logger::level_to_u8(level));
 
         line.write_str(
-                CONTEXT.now().with_timezone(&Local)
+            CONTEXT
+                .now()
+                .with_timezone(&Local)
                 .format("%Y-%m-%d %H:%M:%S.%3f | ")
                 .to_string()
                 .as_str(),

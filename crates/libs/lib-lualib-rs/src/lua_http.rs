@@ -42,7 +42,12 @@ async fn http_request(
         .send()
         .await?;
 
-    let mut buffer = Buffer::with_head_reserve(256, 4);
+    let mut buffer = Buffer::with_capacity(256);
+
+    //reserve 4 bytes for store length
+
+    buffer.commit(std::mem::size_of::<u32>());
+
     buffer.write_str(
         format!(
             "{} {} {}\r\n",
@@ -64,6 +69,7 @@ async fn http_request(
         );
     }
 
+    buffer.seek(std::mem::size_of::<u32>() as isize);
     buffer.write_front((buffer.len() as u32).to_le_bytes().as_ref());
 
     let body = response.bytes().await?;

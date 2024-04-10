@@ -1,4 +1,4 @@
-use lib_core::buffer::{self, Buffer};
+use lib_core::buffer::Buffer;
 use lib_lua::{ffi, ffi::luaL_Reg};
 use std::ffi::c_int;
 use std::net::TcpStream;
@@ -28,134 +28,150 @@ use lib_core::{
 // pub const SOCKET_WRITE: i8 = 3;
 // pub const SOCKET_CONNECT: i8 = 4;
 
-async fn handle_read(reader: OwnedReadHalf, rx: &mut mpsc::Receiver<NetOp>) {
-    let mut reader = BufReader::new(reader);
-    while let Some(op) = rx.recv().await {
-        match op {
-            NetOp::ReadUntil(owner, session, max_size, delim, read_timeout) => {
-                let mut buffer = Box::new(Buffer::with_capacity(std::cmp::min(
-                    max_size,
-                    512 - buffer::DEFAULT_HEAD_RESERVE,
-                )));
-                loop {
-                    let read_res;
-                    if read_timeout > 0 {
-                        match timeout(
-                            Duration::from_millis(read_timeout),
-                            reader.read_until(*delim.last().unwrap(), buffer.as_mut_vec()),
-                        )
-                        .await
-                        {
-                            Ok(res) => {
-                                read_res = res;
-                            }
-                            Err(err) => {
-                                CONTEXT.response_error(
-                                    0,
-                                    owner,
-                                    -session,
-                                    format!("read timeout: {}", err),
-                                );
-                                return;
-                            }
-                        }
-                    } else {
-                        read_res = reader
-                            .read_until(*delim.last().unwrap(), buffer.as_mut_vec())
-                            .await;
-                    }
-
-                    match read_res {
-                        Ok(0) => {
-                            CONTEXT.response_error(0, owner, -session, "eof".to_string());
-                            return;
-                        }
-                        Ok(_) => {
-                            if buffer.len() >= max_size {
-                                CONTEXT.response_error(
-                                    0,
-                                    owner,
-                                    -session,
-                                    "max read size limit".to_string(),
-                                );
-                                return;
-                            }
-                            if buffer.as_vec().ends_with(delim.as_ref()) {
-                                buffer.revert(delim.len());
-                                if CONTEXT
-                                    .send(Message {
-                                        ptype: context::PTYPE_SOCKET_TCP,
-                                        from: 0,
-                                        to: owner,
-                                        session,
-                                        data: Some(buffer),
-                                    })
-                                    .is_some()
-                                {
-                                    return;
-                                }
-                                break;
-                            }
-                            //log::warn!("continue read {}", session);
-                        }
-                        Err(err) => {
-                            CONTEXT.response_error(0, owner, -session, err.to_string());
-                            return;
-                        }
-                    }
+async fn read_until(
+    reader: &mut BufReader<OwnedReadHalf>,
+    owner: i64,
+    session: i64,
+    max_size: usize,
+    delim: Vec<u8>,
+    read_timeout: u64,
+) -> bool {
+    let mut buffer = Box::new(Buffer::with_capacity(std::cmp::min(max_size, 512)));
+    loop {
+        let read_res;
+        if read_timeout > 0 {
+            match timeout(
+                Duration::from_millis(read_timeout),
+                reader.read_until(*delim.last().unwrap(), buffer.as_mut_vec()),
+            )
+            .await
+            {
+                Ok(res) => {
+                    read_res = res;
+                }
+                Err(err) => {
+                    CONTEXT.response_error(0, owner, -session, format!("read timeout: {}", err));
+                    return false;
                 }
             }
-            NetOp::ReadBytes(owner, session, size, read_timeout) => {
-                if size == 0 {
-                    CONTEXT.response_error(
-                        0,
-                        owner,
-                        -session,
-                        "socket op:ReadBytes size must be greater than 0".to_string(),
-                    );
-                    return;
+        } else {
+            read_res = reader
+                .read_until(*delim.last().unwrap(), buffer.as_mut_vec())
+                .await;
+        }
+
+        match read_res {
+            Ok(0) => {
+                CONTEXT.response_error(0, owner, -session, "eof".to_string());
+                return false;
+            }
+            Ok(_) => {
+                if buffer.len() >= max_size {
+                    CONTEXT.response_error(0, owner, -session, "max read size limit".to_string());
+                    return false;
                 }
-                let mut buffer = Box::new(Buffer::with_capacity(size));
-                let space = buffer.prepare(size);
-                let read_res;
-                if read_timeout > 0 {
-                    match timeout(
-                        Duration::from_millis(read_timeout),
-                        reader.read_exact(space),
-                    )
-                    .await
+                if buffer.as_vec().ends_with(delim.as_ref()) {
+                    buffer.revert(delim.len());
+                    if CONTEXT
+                        .send(Message {
+                            ptype: context::PTYPE_SOCKET_TCP,
+                            from: 0,
+                            to: owner,
+                            session,
+                            data: Some(buffer),
+                        })
+                        .is_some()
                     {
-                        Ok(res) => {
-                            read_res = res;
-                        }
-                        Err(err) => {
-                            CONTEXT.response_error(
-                                0,
-                                owner,
-                                -session,
-                                format!("read timeout: {}", err),
-                            );
-                            return;
-                        }
+                        return false;
                     }
-                } else {
-                    read_res = reader.read_exact(space).await;
+                    break;
                 }
+                //log::warn!("continue read {}", session);
+            }
+            Err(err) => {
+                CONTEXT.response_error(0, owner, -session, err.to_string());
+                return false;
+            }
+        }
+    }
+    true
+}
 
-                if let Err(err) = read_res {
-                    CONTEXT.response_error(0, owner, -session, err.to_string());
-                    return;
-                }
+async fn read_bytes(
+    reader: &mut BufReader<OwnedReadHalf>,
+    owner: i64,
+    session: i64,
+    size: usize,
+    read_timeout: u64,
+) -> bool {
+    if size == 0 {
+        CONTEXT.response_error(
+            0,
+            owner,
+            -session,
+            "socket op:ReadBytes size must be greater than 0".to_string(),
+        );
+        return false;
+    }
+    let mut buffer = Box::new(Buffer::with_capacity(size));
+    let space = buffer.prepare(size);
+    let read_res;
+    if read_timeout > 0 {
+        match timeout(
+            Duration::from_millis(read_timeout),
+            reader.read_exact(space),
+        )
+        .await
+        {
+            Ok(res) => {
+                read_res = res;
+            }
+            Err(err) => {
+                CONTEXT.response_error(0, owner, -session, format!("read timeout: {}", err));
+                return false;
+            }
+        }
+    } else {
+        read_res = reader.read_exact(space).await;
+    }
 
-                buffer.commit(size);
-
-                CONTEXT.send(Message {
+    match read_res {
+        Ok(_) => {
+            buffer.commit(size);
+            if CONTEXT
+                .send(Message {
                     ptype: context::PTYPE_SOCKET_TCP,
                     from: 0,
                     to: owner,
                     session,
                     data: Some(buffer),
-                });
+                })
+                .is_some()
+            {
+                return false;
+            }
+        }
+        Err(err) => {
+            CONTEXT.response_error(0, owner, -session, err.to_string());
+            return false;
+        }
+    }
+    true
+}
+
+async fn handle_read(reader: OwnedReadHalf, rx: &mut mpsc::Receiver<NetOp>) {
+    let mut reader = BufReader::new(reader);
+    while let Some(op) = rx.recv().await {
+        match op {
+            NetOp::ReadUntil(owner, session, max_size, delim, read_timeout) => {
+                if !read_until(&mut reader, owner, session, max_size, delim, read_timeout).await {
+                    return;
+                }
+            }
+            NetOp::ReadBytes(owner, session, size, read_timeout) => {
+                if !read_bytes(&mut reader, owner, session, size, read_timeout).await {
+                    return;
+                }
             }
             _ => {}
         }
@@ -186,9 +202,9 @@ async fn handle_write(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<NetOp>)
 
 async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) {
     let fd = CONTEXT.next_net_fd();
-    let (tx0, rx0) = mpsc::channel::<NetOp>(1);
-    let (tx1, rx1) = mpsc::channel::<NetOp>(100);
-    CONTEXT.net.insert(fd, NetChannel(tx0, tx1));
+    let (tx_reader, rx_reader) = mpsc::channel::<NetOp>(1);
+    let (tx_writer, rx_writer) = mpsc::channel::<NetOp>(100);
+    CONTEXT.net.insert(fd, NetChannel(tx_reader, tx_writer));
 
     if CONTEXT
         .send(Message {
@@ -208,16 +224,13 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
     let (reader, writer) = socket.into_split();
 
     let mut read_task = tokio::spawn(async move {
-        let mut rx = rx0;
+        let mut rx = rx_reader;
         handle_read(reader, &mut rx).await;
         let mut left = Vec::with_capacity(10);
         rx.recv_many(&mut left, 10).await;
         for op in left {
             match op {
-                NetOp::ReadUntil(owner, session, _, _, _) => {
-                    CONTEXT.response_error(0, owner, -session, "closed".to_string());
-                }
-                NetOp::ReadBytes(owner, session, _, _) => {
+                NetOp::ReadUntil(owner, session, ..) | NetOp::ReadBytes(owner, session, ..) => {
                     CONTEXT.response_error(0, owner, -session, "closed".to_string());
                 }
                 _ => {}
@@ -225,7 +238,7 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
         }
     });
 
-    let mut write_task = tokio::spawn(handle_write(writer, rx1));
+    let mut write_task = tokio::spawn(handle_write(writer, rx_writer));
 
     if tokio::try_join!(&mut read_task, &mut write_task).is_err() {
         read_task.abort();

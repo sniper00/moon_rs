@@ -1,6 +1,6 @@
 use lib_core::{
-    c_str, context,
-    context::{LuaActorParam, CONTEXT, LOGGER},
+    c_str,
+    context::{self, LuaActorParam, CONTEXT, LOGGER},
     error::Error,
     laux::{self, LuaState},
 };
@@ -256,8 +256,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         params: package_path,
         block: true,
     });
-
-
 
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
