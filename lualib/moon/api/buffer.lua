@@ -5,17 +5,13 @@ error("DO NOT REQUIRE THIS FILE")
 --- This is often used for data transmission between Lua and Rust layers.
 --- This object can be used as an argument for `moon.raw_send` or `socket.write`, 
 --- and it will be automatically released. Otherwise, `buffer.drop` should be used to release it.
---- The object's memory is divided into two parts: head and data. 
---- When writing the data part first and then adding content to the head of the data, 
---- the reserved head part can be used to avoid memory copying.
 ---@class buffer
 local buffer = {}
 
 --- Creates a `Rust Buffer` object that is not managed by `Lua GC`. 
 --- This object can be used as an argument for `moon.raw_send` or `socket.write`, 
 --- and it will be automatically released. Otherwise, `buffer.drop` should be used to release it.
----@param capacity? integer @ The initial capacity of the Buffer, default value is `240`.
----@param headreserved? integer @ The reserved space at the head of the Buffer, default value is `16`.
+---@param capacity? integer @ The initial capacity of the Buffer, default value is `128`.
 ---@return buffer_ptr
 function buffer.new(capacity, headreserved) end
 
@@ -85,7 +81,7 @@ function buffer.prepare(buf, n) end
 ---@return buffer_ptr
 function buffer.concat(...) end
 
---- Converts the parameters to a string and saves it in the buffer.
+--- Converts the parameters to a string.
 ---@return string
 function buffer.concat_string(...) end
 
