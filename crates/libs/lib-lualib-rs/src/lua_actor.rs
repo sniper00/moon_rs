@@ -53,18 +53,26 @@ unsafe extern "C-unwind" fn allocator(
         if !ptr.is_null() {
             let layout = Layout::from_size_align_unchecked(osize, lib_lua::SYS_MIN_ALIGN);
             alloc::dealloc(ptr as *mut u8, layout);
-            actor.mem -= osize;
+            actor.mem -= osize as isize;
         }
         return std::ptr::null_mut();
     }
 
+    // Do not allocate more than isize::MAX
     if nsize > isize::MAX as usize {
         return std::ptr::null_mut();
     }
 
-    actor.mem += nsize;
+    // Are we fit to the memory limits?
+    let mut mem_diff = nsize as isize;
+    if !ptr.is_null() {
+        mem_diff -= osize as isize;
+    }
 
-    if actor.mem_limit > 0 && actor.mem > actor.mem_limit {
+    let mem_limit = actor.mem_limit;
+    let new_used_memory = actor.mem + mem_diff;
+
+    if mem_limit > 0 && new_used_memory > mem_limit {
         log::error!(
             "Actor id:{:?} name:{:?} memory limit exceed: {}",
             actor.id,
@@ -73,6 +81,8 @@ unsafe extern "C-unwind" fn allocator(
         );
         return std::ptr::null_mut();
     }
+
+    actor.mem += mem_diff;
 
     if actor.mem > actor.mem_warning {
         actor.mem_warning *= 2;

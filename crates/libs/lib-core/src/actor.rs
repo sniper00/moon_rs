@@ -14,9 +14,9 @@ pub struct LuaActor {
     pub rx: mpsc::UnboundedReceiver<Message>,
     pub main_state: LuaState,
     pub callback_state: LuaThread,
-    pub mem: usize,
-    pub mem_limit: usize,
-    pub mem_warning: usize,
+    pub mem: isize,
+    pub mem_limit: isize,
+    pub mem_warning: isize,
 }
 
 impl LuaActor {
