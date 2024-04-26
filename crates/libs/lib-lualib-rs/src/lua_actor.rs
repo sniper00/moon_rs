@@ -9,13 +9,13 @@ use lib_core::{
     lreg, lreg_null,
 };
 use lib_lua::{ffi, ffi::luaL_Reg};
-use sha2::digest::DynDigest;
+
 use std::{
     alloc::{self, Layout},
     ffi::{c_char, c_int, c_void, CString},
-    slice,
-    time::Duration,
+    slice
 };
+use crate::lua_utils;
 
 unsafe extern "C-unwind" fn lua_actor_protect_init(state: *mut ffi::lua_State) -> c_int {
     let param = ffi::lua_touserdata(state, 1) as *mut LuaActorParam;
@@ -514,11 +514,6 @@ extern "C-unwind" fn lua_actor_exit(state: *mut ffi::lua_State) -> c_int {
     0
 }
 
-extern "C-unwind" fn num_cpus(state: *mut ffi::lua_State) -> c_int {
-    laux::lua_push(state, num_cpus::get());
-    1
-}
-
 extern "C-unwind" fn env(state: *mut ffi::lua_State) -> c_int {
     if laux::lua_top(state) == 2 {
         let key = laux::lua_get(state, 1);
@@ -634,56 +629,6 @@ extern "C-unwind" fn next_uuid(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-// Dynamic hash function
-fn use_hasher(hasher: &mut dyn DynDigest, data: &[u8]) -> Box<[u8]> {
-    hasher.update(data);
-    hasher.finalize_reset()
-}
-
-// You can use something like this when parsing user input, CLI arguments, etc.
-// DynDigest needs to be boxed here, since function return should be sized.
-fn select_hasher(s: &str) -> Option<Box<dyn DynDigest>> {
-    match s {
-        "md5" => Some(Box::<md5::Md5>::default()),
-        "sha1" => Some(Box::<sha1::Sha1>::default()),
-        "sha224" => Some(Box::<sha2::Sha224>::default()),
-        "sha256" => Some(Box::<sha2::Sha256>::default()),
-        "sha384" => Some(Box::<sha2::Sha384>::default()),
-        "sha512" => Some(Box::<sha2::Sha512>::default()),
-        _ => None,
-    }
-}
-
-fn to_hex_string(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        use std::fmt::Write;
-        write!(&mut s, "{:02x}", byte).expect("Writing to a String cannot fail");
-    }
-    s
-}
-
-extern "C-unwind" fn hash(state: *mut ffi::lua_State) -> c_int {
-    let hasher_type = laux::lua_get(state, 1);
-    let data = laux::lua_get::<&[u8]>(state, 2);
-    if let Some(mut hasher) = select_hasher(hasher_type) {
-        let res = use_hasher(&mut *hasher, data);
-        laux::lua_push(state, to_hex_string(res.as_ref()).as_str());
-        return 1;
-    }
-
-    laux::lua_error(
-        state,
-        format!("unsupported hasher {}", hasher_type).as_str(),
-    );
-}
-
-extern "C-unwind" fn thread_sleep(state: *mut ffi::lua_State) -> c_int {
-    let ms: u64 = laux::lua_get(state, 1);
-    std::thread::sleep(Duration::from_millis(ms as u64));
-    0
-}
-
 unsafe extern "C-unwind" fn luaopen_core(state: *mut ffi::lua_State) -> c_int {
     let l = [
         lreg!("new_service", lua_new_actor),
@@ -696,14 +641,16 @@ unsafe extern "C-unwind" fn luaopen_core(state: *mut ffi::lua_State) -> c_int {
         lreg!("exit", lua_actor_exit),
         lreg!("timeout", lua_timeout),
         lreg!("decode", lua_message_decode),
-        lreg!("num_cpus", num_cpus),
-        // lreg!("match", lua_regex),
         lreg!("env", env),
         lreg!("clock", clock),
         lreg!("tostring", tostring),
         lreg!("next_uuid", next_uuid),
-        lreg!("hash", hash),
-        lreg!("thread_sleep", thread_sleep),
+
+        lreg!("num_cpus", lua_utils::num_cpus),
+        lreg!("hash", lua_utils::hash),
+        lreg!("thread_sleep", lua_utils::thread_sleep),
+        lreg!("base64_encode", lua_utils::base64_encode),
+        lreg!("base64_decode", lua_utils::base64_decode),
         lreg_null!(),
     ];
 

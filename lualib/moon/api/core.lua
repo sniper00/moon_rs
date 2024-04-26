@@ -110,102 +110,13 @@ function core.now() end
 ---@nodiscard
 function core.decode(msg, pattern) end
 
--- ---clone message, but share buffer field
--- ---@param msg message_ptr
--- ---@return userdata
--- function core.clone(msg) end
+---@param data string
+---@return string
+function core.base64_encode(data) end
 
--- ---release clone message
--- ---@param msg message_ptr
--- function core.release(msg) end
+---@param base64str string
+---@return string
+function core.base64_decode(base64str) end
 
--- ---redirect a message to other service
--- function core.redirect(msg, receiver, mtype, sender, sessionid) end
-
--- ---@class asio
--- local asio = {}
-
--- --- Check port bindable or connectable
--- ---@param host string
--- ---@param port integer
--- ---@param is_connect? boolean @ bind or connect
--- ---@return boolean
--- function asio.try_open(host, port, is_connect) end
-
--- ---param protocol moon.PTYPE_SOCKET_TCP, moon.PTYPE_SOCKET_MOON, moon.PTYPE_SOCKET_WS
--- ---@param host string
--- ---@param port integer
--- ---@param protocol integer
--- ---@return integer
--- function asio.listen(host, port, protocol) end
-
--- ---send data to fd
--- ---@param fd integer
--- ---@param data string|buffer_ptr
--- ---@param flag? integer
--- ---@return boolean
--- function asio.write(fd, data, flag) end
-
--- ---@param fd integer
--- ---@param m message_ptr
--- ---@return boolean
--- function asio.write_message(fd, m) end
-
--- --- 设置读操作超时, 默认是0, 永远不会超时。为了处理大量链接的检测,实际超时检测并不严格，误差范围为[t, t+10)
--- ---@param fd integer
--- ---@param t integer @ seconds
--- ---@return boolean
--- function asio.settimeout(fd, t) end
-
--- ---@param fd integer
--- ---@return boolean
--- function asio.setnodelay(fd) end
-
--- ---@alias chunkmode
--- ---| 'r' # read.
--- ---| 'w' # write.
--- ---| 'rw'
--- ---| 'wr'
-
--- --- 对于PTYPE_SOCKET_MOON类型的协议, 默认最大长度是65534字节。
--- --- 可以设置chunkmode, 允许收发大于这个长度消息, 底层的处理是对消息进行切片。
--- ---@param fd integer
--- ---@param mode chunkmode
--- ---@return boolean
--- function asio.set_enable_chunked(fd, mode) end
-
--- --- set send queue limit
--- ---@param fd integer @ fd
--- ---@param warnsize integer @ if send queue size > warnsize, print warnning log
--- ---@param errorsize integer @ if send queue size > errorsize, print error log and close socket
--- function asio.set_send_queue_limit(fd, warnsize, errorsize) end
-
--- ---@param fd integer
--- function asio.close(fd) end
-
--- ---@param fd integer
--- ---@return string @ format ip:port
--- function asio.getaddress(fd) end
-
--- ---@param fd integer
--- ---@param addr string @ addr bytes string. see udp callback function second param or user make_endpoint
--- ---@param data string|userdata
--- ---@return boolean
--- function asio.sendto(fd, addr, data) end
-
--- ---@param fd integer
--- ---@param host string
--- ---@param port integer
--- ---@return boolean
--- function asio.udp_connect(fd, host, port) end
-
--- ---@param host string
--- ---@param port integer
--- ---@return string @addr bytes string
--- function asio.make_endpoint(host, port) end
-
--- ---
--- --- 切换协议类型, 要求fd关联的socket的type为moon.PTYPE_SOCKET_TCP. 现在只用于webscoket.
--- function asio.switch_type(fd, type) end
 
 return core

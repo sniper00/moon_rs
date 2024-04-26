@@ -7,6 +7,7 @@ mod lua_http;
 mod lua_json;
 mod lua_seri;
 mod lua_socket;
+mod lua_utils;
 
 pub mod lua_actor;
 
