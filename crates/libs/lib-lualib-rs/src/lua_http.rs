@@ -75,15 +75,13 @@ async fn http_request(
     let body = response.bytes().await?;
     buffer.write_slice(body.as_ref());
 
-    if let Some(sender) = CONTEXT.get(id) {
-        let _ = sender.send(Message {
-            ptype: context::PTYPE_HTTP,
-            from: 0,
-            to: id,
-            session,
-            data: Some(Box::new(buffer)),
-        });
-    }
+    CONTEXT.send(Message {
+        ptype: context::PTYPE_HTTP,
+        from: 0,
+        to: id,
+        session,
+        data: Some(Box::new(buffer)),
+    });
     Ok(())
 }
 

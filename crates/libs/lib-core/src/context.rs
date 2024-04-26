@@ -131,13 +131,6 @@ impl LuaActorServer {
         Ok(())
     }
 
-    pub fn get(
-        &self,
-        id: i64,
-    ) -> Option<dashmap::mapref::one::Ref<'_, i64, mpsc::UnboundedSender<Message>>> {
-        self.actors.get(&id)
-    }
-
     pub fn remove(&self, id: i64) -> Option<(i64, mpsc::UnboundedSender<Message>)> {
         self.actors.remove(&id)
     }
