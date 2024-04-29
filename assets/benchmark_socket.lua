@@ -28,7 +28,7 @@ end
 
 moon.async(function()
 
-    local listenfd  = socket.listen(conf.host..":"..conf.port)
+    local listenfd  = assert(socket.listen(conf.host..":"..conf.port))
 
     print(string.format([[
 

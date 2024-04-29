@@ -289,7 +289,7 @@ extern "C-unwind" fn lua_socket_listen(state: *mut ffi::lua_State) -> c_int {
         }
         Err(err) => {
             laux::lua_push(state, false);
-            laux::lua_push(state, format!("socket_listen error: {}", err));
+            laux::lua_push(state, format!("Listen '{}' failed: {}", addr, err));
             2
         }
     }
