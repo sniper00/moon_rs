@@ -37,12 +37,8 @@ static GLOBAL_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
 lazy_static! {
     pub static ref CONTEXT: LuaActorServer = {
-        let client_builder = ClientBuilder::new()
-            .timeout(Duration::from_secs(5))
-            .use_rustls_tls()
-            .tcp_nodelay(true);
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (timer_tx, timer_rx) = mpsc::unbounded_channel();
 
         LuaActorServer {
             actor_uuid: AtomicI64::new(1),
@@ -53,12 +49,12 @@ lazy_static! {
             actors: DashMap::new(),
             unique_actors: DashMap::new(),
             clock: Instant::now(),
-            http_client: client_builder.build().unwrap_or_default(),
+            http_clients: DashMap::new(),
             env: DashMap::new(),
             net: DashMap::new(),
             monitor: DashMap::new(),
-            timer_tx: tx,
-            timer_rx: Mutex::new(rx),
+            timer_tx: timer_tx,
+            timer_rx: Mutex::new(timer_rx),
             now: Utc::now(),
             time_offset: AtomicU64::new(0),
         }
@@ -113,7 +109,7 @@ pub struct LuaActorServer {
     now: DateTime<Utc>,
     time_offset: AtomicU64,
     pub net: DashMap<i64, NetChannel>,
-    pub http_client: reqwest::Client,
+    http_clients: DashMap<String, reqwest::Client>,
 }
 
 impl LuaActorServer {
@@ -294,6 +290,31 @@ impl LuaActorServer {
                 });
             }
         });
+    }
+
+    pub fn get_http_client(&self, timeout: u64, proxy: &String) -> reqwest::Client {
+        let name = format!("{}_{}", timeout, proxy);
+        if let Some(client) = self.http_clients.get(&name) {
+            return client.clone();
+        }
+
+        if timeout > 100 {
+            log::warn!("http client timeout {} is too long", timeout);
+        }
+
+        let builder = ClientBuilder::new()
+            .timeout(Duration::from_secs(timeout))
+            .use_rustls_tls()
+            .tcp_nodelay(true);
+
+        let client = if proxy.is_empty() {
+            builder.build().unwrap_or_default()
+        } else {
+            builder.proxy(reqwest::Proxy::all(proxy).unwrap()).build().unwrap_or_default()
+        };
+
+        self.http_clients.insert(name.to_string(), client.clone());
+        client
     }
 }
 

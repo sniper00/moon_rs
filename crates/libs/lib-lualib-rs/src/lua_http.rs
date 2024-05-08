@@ -14,6 +14,17 @@ pub type RequestResult = Result<(String, String, String, HashMap<String, String>
 
 pub type ResponseResult = Result<(String, String, HashMap<String, String>), &'static str>;
 
+struct HttpRequest {
+    id: i64,
+    session: i64,
+    method: String,
+    uri: String,
+    body: String,
+    headers: HeaderMap,
+    timeout: u64,
+    proxy: String,
+}
+
 fn version_to_string(version: &reqwest::Version) -> &str {
     match *version {
         reqwest::Version::HTTP_09 => "HTTP/0.9",
@@ -25,20 +36,13 @@ fn version_to_string(version: &reqwest::Version) -> &str {
     }
 }
 
-async fn http_request(
-    id: i64,
-    session: i64,
-    method: String,
-    uri: String,
-    content: String,
-    headers: HeaderMap,
-) -> Result<(), Box<dyn Error>> {
-    let http_client = &CONTEXT.http_client;
+async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
+    let http_client = &CONTEXT.get_http_client(req.timeout, &req.proxy);
 
     let response = http_client
-        .request(Method::from_str(method.as_str())?, uri)
-        .headers(headers)
-        .body(content)
+        .request(Method::from_str(req.method.as_str())?, req.uri)
+        .headers(req.headers)
+        .body(req.body)
         .send()
         .await?;
 
@@ -78,25 +82,15 @@ async fn http_request(
     CONTEXT.send(Message {
         ptype: context::PTYPE_HTTP,
         from: 0,
-        to: id,
-        session,
+        to: req.id,
+        session: req.session,
         data: Some(Box::new(buffer)),
     });
     Ok(())
 }
 
 extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
-    // let lua = laux::LuaStateRef::new(state);
-
     laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
-
-    let method: String = laux::opt_field(state, 1, "method").unwrap_or("GET".to_string());
-    let uri: String = laux::opt_field(state, 1, "uri").unwrap_or_default();
-    let content: String = laux::opt_field(state, 1, "content").unwrap_or_default();
-
-    let actor = LuaActor::from_lua_state(state);
-    let id = actor.id;
-    let session = actor.next_uuid();
 
     let mut headers = HeaderMap::new();
 
@@ -131,8 +125,24 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
         }
     }
 
+    let actor = LuaActor::from_lua_state(state);
+
+    let id = actor.id;
+    let session = actor.next_uuid();
+
+    let req = HttpRequest {
+        id,
+        session,
+        method: laux::opt_field(state, 1, "method").unwrap_or("GET".to_string()),
+        uri: laux::opt_field(state, 1, "uri").unwrap_or_default(),
+        body: laux::opt_field(state, 1, "body").unwrap_or_default(),
+        headers,
+        timeout: laux::opt_field(state, 1, "timeout").unwrap_or(5),
+        proxy: laux::opt_field(state, 1, "proxy").unwrap_or_default(),
+    };
+
     tokio::spawn(async move {
-        if let Err(err) = http_request(id, session, method, uri, content, headers).await {
+        if let Err(err) = http_request( req ).await {
             CONTEXT.response_error(0, id, -session, err.to_string());
         }
     });

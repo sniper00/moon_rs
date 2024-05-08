@@ -23,35 +23,44 @@ local function parse_raw_response(raw_response, err)
     return response
 end
 
+---@class HttpRequestOptions
+---@field headers? table<string,string>
+---@field timeout? integer
+---@field proxy? string
+
 local client = {}
 
----@param uri string @host:port
----@param headers? table
-function client.get(uri, headers)
-    return parse_raw_response(moon.wait(core.request({
-        uri = uri,
-        method = "GET",
-        headers = headers
-    })))
+---@param uri string
+---@param opts? HttpRequestOptions
+---@return HttpResponse
+function client.get(uri, opts)
+    opts = opts or {}
+    opts.uri = uri
+    opts.method = "GET"
+    return parse_raw_response(moon.wait(core.request(opts)))
 end
 
 local json_content_type = { ["Content-Type"] = "application/json" }
+
+---@param uri string
+---@param data table
+---@param opts? HttpRequestOptions
 ---@return HttpResponse
-function client.post_json(uri, tb, headers)
-    if not headers then
-        headers = json_content_type
+function client.post_json(uri, data, opts)
+    opts = opts or {}
+    if not opts.headers then
+        opts.headers = json_content_type
     else
-        if not headers['Content-Type'] then
-            headers['Content-Type'] = "application/json"
+        if not opts.headers['Content-Type'] then
+            opts.headers['Content-Type'] = "application/json"
         end
     end
 
-    local res = parse_raw_response(moon.wait(core.request({
-        uri = uri,
-        method = "POST",
-        headers = json_content_type,
-        content = json.encode(tb),
-    })))
+    opts.uri = uri
+    opts.method = "POST"
+    opts.body = json.encode(data)
+
+    local res = parse_raw_response(moon.wait(core.request(opts)))
 
     if res.status_code == 200 then
         res.body = tojson(res)
@@ -59,35 +68,44 @@ function client.post_json(uri, tb, headers)
     return res
 end
 
-function client.post(uri, content, headers)
-    return parse_raw_response(moon.wait(core.request({
-        uri = uri,
-        method = "POST",
-        content = content,
-        headers = headers
-    })))
+---@param uri string
+---@param data string
+---@param opts? HttpRequestOptions
+---@return HttpResponse
+function client.post(uri, data, opts)
+    opts = opts or {}
+    opts.uri = uri
+    opts.body = data
+    opts.method = "POST"
+    return parse_raw_response(moon.wait(core.request(opts)))
 end
 
 local form_headers = { ["Content-Type"] = "application/x-www-form-urlencoded" }
 
-function client.post_form(uri, form, headers)
-    if not headers then
-        headers = form_headers
+---@param uri string
+---@param data table<string,string>
+---@param opts? HttpRequestOptions
+---@return HttpResponse
+function client.post_form(uri, data, opts)
+    opts = opts or {}
+    if not opts.headers then
+        opts.headers = form_headers
     else
-        if not headers['Content-Type'] then
-            headers['Content-Type'] = "application/x-www-form-urlencoded"
+        if not opts.headers['Content-Type'] then
+            opts.headers['Content-Type'] = "application/x-www-form-urlencoded"
         end
     end
-    for k, v in pairs(form) do
-        form[k] = tostring(v)
+
+    opts.body = {}
+    for k, v in pairs(data) do
+        opts.body[k] = tostring(v)
     end
 
-    return parse_raw_response(moon.wait(core.request({
-        uri = uri,
-        method = "POST",
-        content = core.encode_query_string(form),
-        headers = headers
-    })))
+    opts.uri = uri
+    opts.method = "POST"
+    opts.body = core.encode_query_string(opts.body)
+
+    return parse_raw_response(moon.wait(core.request(opts)))
 end
 
 return client
