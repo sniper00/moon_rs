@@ -405,9 +405,9 @@ extern "C-unwind" fn lua_http_encode_query_string(state: *mut ffi::lua_State) ->
     laux::lua_pushnil(state);
     let mut query = HashMap::new();
     while laux::lua_next(state, 1) {
-        let key = laux::lua_get::<&str>(state, -2);
-        let value = laux::lua_get::<&str>(state, -1);
-        query.insert(key.to_string(), value.to_string());
+        let key = laux::to_string_unchecked(state, -2);
+        let value = laux::to_string_unchecked(state, -1);
+        query.insert(key, value);
         laux::lua_pop(state, 1);
     }
     let query_string = HttpParser::encode_query(&query);

@@ -768,3 +768,33 @@ pub fn lua_pushlightuserdata(state: LuaStateRaw, p: *mut std::ffi::c_void) {
         ffi::lua_pushlightuserdata(state, p);
     }
 }
+
+#[inline]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn to_string_unchecked(state: *mut ffi::lua_State, index: i32)-> String{
+    match lua_type(state, index) {
+        ffi::LUA_TNIL => {
+            String::from("nil")
+        }
+        ffi::LUA_TSTRING => {
+            lua_get::<String>(state, index)
+        }
+        ffi::LUA_TNUMBER => {
+            if is_integer(state, index) {
+                lua_to::<i64>(state, index).to_string()
+            } else {
+                lua_to::<f64>(state, index).to_string()
+            }
+        }
+        ffi::LUA_TBOOLEAN => {
+            if lua_to::<bool>(state, index) { 
+                String::from("true") 
+            } else { 
+                String::from("false") 
+            }
+        }
+        _ => {
+            String::from("string type expected")
+        }
+    }
+}
