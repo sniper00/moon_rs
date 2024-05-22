@@ -761,8 +761,7 @@ function _M.connect(opts)
     local charset = CHARSET_MAP[opts.charset or "_default"]
     local channel =
         socketchannel.channel {
-        host = opts.host,
-        port = opts.port or 3306,
+        addr = opts.addr,
         auth = _mysql_login(self, user, password, charset, database, opts.on_connect),
         overload = opts.overload,
         timeout = opts.timeout

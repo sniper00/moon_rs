@@ -171,7 +171,7 @@ pub fn new_actor(params: LuaActorParam) {
 
 pub fn init(actor: &mut LuaActor, params: &LuaActorParam) -> Result<(), String> {
     //log::info!("init actor id: {} name: {}", id, params.name);
-    actor.name = params.name.clone();
+    actor.name.clone_from(&params.name);
     actor.unique = params.unique;
 
     CONTEXT.add_actor(actor)?;

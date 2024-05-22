@@ -18,7 +18,7 @@ struct HttpRequest {
     id: i64,
     session: i64,
     method: String,
-    uri: String,
+    url: String,
     body: String,
     headers: HeaderMap,
     timeout: u64,
@@ -40,7 +40,7 @@ async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
     let http_client = &CONTEXT.get_http_client(req.timeout, &req.proxy);
 
     let response = http_client
-        .request(Method::from_str(req.method.as_str())?, req.uri)
+        .request(Method::from_str(req.method.as_str())?, req.url)
         .headers(req.headers)
         .body(req.body)
         .send()
@@ -134,7 +134,7 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
         id,
         session,
         method: laux::opt_field(state, 1, "method").unwrap_or("GET".to_string()),
-        uri: laux::opt_field(state, 1, "uri").unwrap_or_default(),
+        url: laux::opt_field(state, 1, "url").unwrap_or_default(),
         body: laux::opt_field(state, 1, "body").unwrap_or_default(),
         headers,
         timeout: laux::opt_field(state, 1, "timeout").unwrap_or(5),
@@ -407,7 +407,7 @@ extern "C-unwind" fn lua_http_encode_query_string(state: *mut ffi::lua_State) ->
     while laux::lua_next(state, 1) {
         let key = laux::to_string_unchecked(state, -2);
         let value = laux::to_string_unchecked(state, -1);
-        query.insert(key, value);
+        query.insert(key.to_string(), value.to_string());
         laux::lua_pop(state, 1);
     }
     let query_string = HttpParser::encode_query(&query);

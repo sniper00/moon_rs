@@ -53,7 +53,7 @@ lazy_static! {
             env: DashMap::new(),
             net: DashMap::new(),
             monitor: DashMap::new(),
-            timer_tx: timer_tx,
+            timer_tx,
             timer_rx: Mutex::new(timer_rx),
             now: Utc::now(),
             time_offset: AtomicU64::new(0),

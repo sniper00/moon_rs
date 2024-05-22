@@ -30,23 +30,23 @@ end
 
 local client = {}
 
----@param uri string
+---@param url string
 ---@param opts? HttpRequestOptions
 ---@return HttpResponse
-function client.get(uri, opts)
+function client.get(url, opts)
     opts = opts or {}
-    opts.uri = uri
+    opts.url = url
     opts.method = "GET"
     return parse_raw_response(moon.wait(core.request(opts)))
 end
 
 local json_content_type = { ["Content-Type"] = "application/json" }
 
----@param uri string
+---@param url string
 ---@param data table
 ---@param opts? HttpRequestOptions
 ---@return HttpResponse
-function client.post_json(uri, data, opts)
+function client.post_json(url, data, opts)
     opts = opts or {}
     if not opts.headers then
         opts.headers = json_content_type
@@ -56,7 +56,7 @@ function client.post_json(uri, data, opts)
         end
     end
 
-    opts.uri = uri
+    opts.url = url
     opts.method = "POST"
     opts.body = json.encode(data)
 
@@ -68,13 +68,13 @@ function client.post_json(uri, data, opts)
     return res
 end
 
----@param uri string
+---@param url string
 ---@param data string
 ---@param opts? HttpRequestOptions
 ---@return HttpResponse
-function client.post(uri, data, opts)
+function client.post(url, data, opts)
     opts = opts or {}
-    opts.uri = uri
+    opts.url = url
     opts.body = data
     opts.method = "POST"
     return parse_raw_response(moon.wait(core.request(opts)))
@@ -82,11 +82,11 @@ end
 
 local form_headers = { ["Content-Type"] = "application/x-www-form-urlencoded" }
 
----@param uri string
+---@param url string
 ---@param data table<string,string>
 ---@param opts? HttpRequestOptions
 ---@return HttpResponse
-function client.post_form(uri, data, opts)
+function client.post_form(url, data, opts)
     opts = opts or {}
     if not opts.headers then
         opts.headers = form_headers
@@ -101,7 +101,7 @@ function client.post_form(uri, data, opts)
         opts.body[k] = tostring(v)
     end
 
-    opts.uri = uri
+    opts.url = url
     opts.method = "POST"
     opts.body = core.encode_query_string(opts.body)
 

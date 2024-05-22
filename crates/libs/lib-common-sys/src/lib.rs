@@ -6,11 +6,16 @@ pub type DWORD = u32;
 pub type ConsoleHandlerRoutine = extern "system" fn(DWORD)->i32;
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn set_console_title(title: *const i8){
     extern "system" {
         fn SetConsoleTitleA(
             title: *const i8
         ) -> i32;
+    }
+
+    if title.is_null(){
+        return;
     }
 
     unsafe{
