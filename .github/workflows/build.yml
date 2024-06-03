@@ -57,10 +57,10 @@ jobs:
           cd archive
           if [ "${{ matrix.build }}" = "windows" ]; then
             cp "../target/${{ matrix.target }}/release/moon_rs.exe" ./
-            7z a "${{ matrix.archive-name }}" LICENSE README.md moon_rs.exe
+            7z a "${{ matrix.archive-name }}" README.md moon_rs.exe lualib assets
           else
             cp "../target/${{ matrix.target }}/release/moon_rs" ./
-            tar -czf "${{ matrix.archive-name }}" LICENSE README.md moon_rs
+            tar -czf "${{ matrix.archive-name }}" README.md moon_rs lualib assets
           fi
       - name: Upload archive
         uses: actions/upload-artifact@v1
