@@ -1,44 +1,69 @@
-name: Build
-
+name: build
 on:
-  push:
-    branches:
-      - main
-
+  workflow_dispatch: {}
 jobs:
   build:
-    name: Build
-    runs-on: ubuntu-latest
+    name: build
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-pc-windows-gnu
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
+        build: [linux, macos, windows]
+        include:
+          - build: linux
+            os: ubuntu-18.04
+            rust: nightly
+            target: x86_64-unknown-linux-musl
+            archive-name: moon_rs-linux.tar.gz
+          - build: macos
+            os: macos-latest
+            rust: nightly
+            target: x86_64-apple-darwin
+            archive-name: moon_rs-macos.tar.gz
+          - build: windows
+            os: windows-2022
+            rust: nightly-x86_64-msvc
+            target: x86_64-pc-windows-msvc
+            archive-name: moon_rs-windows.7z
+      fail-fast: false
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v2
 
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
+          toolchain: ${{ matrix.rust }}
           profile: minimal
-          toolchain: stable
           override: true
           target: ${{ matrix.target }}
 
-      - name: Install cross
-        run: cargo install cross
+      - name: Build binary
+        run: cargo build --verbose --release --target ${{ matrix.target }}
+        env:
+          RUST_BACKTRACE: 1
 
-      - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --target ${{ matrix.target }}
+      - name: Strip binary (linux and macos)
+        if: matrix.build == 'linux' || matrix.build == 'macos'
+        run: strip "target/${{ matrix.target }}/release/moon_rs"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v2
+      - name: Build archive
+        shell: bash
+        run: |
+          mkdir archive
+          cp README.md archive/
+          cp -r lualib archive/
+          cp -r assets archive/
+          cd archive
+          if [ "${{ matrix.build }}" = "windows" ]; then
+            cp "../target/${{ matrix.target }}/release/moon_rs.exe" ./
+            7z a "${{ matrix.archive-name }}" LICENSE README.md moon_rs.exe
+          else
+            cp "../target/${{ matrix.target }}/release/moon_rs" ./
+            tar -czf "${{ matrix.archive-name }}" LICENSE README.md moon_rs
+          fi
+      - name: Upload archive
+        uses: actions/upload-artifact@v1
         with:
-          name: ${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/*
+          name: ${{ matrix.archive-name }}
+          path: archive/${{ matrix.archive-name }}
