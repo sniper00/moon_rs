@@ -10,7 +10,7 @@ jobs:
         build: [linux, macos, windows]
         include:
           - build: linux
-            os: windows-latest
+            os: ubuntu-latest
             rust: nightly
             target: x86_64-unknown-linux-musl
             archive-name: moon_rs-linux.tar.gz
@@ -20,7 +20,7 @@ jobs:
             target: x86_64-apple-darwin
             archive-name: moon_rs-macos.tar.gz
           - build: windows
-            os: windows-2022
+            os: windows-latest
             rust: nightly-x86_64-msvc
             target: x86_64-pc-windows-msvc
             archive-name: moon_rs-windows.7z
