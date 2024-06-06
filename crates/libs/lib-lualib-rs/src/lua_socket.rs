@@ -36,6 +36,18 @@ async fn read_until(
     delim: Vec<u8>,
     read_timeout: u64,
 ) -> bool {
+    let mut with_delim = false;
+    let mut delim = delim.as_slice();
+    if delim.is_empty() || (delim[0] == b'^' && delim.len() < 2) {
+        CONTEXT.response_error(0, owner, -session, "socket op:ReadUntil delim is empty".to_string());
+        return false;
+    }
+    
+    if delim[0] == b'^' {
+        delim = &delim[1..];
+        with_delim = true;
+    }
+
     let mut buffer = Box::new(Buffer::with_capacity(std::cmp::min(max_size, 512)));
     loop {
         let read_res;
@@ -71,7 +83,9 @@ async fn read_until(
                     return false;
                 }
                 if buffer.as_vec().ends_with(delim.as_ref()) {
-                    buffer.revert(delim.len());
+                    if !with_delim {
+                        buffer.revert(delim.len());
+                    }
                     if CONTEXT
                         .send(Message {
                             ptype: context::PTYPE_SOCKET_TCP,

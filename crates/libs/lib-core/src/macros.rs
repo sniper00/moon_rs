@@ -30,7 +30,7 @@ macro_rules! lreg_null {
 macro_rules! lua_rawsetfield {
     ($state:expr, $tbindex:expr, $kname:expr, $valueexp:expr) => {
         unsafe {
-            ffi::lua_pushliteral($state, $kname);
+            ffi::lua_pushstring($state, c_str!($kname));
             $valueexp;
             ffi::lua_rawset($state, $tbindex);
         }

@@ -7,12 +7,10 @@ use lib_core::{
     lreg, lreg_null, lua_rawsetfield,
 };
 use lib_lua::{ffi, ffi::luaL_Reg};
+use percent_encoding::percent_decode;
 use reqwest::{header::HeaderMap, Method};
-use std::{collections::HashMap, error::Error, ffi::c_int, str::FromStr};
-
-pub type RequestResult = Result<(String, String, String, HashMap<String, String>), &'static str>;
-
-pub type ResponseResult = Result<(String, String, HashMap<String, String>), &'static str>;
+use std::{error::Error, ffi::c_int, str::FromStr};
+use url::form_urlencoded::{self};
 
 struct HttpRequest {
     id: i64,
@@ -72,6 +70,8 @@ async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
             .as_str(),
         );
     }
+
+    buffer.write_str("\r\n\r\n");
 
     buffer.seek(std::mem::size_of::<u32>() as isize);
     buffer.write_front((buffer.len() as u32).to_le_bytes().as_ref());
@@ -142,7 +142,7 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
     };
 
     tokio::spawn(async move {
-        if let Err(err) = http_request( req ).await {
+        if let Err(err) = http_request(req).await {
             CONTEXT.response_error(0, id, -session, err.to_string());
         }
     });
@@ -151,250 +151,98 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-pub struct HttpParser;
-
-impl HttpParser {
-    pub fn parse_response(sv: &str) -> ResponseResult {
-        let mut lines = sv.lines();
-        let line = match lines.next() {
-            Some(line) => line,
-            None => return Err("No input"),
-        };
-
-        let mut parts = line.splitn(3, ' ');
-        let version = match parts.next() {
-            Some(part) => part[5..].to_string(),
-            None => return Err("No version"),
-        };
-
-        let status_code = match parts.next() {
-            Some(part) => part.to_string(),
-            None => return Err("No status code"),
-        };
-
-        let mut header = HashMap::new();
-        for line in lines {
-            let mut parts = line.splitn(2, ':');
-            let key = match parts.next() {
-                Some(part) => part.trim().to_string(),
-                None => continue,
-            };
-
-            let value = match parts.next() {
-                Some(part) => part.trim().to_string(),
-                None => continue,
-            };
-
-            header.insert(key, value);
-        }
-
-        Ok((version, status_code, header))
-    }
-
-    pub fn parse_request(sv: &str) -> RequestResult {
-        let mut lines = sv.lines();
-        let line = match lines.next() {
-            Some(line) => line,
-            None => return Err("No input"),
-        };
-
-        let mut parts = line.splitn(3, ' ');
-        let method = match parts.next() {
-            Some(part) => part.to_string(),
-            None => return Err("No method"),
-        };
-
-        let mut path = match parts.next() {
-            Some(part) => part.to_string(),
-            None => return Err("No path"),
-        };
-
-        let mut query_string = String::new();
-        if let Some(index) = path.find('?') {
-            query_string = path[index + 1..].to_string();
-            path = path[..index].to_string();
-        }
-
-        let mut header = HashMap::new();
-        for line in lines {
-            let mut parts = line.splitn(2, ':');
-            let key = match parts.next() {
-                Some(part) => part.trim().to_string(),
-                None => continue,
-            };
-
-            let value = match parts.next() {
-                Some(part) => part.trim().to_string(),
-                None => continue,
-            };
-
-            header.insert(key, value);
-        }
-
-        Ok((method, path, query_string, header))
-    }
-
-    fn percent_encode(value: &str) -> String {
-        let mut result = String::new();
-        result.reserve(value.len()); // Minimum size of result
-        for chr in value.chars() {
-            if !(chr.is_ascii_digit()
-                || chr.is_ascii_uppercase()
-                || chr.is_ascii_lowercase()
-                || chr == '-'
-                || chr == '.'
-                || chr == '_'
-                || chr == '~')
-            {
-                result.push('%');
-                result.push_str(&format!("{:02X}", chr as u8));
-            } else {
-                result.push(chr);
-            }
-        }
-        result
-    }
-
-    fn percent_decode(value: &str) -> String {
-        let mut result = String::new();
-        result.reserve(value.len() / 3 + (value.len() % 3)); // Minimum size of result
-        let mut iter = value.chars();
-        while let Some(chr) = iter.next() {
-            if chr == '%' {
-                if let Some(hex) = iter.next() {
-                    if let Some(hex2) = iter.next() {
-                        let decoded_chr =
-                            u8::from_str_radix(&format!("{}{}", hex, hex2), 16).unwrap_or(0);
-                        result.push(decoded_chr as char);
-                    }
-                }
-            } else if chr == '+' {
-                result.push(' ');
-            } else {
-                result.push(chr);
-            }
-        }
-        result
-    }
-
-    fn encode_query(query: &HashMap<String, String>) -> String {
-        let mut result = String::new();
-        for (key, value) in query {
-            if !result.is_empty() {
-                result.push('&');
-            }
-            result.push_str(&HttpParser::percent_encode(key.as_str()));
-            result.push('=');
-            result.push_str(&HttpParser::percent_encode(value.as_str()));
-        }
-        result
-    }
-
-    /// Parses a query string into a `HashMap`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use your_crate::HttpParser;
-    /// use std::collections::HashMap;
-    ///
-    /// let query_string = "key%3Dvalue=value%26value";
-    /// let mut expected = HashMap::new();
-    /// expected.insert("key=value".to_string(), "value&value".to_string());
-    ///
-    /// assert_eq!(HttpParser::parse_query(query_string), expected);
-    ///
-    /// assert_eq!(HttpParser::parse_query(query_string), expected);
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// This function does not panic.
-    ///
-    /// # Errors
-    ///
-    /// This function does not return any errors.
-    fn parse_query(query_string: &str) -> HashMap<String, String> {
-        let mut query = HashMap::new();
-        for pair in query_string.split('&') {
-            let mut parts = pair.splitn(2, '=');
-            let key = match parts.next() {
-                Some(part) => part.to_string(),
-                None => continue,
-            };
-
-            let value = match parts.next() {
-                Some(part) => part.to_string(),
-                None => continue,
-            };
-
-            query.insert(
-                HttpParser::percent_decode(key.as_str()),
-                HttpParser::percent_decode(value.as_str()),
-            );
-        }
-        query
-    }
-}
-
 extern "C-unwind" fn lua_http_parse_response(state: *mut ffi::lua_State) -> c_int {
-    let raw_response = laux::lua_get::<&str>(state, 1);
-    if let Ok((version, status_code, header)) = HttpParser::parse_response(raw_response) {
-        unsafe {
-            ffi::lua_createtable(state, 0, 6);
-            lua_rawsetfield!(state, -3, "version", laux::lua_push(state, version));
-            lua_rawsetfield!(
-                state,
-                -3,
-                "status_code",
-                laux::lua_push(state, i32::from_str(status_code.as_str()).unwrap_or(-2))
-            );
-            ffi::lua_pushliteral(state, "headers");
-            ffi::lua_createtable(state, 0, header.len() as c_int);
-            for (key, value) in header {
-                laux::lua_push(state, key.to_lowercase());
-                laux::lua_push(state, value);
+    let raw_response = laux::lua_get::<&[u8]>(state, 1);
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut res = httparse::Response::new(&mut headers);
+
+    match res.parse(raw_response) {
+        Ok(httparse::Status::Complete(_)) => {
+            let version = res.version.unwrap_or(1);
+            let status_code = res.code.unwrap_or(200);
+            unsafe {
+                ffi::lua_createtable(state, 0, 6);
+                lua_rawsetfield!(state, -3, "version", laux::lua_push(state, version));
+                lua_rawsetfield!(
+                    state,
+                    -3,
+                    "status_code",
+                    laux::lua_push(state, status_code as u32)
+                );
+                ffi::lua_pushstring(state, c_str!("headers"));
+                ffi::lua_createtable(state, 0, res.headers.len() as c_int);
+                for header in res.headers.iter() {
+                    laux::lua_push(state, header.name.to_lowercase());
+                    laux::lua_push(state, header.value);
+                    ffi::lua_rawset(state, -3);
+                }
                 ffi::lua_rawset(state, -3);
+                1
             }
-            ffi::lua_rawset(state, -3);
-            1
         }
-    } else {
-        unsafe {
-            ffi::lua_pushboolean(state, 0);
-            ffi::lua_pushstring(state, c_str!("parse response error"));
+        Ok(httparse::Status::Partial) => {
+            laux::lua_push(state, false);
+            laux::lua_push(state, "Incomplete response");
+            2
+        }
+        Err(err) => {
+            laux::lua_push(state, false);
+            laux::lua_push(state, err.to_string());
             2
         }
     }
 }
 
 extern "C-unwind" fn lua_http_parse_request(state: *mut ffi::lua_State) -> c_int {
-    let raw_request = laux::lua_get::<&str>(state, 1);
-    if let Ok((method, path, query_string, header)) = HttpParser::parse_request(raw_request) {
-        unsafe {
-            ffi::lua_createtable(state, 0, 6);
-            lua_rawsetfield!(state, -3, "method", laux::lua_push(state, method));
-            lua_rawsetfield!(state, -3, "path", laux::lua_push(state, path));
-            lua_rawsetfield!(
-                state,
-                -3,
-                "query_string",
-                laux::lua_push(state, query_string)
-            );
-            ffi::lua_pushliteral(state, "headers");
-            ffi::lua_createtable(state, 0, header.len() as c_int);
-            for (key, value) in header {
-                laux::lua_push(state, key.to_lowercase());
-                laux::lua_push(state, value);
+    let raw_request = laux::lua_get::<&[u8]>(state, 1);
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+
+    match req.parse(raw_request) {
+        Ok(httparse::Status::Complete(_)) => {
+            let method = req.method.unwrap_or("GET");
+
+            let path = percent_decode(req.path.unwrap_or("/").as_bytes()).decode_utf8_lossy();
+
+            let mut query_string = "";
+            let path = if let Some(index) = path.find('?') {
+                query_string = &path[index + 1..];
+                &path[..index]
+            } else {
+                &path
+            };
+
+            unsafe {
+                ffi::lua_createtable(state, 0, 6);
+                lua_rawsetfield!(state, -3, "method", laux::lua_push(state, method));
+                lua_rawsetfield!(state, -3, "path", laux::lua_push(state, path));
+                lua_rawsetfield!(
+                    state,
+                    -3,
+                    "query_string",
+                    laux::lua_push(state, query_string)
+                );
+                ffi::lua_pushstring(state, c_str!("headers"));
+                ffi::lua_createtable(state, 0, req.headers.len() as c_int);
+
+                for header in req.headers.iter() {
+                    laux::lua_push(state, header.name.to_lowercase());
+                    laux::lua_push(state, header.value);
+                    ffi::lua_rawset(state, -3);
+                }
+
                 ffi::lua_rawset(state, -3);
+                1
             }
-            ffi::lua_rawset(state, -3);
-            1
         }
-    } else {
-        unsafe {
-            ffi::lua_pushboolean(state, 0);
-            ffi::lua_pushstring(state, c_str!("parse request error"));
+        Ok(httparse::Status::Partial) => {
+            laux::lua_push(state, false);
+            laux::lua_push(state, "Incomplete request");
+            2
+        }
+        Err(err) => {
+            laux::lua_push(state, false);
+            laux::lua_push(state, err.to_string());
             2
         }
     }
@@ -403,30 +251,47 @@ extern "C-unwind" fn lua_http_parse_request(state: *mut ffi::lua_State) -> c_int
 extern "C-unwind" fn lua_http_encode_query_string(state: *mut ffi::lua_State) -> c_int {
     laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
     laux::lua_pushnil(state);
-    let mut query = HashMap::new();
+    let mut result = String::new();
     while laux::lua_next(state, 1) {
+        if !result.is_empty() {
+            result.push('&');
+        }
         let key = laux::to_string_unchecked(state, -2);
         let value = laux::to_string_unchecked(state, -1);
-        query.insert(key.to_string(), value.to_string());
+        result.push_str(
+            form_urlencoded::byte_serialize(key.as_bytes())
+                .collect::<String>()
+                .as_str(),
+        );
+        result.push('=');
+        result.push_str(
+            form_urlencoded::byte_serialize(value.as_bytes())
+                .collect::<String>()
+                .as_str(),
+        );
         laux::lua_pop(state, 1);
     }
-    let query_string = HttpParser::encode_query(&query);
-    laux::lua_push(state, query_string);
+    laux::lua_push(state, result);
     1
 }
 
 extern "C-unwind" fn lua_http_parse_query_string(state: *mut ffi::lua_State) -> c_int {
     let query_string = laux::lua_get::<&str>(state, 1);
-    let query = HttpParser::parse_query(query_string);
-    unsafe {
-        ffi::lua_createtable(state, 0, query.len() as c_int);
-        for (key, value) in query {
-            laux::lua_push(state, key);
-            laux::lua_push(state, value);
+
+    unsafe { ffi::lua_createtable(state, 0, 8) };
+
+    let decoded: Vec<(String, String)> = form_urlencoded::parse(query_string.as_bytes())
+        .into_owned()
+        .collect();
+
+    for pair in decoded {
+        laux::lua_push(state, pair.0);
+        laux::lua_push(state, pair.1);
+        unsafe {
             ffi::lua_rawset(state, -3);
         }
-        1
     }
+    1
 }
 
 pub unsafe extern "C-unwind" fn luaopen_http(state: *mut ffi::lua_State) -> c_int {
@@ -443,60 +308,4 @@ pub unsafe extern "C-unwind" fn luaopen_http(state: *mut ffi::lua_State) -> c_in
     ffi::luaL_setfuncs(state, l.as_ptr(), 0);
 
     1
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_response() {
-        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
-        let result = HttpParser::parse_response(response).unwrap();
-        assert_eq!(result.0, "1.1");
-        assert_eq!(result.1, "200");
-        assert_eq!(result.2.get("Content-Type").unwrap(), "text/html");
-    }
-
-    #[test]
-    fn test_parse_request() {
-        let request = "GET /path?query=value HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let result = HttpParser::parse_request(request).unwrap();
-        assert_eq!(result.0, "GET");
-        assert_eq!(result.1, "/path");
-        assert_eq!(result.2, "query=value");
-        assert_eq!(result.3.get("Host").unwrap(), "example.com");
-    }
-
-    #[test]
-    fn test_percent_encode() {
-        let value = "value with spaces";
-        let result = HttpParser::percent_encode(value);
-        assert_eq!(result, "value%20with%20spaces");
-    }
-
-    #[test]
-    fn test_percent_decode() {
-        let value = "value%20with%20spaces";
-        let result = HttpParser::percent_decode(value);
-        assert_eq!(result, "value with spaces");
-    }
-
-    #[test]
-    fn test_encode_query() {
-        let mut query = HashMap::new();
-        query.insert(
-            "key with spaces".to_string(),
-            "value with spaces".to_string(),
-        );
-        let result = HttpParser::encode_query(&query);
-        assert_eq!(result, "key%20with%20spaces=value%20with%20spaces");
-    }
-
-    #[test]
-    fn test_parse_query() {
-        let query_string = "key%20with%20spaces=value%20with%20spaces";
-        let result = HttpParser::parse_query(query_string);
-        assert_eq!(result.get("key with spaces").unwrap(), "value with spaces");
-    }
 }

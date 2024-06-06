@@ -24,11 +24,11 @@ lclone(lua_State *L) {
 
 	lua_lock(L);
 	LClosure *cl = luaF_newLclosure(L, p->sizeupvalues);
-	luaF_initupvals(L, cl);
-	cl->p = p;
-	setclLvalue2s(L, L->top.p++, cl);
+    setclLvalue2s(L,L->top.p,cl);
+    api_incr_top(L);
+    cl->p = p;
+    luaF_initupvals(L, cl);
 	lua_unlock(L);
-
 	return 1;
 }
 

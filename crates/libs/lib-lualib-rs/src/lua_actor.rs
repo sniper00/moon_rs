@@ -19,6 +19,10 @@ use crate::lua_utils;
 
 unsafe extern "C-unwind" fn lua_actor_protect_init(state: *mut ffi::lua_State) -> c_int {
     let param = ffi::lua_touserdata(state, 1) as *mut LuaActorParam;
+    if param.is_null() {
+        ffi::luaL_error(state, c_str!("invalid param"));
+    }
+
     ffi::luaL_openlibs(state);
 
     ffi::luaL_requiref(state, c_str!("moon.core"), luaopen_core, 0);

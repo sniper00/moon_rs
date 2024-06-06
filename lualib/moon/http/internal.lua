@@ -251,7 +251,7 @@ local function parse_header(data)
     ---@type HttpRequest
     local request, err = c.parse_request(data)
     if err then
-        return { protocol_error = "Invalid HTTP request header" }
+        return { protocol_error = "Invalid HTTP request header:"..tostring(err) }
     end
 
     if request.method == "HEAD" then
@@ -274,7 +274,7 @@ function M.read_request(fd, timeout, prefix_data, opt)
     local header_max_len = opt.header_max_len or 8192
     local content_max_len = opt.content_max_len or 5242880 -- 5MB
 
-    local data, err = socket.read(fd, "\r\n\r\n", header_max_len)
+    local data, err = socket.read(fd, "^\r\n\r\n", header_max_len)
     if not data then
         return { error = err, network_error = true }
     end
