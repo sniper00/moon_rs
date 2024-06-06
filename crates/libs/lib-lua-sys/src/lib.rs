@@ -10,25 +10,12 @@ use std::os::raw::c_int;
 #[cfg(any(feature = "lua54", doc))]
 pub use lua54::*;
 
-#[cfg(any(feature = "lua53", doc))]
-pub use lua53::*;
-
-#[cfg(any(feature = "lua52", doc))]
-pub use lua52::*;
-
-#[cfg(any(feature = "lua51", feature = "luajit", doc))]
-pub use lua51::*;
-
 #[cfg(any(feature = "luau", doc))]
 pub use luau::*;
 
-#[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+#[cfg(feature = "lua54")]
 #[doc(hidden)]
 pub const LUA_MAX_UPVALUES: c_int = 255;
-
-#[cfg(any(feature = "lua51", feature = "luajit"))]
-#[doc(hidden)]
-pub const LUA_MAX_UPVALUES: c_int = 60;
 
 #[cfg(feature = "luau")]
 #[doc(hidden)]
@@ -84,18 +71,6 @@ mod macros;
 pub mod lua54;
 
 pub use lua54 as ffi;
-
-#[cfg(any(feature = "lua53", doc))]
-#[cfg_attr(docsrs, doc(cfg(feature = "lua53")))]
-pub mod lua53;
-
-#[cfg(any(feature = "lua52", doc))]
-#[cfg_attr(docsrs, doc(cfg(feature = "lua52")))]
-pub mod lua52;
-
-#[cfg(any(feature = "lua51", feature = "luajit", doc))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "lua51", feature = "luajit"))))]
-pub mod lua51;
 
 #[cfg(any(feature = "luau", doc))]
 #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]

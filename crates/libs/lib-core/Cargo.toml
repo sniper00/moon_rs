@@ -7,9 +7,6 @@ edition = "2021"
 [lib]
 doctest = false
 
-[lints]
-workspace = true
-
 [dependencies]
 lib-lua = {package = "lib-lua-sys", path = "../../libs/lib-lua-sys",features = ["lua54"]}
 lib-common = {package= "lib-common-sys", path = "../../libs/lib-common-sys", version = "0.1.0"}

@@ -8,9 +8,6 @@ edition = "2021"
 [lib]
 doctest = false
 
-[lints]
-workspace = true
-
 [dependencies]
 lib-core = { path = "../../libs/lib-core"}
 lib-lua = {package = "lib-lua-sys", path = "../../libs/lib-lua-sys",features = ["lua54"]}
@@ -31,3 +28,7 @@ sha1 = "0.10.6"
 reqwest = { version = "0.11", features = ["rustls-tls"], default-features = false}
 serde = { version = "1.0", features = ["derive"]}
 serde_json = {version = "1.0"}
+httparse = "1.8.0"
+percent-encoding = "2.3.1"
+form_urlencoded = "1.2.1"
+url = "2.5.0"
