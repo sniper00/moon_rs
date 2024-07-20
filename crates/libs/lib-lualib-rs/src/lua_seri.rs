@@ -1,13 +1,13 @@
 use std::ffi::{c_int, c_void};
 
-use lib_lua::ffi::{self, luaL_Reg, LUA_TLIGHTUSERDATA, LUA_TSTRING};
-
-use lib_core::{
-    buffer::Buffer,
-    c_str,
+use lib_lua::{
+    self, cstr,
+    ffi::{self, luaL_Reg, LUA_TLIGHTUSERDATA, LUA_TSTRING},
     laux::{self},
     lreg, lreg_null,
 };
+
+use lib_core::buffer::Buffer;
 
 const TYPE_NIL: u8 = 0;
 const TYPE_BOOLEAN: u8 = 1;
@@ -204,7 +204,7 @@ unsafe fn write_table(
     depth: i32,
 ) -> Result<i32, String> {
     if ffi::lua_checkstack(state, ffi::LUA_MINSTACK) == 0 {
-        ffi::lua_pushstring(state, c_str!("out of memory"));
+        ffi::lua_pushstring(state, cstr!("out of memory"));
         return Ok(1);
     }
 
@@ -212,7 +212,7 @@ unsafe fn write_table(
         index = ffi::lua_gettop(state) + index + 1;
     };
 
-    if ffi::luaL_getmetafield(state, index, c_str!("__pairs")) != ffi::LUA_TNIL {
+    if ffi::luaL_getmetafield(state, index, cstr!("__pairs")) != ffi::LUA_TNIL {
         write_table_metapairs(state, buf, index, depth)
     } else {
         let array_size = write_table_array(state, buf, index, depth)?;
@@ -584,7 +584,7 @@ unsafe extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
     }
 
     if data.is_null() || len == 0 {
-        ffi::luaL_error(state, c_str!("deserialize null pointer"));
+        ffi::luaL_error(state, cstr!("deserialize null pointer"));
     }
 
     ffi::lua_settop(state, 1);
@@ -619,14 +619,14 @@ unsafe extern "C-unwind" fn peek_one(state: *mut ffi::lua_State) -> c_int {
     }
 
     if ffi::lua_type(state, 1) != LUA_TLIGHTUSERDATA {
-        ffi::luaL_argerror(state, 1, c_str!("peek_one need lightuserdata"));
+        ffi::luaL_argerror(state, 1, cstr!("peek_one need lightuserdata"));
     }
 
     let seek = laux::lua_opt(state, 2).unwrap_or(false);
 
     let buf = unsafe { ffi::lua_touserdata(state, 1) as *mut Buffer };
     if buf.is_null() {
-        ffi::luaL_argerror(state, 1, c_str!("null buffer pointer"));
+        ffi::luaL_argerror(state, 1, cstr!("null buffer pointer"));
     }
 
     if (*buf).is_empty() {

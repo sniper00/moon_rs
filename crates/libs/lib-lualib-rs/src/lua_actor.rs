@@ -1,31 +1,26 @@
 use crate::luaopen_custom_libs;
 use base64::{engine, Engine};
 use lib_core::{
-    actor::LuaActor,
-    c_str,
-    context::{self, LuaActorParam, Message, CONTEXT, LOGGER},
-    laux::{self},
-    log::Logger,
-    lreg, lreg_null,
+    actor::LuaActor, check_buffer, context::{self, LuaActorParam, Message, CONTEXT, LOGGER}, log::Logger
 };
-use lib_lua::{ffi, ffi::luaL_Reg};
+use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null};
 
+use crate::lua_utils;
 use std::{
     alloc::{self, Layout},
     ffi::{c_char, c_int, c_void, CString},
-    slice
+    slice,
 };
-use crate::lua_utils;
 
 unsafe extern "C-unwind" fn lua_actor_protect_init(state: *mut ffi::lua_State) -> c_int {
     let param = ffi::lua_touserdata(state, 1) as *mut LuaActorParam;
     if param.is_null() {
-        ffi::luaL_error(state, c_str!("invalid param"));
+        ffi::luaL_error(state, cstr!("invalid param"));
     }
 
     ffi::luaL_openlibs(state);
 
-    ffi::luaL_requiref(state, c_str!("moon.core"), luaopen_core, 0);
+    ffi::luaL_requiref(state, cstr!("moon.core"), luaopen_core, 0);
     ffi::lua_pop(state, 1);
 
     luaopen_custom_libs(state);
@@ -332,12 +327,12 @@ extern "C-unwind" fn lua_actor_query(state: *mut ffi::lua_State) -> c_int {
 
 extern "C-unwind" fn lua_actor_send(state: *mut ffi::lua_State) -> c_int {
     let ptype = laux::lua_get(state, 1);
-    unsafe { ffi::luaL_argcheck(state, (ptype > 0) as i32, 1, c_str!("PTYPE must > 0")) }
+    unsafe { ffi::luaL_argcheck(state, (ptype > 0) as i32, 1, cstr!("PTYPE must > 0")) }
 
     let to: i64 = laux::lua_get(state, 2);
-    unsafe { ffi::luaL_argcheck(state, (to > 0) as i32, 2, c_str!("receiver must > 0")) }
+    unsafe { ffi::luaL_argcheck(state, (to > 0) as i32, 2, cstr!("receiver must > 0")) }
 
-    let data = laux::check_buffer(state, 3);
+    let data = check_buffer(state, 3);
 
     let actor = LuaActor::from_lua_state(state);
 
@@ -431,7 +426,7 @@ unsafe extern "C-unwind" fn lua_actor_callback(state: *mut ffi::lua_State) -> c_
     actor.callback_state.0 = ffi::lua_newthread(state);
     ffi::lua_pushcfunction(actor.callback_state.0, laux::lua_traceback);
     ffi::lua_setuservalue(state, -2);
-    ffi::lua_setfield(state, ffi::LUA_REGISTRYINDEX, c_str!("callback_context"));
+    ffi::lua_setfield(state, ffi::LUA_REGISTRYINDEX, cstr!("callback_context"));
     ffi::lua_xmove(state, actor.callback_state.0, 1);
 
     0
@@ -490,7 +485,7 @@ extern "C-unwind" fn lua_actor_log(state: *mut ffi::lua_State) -> c_int {
     let mut debug: ffi::lua_Debug = unsafe { std::mem::zeroed() };
     if unsafe {
         ffi::lua_getstack(state, stack_level as c_int, &mut debug) != 0
-            && ffi::lua_getinfo(state, c_str!("Sl"), &mut debug) != 0
+            && ffi::lua_getinfo(state, cstr!("Sl"), &mut debug) != 0
     } {
         content.write_str("    ");
         content.write(b'(');
@@ -547,7 +542,7 @@ unsafe extern "C-unwind" fn tostring(state: *mut ffi::lua_State) -> c_int {
             state,
             if !data.is_null() { 1 } else { 0 },
             1,
-            c_str!("lightuserdata(char*) expected"),
+            cstr!("lightuserdata(char*) expected"),
         );
         let len = ffi::luaL_checkinteger(state, 2) as usize;
         ffi::lua_pushlstring(state, data as *const c_char, len);
@@ -558,7 +553,7 @@ unsafe extern "C-unwind" fn tostring(state: *mut ffi::lua_State) -> c_int {
 fn get_message_pointer(state: *mut ffi::lua_State) -> &'static mut Message {
     let m = unsafe { ffi::lua_touserdata(state, 1) as *mut Message };
     if m.is_null() {
-        unsafe { ffi::luaL_argerror(state, 1, c_str!("null message pointer")) };
+        unsafe { ffi::luaL_argerror(state, 1, cstr!("null message pointer")) };
     }
     unsafe { &mut *m }
 }
@@ -621,7 +616,7 @@ extern "C-unwind" fn lua_message_decode(state: *mut ffi::lua_State) -> c_int {
                 }
             }
             _ => unsafe {
-                ffi::luaL_error(state, c_str!("invalid format option '%c'"), c);
+                ffi::luaL_error(state, cstr!("invalid format option '%c'"), c);
             },
         }
     }
@@ -649,7 +644,6 @@ unsafe extern "C-unwind" fn luaopen_core(state: *mut ffi::lua_State) -> c_int {
         lreg!("clock", clock),
         lreg!("tostring", tostring),
         lreg!("next_uuid", next_uuid),
-
         lreg!("num_cpus", lua_utils::num_cpus),
         lreg!("hash", lua_utils::hash),
         lreg!("thread_sleep", lua_utils::thread_sleep),
@@ -663,10 +657,10 @@ unsafe extern "C-unwind" fn luaopen_core(state: *mut ffi::lua_State) -> c_int {
 
     let actor = LuaActor::from_lua_state(state);
     laux::lua_push(state, actor.id);
-    ffi::lua_setfield(state, -2, c_str!("id"));
+    ffi::lua_setfield(state, -2, cstr!("id"));
 
     laux::lua_push(state, actor.name.as_str());
-    ffi::lua_setfield(state, -2, c_str!("name"));
+    ffi::lua_setfield(state, -2, cstr!("name"));
 
     1
 }

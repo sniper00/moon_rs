@@ -1,11 +1,11 @@
 use base64::{engine, Engine};
-use lib_core::laux::{self, lua_push};
-use lib_lua::ffi;
-use sha2::digest::DynDigest;
-use std::{
-    ffi::c_int,
-    time::Duration,
+use lib_lua::{
+    self,
+    ffi::{self},
+    laux::{self},
 };
+use sha2::digest::DynDigest;
+use std::{ffi::c_int, time::Duration};
 
 pub extern "C-unwind" fn num_cpus(state: *mut ffi::lua_State) -> c_int {
     laux::lua_push(state, num_cpus::get());
@@ -64,18 +64,16 @@ pub extern "C-unwind" fn thread_sleep(state: *mut ffi::lua_State) -> c_int {
 
 pub extern "C-unwind" fn base64_encode(state: *mut ffi::lua_State) -> c_int {
     let data = laux::lua_get::<&[u8]>(state, 1);
-    let base64_string = engine::general_purpose::STANDARD
-    .encode(data);
+    let base64_string = engine::general_purpose::STANDARD.encode(data);
     laux::lua_push(state, base64_string);
     1
 }
 
 pub extern "C-unwind" fn base64_decode(state: *mut ffi::lua_State) -> c_int {
     let base64_string = laux::lua_get::<&str>(state, 1);
-    let data = engine::general_purpose::STANDARD
-    .decode(base64_string);
+    let data = engine::general_purpose::STANDARD.decode(base64_string);
     if data.is_err() {
-        lua_push(state, data.clone().unwrap_err().to_string());
+        laux::lua_push(state, data.clone().unwrap_err().to_string());
         drop(data);
         laux::throw_error(state);
     }

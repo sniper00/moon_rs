@@ -1,5 +1,10 @@
-use lib_core::buffer::Buffer;
-use lib_lua::{ffi, ffi::luaL_Reg};
+use lib_core::{buffer::Buffer, check_buffer};
+use lib_lua::{
+    self, cstr,
+    ffi::{self, luaL_Reg},
+    laux::{self},
+    lreg, lreg_null,
+};
 use std::ffi::c_int;
 use std::net::TcpStream;
 use std::time::Duration;
@@ -17,10 +22,7 @@ use tokio::{
 
 use lib_core::{
     actor::LuaActor,
-    c_str,
     context::{self, Message, NetChannel, NetOp, CONTEXT},
-    laux::{self},
-    lreg, lreg_null,
 };
 
 // pub const SOCKET_ACCEPT: i8 = 1;
@@ -39,10 +41,15 @@ async fn read_until(
     let mut with_delim = false;
     let mut delim = delim.as_slice();
     if delim.is_empty() || (delim[0] == b'^' && delim.len() < 2) {
-        CONTEXT.response_error(0, owner, -session, "socket op:ReadUntil delim is empty".to_string());
+        CONTEXT.response_error(
+            0,
+            owner,
+            -session,
+            "socket op:ReadUntil delim is empty".to_string(),
+        );
         return false;
     }
-    
+
     if delim[0] == b'^' {
         delim = &delim[1..];
         with_delim = true;
@@ -378,7 +385,7 @@ extern "C-unwind" fn lua_socket_write(state: *mut ffi::lua_State) -> c_int {
     let actor = LuaActor::from_lua_state(state);
 
     let fd = laux::lua_get(state, 1);
-    let data = laux::check_buffer(state, 2);
+    let data = check_buffer(state, 2);
     let close = laux::lua_opt(state, 3).unwrap_or_default();
 
     if let Some(channel) = CONTEXT.net.get(&fd) {

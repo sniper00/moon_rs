@@ -348,8 +348,9 @@ pub fn run_timer() {
     tokio::spawn(async move {
         let mut btree_map = BTreeSet::new();
         let mut rc = CONTEXT.timer_rx.lock().await;
+        let mut wait_time = 1000;
         loop {
-            match timeout(Duration::from_millis(1), rc.recv()).await {
+            match timeout(Duration::from_millis(wait_time), rc.recv()).await {
                 Ok(Some(timer)) => {
                     //println!("insert timer: {:?} {:?}", timer, CONTEXT.now_clock());
                     btree_map.insert(timer);
@@ -360,8 +361,11 @@ pub fn run_timer() {
                 Err(_) => {} //timeout
             }
 
+            wait_time = 1000;
+
             while let Some(timer) = btree_map.first() {
-                if timer.expiry_clock <= CONTEXT.now_clock().as_millis() as i64 {
+                let diff = timer.expiry_clock - CONTEXT.now_clock().as_millis() as i64;
+                if diff <= 0 {
                     //println!("timer timeout: {:?} {:?}", timer, CONTEXT.now_clock());
                     CONTEXT.send(Message {
                         ptype: PTYPE_TIMER,
@@ -372,6 +376,7 @@ pub fn run_timer() {
                     });
                     btree_map.pop_first();
                 } else {
+                    wait_time = diff as u64;
                     break;
                 }
             }

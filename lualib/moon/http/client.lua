@@ -17,7 +17,7 @@ local function parse_raw_response(raw_response, err)
     local header_len = string.unpack("<I", raw_response)
 
     local raw_header = string.sub(raw_response, 5, 4 + header_len)
-    local response = core.parse_response(raw_header)
+    local response = assert(core.parse_response(raw_header))
     response.body = string.sub(raw_response, 5 + header_len)
 
     return response

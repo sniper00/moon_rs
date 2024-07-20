@@ -1,14 +1,8 @@
-use lib_lua::{ffi, ffi::luaL_Reg};
+use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null};
 use std::ffi::c_int;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-};
-
-use lib_core::{
-    c_str,
-    laux::{self},
-    lreg, lreg_null,
 };
 
 fn listdir(state: *mut ffi::lua_State, path: &Path, idx: &mut i32, ext: &str) {

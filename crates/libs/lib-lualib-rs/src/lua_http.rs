@@ -1,12 +1,9 @@
 use lib_core::{
     actor::LuaActor,
     buffer::Buffer,
-    c_str,
     context::{self, Message, CONTEXT},
-    laux::{self},
-    lreg, lreg_null, lua_rawsetfield,
 };
-use lib_lua::{ffi, ffi::luaL_Reg};
+use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null, lua_rawsetfield};
 use percent_encoding::percent_decode;
 use reqwest::{header::HeaderMap, Method};
 use std::{error::Error, ffi::c_int, str::FromStr};
@@ -95,7 +92,7 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
     let mut headers = HeaderMap::new();
 
     {
-        laux::push_c_string(state, c_str!("headers"));
+        laux::push_c_string(state, cstr!("headers"));
         if laux::lua_rawget(state, 1) == ffi::LUA_TTABLE {
             // [+1]
             laux::lua_pushnil(state);
@@ -153,43 +150,69 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
 
 extern "C-unwind" fn lua_http_parse_response(state: *mut ffi::lua_State) -> c_int {
     let raw_response = laux::lua_get::<&[u8]>(state, 1);
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut res = httparse::Response::new(&mut headers);
 
-    match res.parse(raw_response) {
-        Ok(httparse::Status::Complete(_)) => {
-            let version = res.version.unwrap_or(1);
-            let status_code = res.code.unwrap_or(200);
-            unsafe {
-                ffi::lua_createtable(state, 0, 6);
-                lua_rawsetfield!(state, -3, "version", laux::lua_push(state, version));
-                lua_rawsetfield!(
-                    state,
-                    -3,
-                    "status_code",
-                    laux::lua_push(state, status_code as u32)
-                );
-                ffi::lua_pushstring(state, c_str!("headers"));
-                ffi::lua_createtable(state, 0, res.headers.len() as c_int);
-                for header in res.headers.iter() {
-                    laux::lua_push(state, header.name.to_lowercase());
-                    laux::lua_push(state, header.value);
-                    ffi::lua_rawset(state, -3);
-                }
-                ffi::lua_rawset(state, -3);
-                1
-            }
-        }
-        Ok(httparse::Status::Partial) => {
+    let mut lines = raw_response.split(|&x| x == b'\n');
+    let version_line = match lines.next() {
+        Some(version_line) => version_line,
+        None => {
             laux::lua_push(state, false);
-            laux::lua_push(state, "Incomplete response");
-            2
+            laux::lua_push(state, "No input");
+            return 2;
         }
-        Err(err) => {
+    };
+
+    let mut parts = version_line.splitn(3, |&x| x == b' ');
+    let version = match parts.next() {
+        Some(part) => &part[5..],
+        None => {
             laux::lua_push(state, false);
-            laux::lua_push(state, err.to_string());
-            2
+            laux::lua_push(state, "No version");
+            return 2;
         }
+    };
+
+    let status_code = match parts.next() {
+        Some(part) => part,
+        None => {
+            laux::lua_push(state, false);
+            laux::lua_push(state, "No status code");
+            return 2;
+        }
+    };
+
+    unsafe {
+        ffi::lua_createtable(state, 0, 6);
+        lua_rawsetfield!(state, -3, "version", laux::lua_push(state, version));
+        lua_rawsetfield!(
+            state,
+            -3,
+            "status_code",
+            laux::lua_push(
+                state,
+                i32::from_str(String::from_utf8_lossy(status_code).as_ref()).unwrap_or(200)
+            )
+        );
+
+        ffi::lua_pushstring(state, cstr!("headers"));
+        ffi::lua_createtable(state, 0, 16);
+        for line in lines {
+            let mut parts = line.splitn(2, |&x| x == b':');
+            let key = match parts.next() {
+                Some(part) => String::from_utf8_lossy(part),
+                None => continue,
+            };
+
+            let value = match parts.next() {
+                Some(part) => String::from_utf8_lossy(part),
+                None => continue,
+            };
+
+            laux::lua_push(state, key.as_ref().to_lowercase());
+            laux::lua_push(state, value.as_ref().trim());
+            ffi::lua_rawset(state, -3);
+        }
+        ffi::lua_rawset(state, -3);
+        1
     }
 }
 
@@ -222,7 +245,7 @@ extern "C-unwind" fn lua_http_parse_request(state: *mut ffi::lua_State) -> c_int
                     "query_string",
                     laux::lua_push(state, query_string)
                 );
-                ffi::lua_pushstring(state, c_str!("headers"));
+                ffi::lua_pushstring(state, cstr!("headers"));
                 ffi::lua_createtable(state, 0, req.headers.len() as c_int);
 
                 for header in req.headers.iter() {

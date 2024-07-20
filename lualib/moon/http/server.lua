@@ -72,7 +72,7 @@ local function request_handler(fd, request)
         end
     end
 
-    local handler = routers[request.path]
+    local handler = routers[request.path] or routers["*"]
     if handler then
         local ok, err = xpcall(handler, traceback, request, response)
         if not ok then

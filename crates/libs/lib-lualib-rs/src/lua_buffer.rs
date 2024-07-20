@@ -1,10 +1,7 @@
-use lib_lua::ffi::{self, luaL_Reg, lua_Integer};
+use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, ffi::lua_Integer, laux, lreg, lreg_null};
 use std::ffi::{c_int, c_void};
 
-use lib_core::{
-    buffer::{self, Buffer},
-    c_str, laux, lreg, lreg_null,
-};
+use lib_core::buffer::{self, Buffer};
 
 const MAX_DEPTH: i32 = 32;
 
@@ -137,7 +134,7 @@ extern "C-unwind" fn concat_string(state: *mut ffi::lua_State) -> c_int {
 fn get_mut_buffer(state: *mut ffi::lua_State) -> &'static mut Buffer {
     let buf = unsafe { ffi::lua_touserdata(state, 1) as *mut Buffer };
     if buf.is_null() {
-        unsafe { ffi::luaL_argerror(state, 1, c_str!("null buffer pointer")) };
+        unsafe { ffi::luaL_argerror(state, 1, cstr!("null buffer pointer")) };
     }
     unsafe { &mut *buf }
 }
@@ -152,7 +149,7 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
             let mut pos = ffi::luaL_optinteger(state, 3, 0) as usize;
             let len = buf.len();
             if pos > len {
-                return ffi::luaL_argerror(state, 3, c_str!("out of range"));
+                return ffi::luaL_argerror(state, 3, cstr!("out of range"));
             }
             let mut le = true;
             for c in opt.chars() {
@@ -161,28 +158,28 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
                     '<' => le = true,
                     'h' => {
                         if len - pos < 2 {
-                            ffi::luaL_error(state, c_str!("data out of range"));
+                            ffi::luaL_error(state, cstr!("data out of range"));
                         }
                         ffi::lua_pushinteger(state, buf.read_i16(pos, le) as lua_Integer);
                         pos += 2;
                     }
                     'H' => {
                         if len - pos < 2 {
-                            ffi::luaL_error(state, c_str!("data out of range"));
+                            ffi::luaL_error(state, cstr!("data out of range"));
                         }
                         ffi::lua_pushinteger(state, buf.read_u16(pos, le) as lua_Integer);
                         pos += 2;
                     }
                     'i' => {
                         if len - pos < 4 {
-                            ffi::luaL_error(state, c_str!("data out of range"));
+                            ffi::luaL_error(state, cstr!("data out of range"));
                         }
                         ffi::lua_pushinteger(state, buf.read_i32(pos, le) as lua_Integer);
                         pos += 4;
                     }
                     'I' => {
                         if len - pos < 4 {
-                            ffi::luaL_error(state, c_str!("data out of range"));
+                            ffi::luaL_error(state, cstr!("data out of range"));
                         }
                         ffi::lua_pushinteger(state, buf.read_u32(pos, le) as lua_Integer);
                         pos += 4;
@@ -195,7 +192,7 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
                         ffi::lua_pushlstring(state, buf.as_ptr() as *const i8, buf.len());
                     }
                     _ => {
-                        ffi::luaL_error(state, c_str!("invalid format option '%c'"), c);
+                        ffi::luaL_error(state, cstr!("invalid format option '%c'"), c);
                     }
                 }
             }
@@ -204,7 +201,7 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
             let count = ffi::luaL_optinteger(state, 3, -1) as usize;
             let len = buf.len();
             if pos > len {
-                return ffi::luaL_argerror(state, 2, c_str!("out of range"));
+                return ffi::luaL_argerror(state, 2, cstr!("out of range"));
             }
             let count = std::cmp::min(len - pos, count);
             ffi::lua_pushlstring(state, buf.data().as_ptr() as *const i8, count);
@@ -221,7 +218,7 @@ extern "C-unwind" fn buffer_new(state: *mut ffi::lua_State) -> c_int {
             state,
             if capacity < (usize::MAX / 2) { 1 } else { 0 },
             1,
-            c_str!("invalid capacity"),
+            cstr!("invalid capacity"),
         )
     };
     let buf = Box::new(Buffer::with_capacity(capacity));
@@ -244,7 +241,7 @@ extern "C-unwind" fn read(state: *mut ffi::lua_State) -> c_int {
     let len = laux::lua_get(state, 2);
     if len > buf.len() {
         unsafe {
-            ffi::luaL_argerror(state, 2, c_str!("out of range"));
+            ffi::luaL_argerror(state, 2, cstr!("out of range"));
         }
     }
 
@@ -262,7 +259,7 @@ extern "C-unwind" fn write_front(state: *mut ffi::lua_State) -> c_int {
         let s = laux::lua_get::<&[u8]>(state, i);
         if !buf.write_front(s) {
             unsafe {
-                ffi::luaL_error(state, c_str!("no more front space"));
+                ffi::luaL_error(state, cstr!("no more front space"));
             }
         }
     }

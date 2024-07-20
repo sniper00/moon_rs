@@ -75,3 +75,5 @@ pub use lua54 as ffi;
 #[cfg(any(feature = "luau", doc))]
 #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
 pub mod luau;
+
+pub mod laux;

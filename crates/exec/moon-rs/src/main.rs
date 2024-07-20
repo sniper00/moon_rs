@@ -1,10 +1,11 @@
 use lib_core::{
-    c_str,
     context::{self, LuaActorParam, CONTEXT, LOGGER},
     error::Error,
+};
+use lib_lua::{
+    self, cstr, ffi,
     laux::{self, LuaState},
 };
-use lib_lua::ffi;
 use lib_lualib_rs::lua_actor;
 use mimalloc::MiMalloc;
 use std::{
@@ -153,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let lua_state = lua.0;
             ffi::luaL_openlibs(lua_state);
             ffi::lua_pushboolean(lua_state, 1);
-            ffi::lua_setglobal(lua_state, c_str!("__init__"));
+            ffi::lua_setglobal(lua_state, cstr!("__init__"));
 
             ffi::lua_pushcfunction(lua_state, laux::lua_traceback);
             assert_eq!(ffi::lua_gettop(lua_state), 1);
@@ -278,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     LOGGER.stop();
 
     while !LOGGER.stopped() {
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     if error_code != 0 {

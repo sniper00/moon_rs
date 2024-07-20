@@ -1,13 +1,7 @@
 use calamine::{open_workbook, DataType, Reader, Xlsx};
 use csv::ReaderBuilder;
-use lib_lua::{ffi, ffi::luaL_Reg};
+use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null};
 use std::{os::raw::c_int, path::Path};
-
-use lib_core::{
-    c_str,
-    laux::{self},
-    lreg, lreg_null,
-};
 
 fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
     let res = ReaderBuilder::new().has_headers(false).from_path(path);
@@ -25,7 +19,7 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
                         .to_str()
                         .unwrap_or_default(),
                 );
-                ffi::lua_setfield(state, -2, c_str!("name"));
+                ffi::lua_setfield(state, -2, cstr!("name"));
                 ffi::lua_createtable(state, 1024, 0);
             }
 
@@ -55,7 +49,7 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
             }
 
             unsafe {
-                ffi::lua_setfield(state, -2, c_str!("data"));
+                ffi::lua_setfield(state, -2, cstr!("data"));
                 ffi::lua_rawseti(state, -2, 1);
             }
             1
@@ -88,7 +82,7 @@ fn read_xlxs(state: *mut ffi::lua_State, path: &Path) -> c_int {
                         ffi::lua_createtable(state, 0, 2);
                         laux::lua_push(state, sheet.as_str());
 
-                        ffi::lua_setfield(state, -2, c_str!("name"));
+                        ffi::lua_setfield(state, -2, cstr!("name"));
 
                         ffi::lua_createtable(state, range.rows().len() as i32, 0);
                         for (i, row) in range.rows().enumerate() {
@@ -114,7 +108,7 @@ fn read_xlxs(state: *mut ffi::lua_State, path: &Path) -> c_int {
                             }
                             ffi::lua_rawseti(state, -2, (i + 1) as i64);
                         }
-                        ffi::lua_setfield(state, -2, c_str!("data"));
+                        ffi::lua_setfield(state, -2, cstr!("data"));
                     }
                     sheet_counter += 1;
                     unsafe {

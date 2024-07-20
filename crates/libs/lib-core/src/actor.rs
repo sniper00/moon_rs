@@ -1,5 +1,4 @@
-use crate::laux::{LuaState, LuaThread};
-
+use lib_lua::laux::{LuaState, LuaThread};
 use super::context::Message;
 pub use lib_lua as ffi;
 use tokio::sync::mpsc;

@@ -11,8 +11,7 @@ use std::{
         mpsc::{self, Sender},
         Arc,
     },
-    thread,
-    time::Duration,
+    thread
 };
 
 use crate::{buffer::Buffer, context::CONTEXT};
@@ -88,7 +87,7 @@ impl Logger {
             clone_state.state.store(STATE_RUNNING, Ordering::Release);
 
             loop {
-                match receiver.recv_timeout(Duration::from_millis(1)) {
+                match receiver.recv() {
                     Ok(message) => match message {
                         LogMessage::Line(mut line) => {
                             let enable_stdout = line.read_u8(0) != 0;

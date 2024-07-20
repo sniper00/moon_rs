@@ -1,9 +1,5 @@
-pub use lib_lua as ffi;
+use crate::ffi;
 use std::ffi::{c_char, c_int};
-
-use crate::c_str;
-
-use super::buffer::Buffer;
 
 pub type LuaStateRaw = *mut ffi::lua_State;
 
@@ -570,29 +566,6 @@ where
     }
 
     LuaValue::from_lua_opt(state, -1)
-}
-
-#[inline]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn check_buffer(state: LuaStateRaw, index: i32) -> Option<Box<Buffer>> {
-    match lua_type(state, index) {
-        ffi::LUA_TSTRING => Some(Box::new(lua_get::<&[u8]>(state, index).into())),
-        ffi::LUA_TLIGHTUSERDATA => unsafe {
-            let ptr = ffi::lua_touserdata(state, index) as *mut Buffer;
-            Some(Box::from_raw(ptr))
-        },
-        ffi::LUA_TNIL => None,
-        _ => {
-            unsafe {
-                ffi::luaL_argerror(
-                    state,
-                    index,
-                    c_str!("nil, lightuserdata(buffer*) or string expected"),
-                )
-            };
-            None
-        }
-    }
 }
 
 #[inline]
