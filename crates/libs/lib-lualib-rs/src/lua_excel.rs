@@ -3,11 +3,12 @@ use csv::ReaderBuilder;
 use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null};
 use std::{os::raw::c_int, path::Path};
 
-fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
+fn read_csv(state: *mut ffi::lua_State, path: &Path, max_row: usize) -> c_int {
     let res = ReaderBuilder::new().has_headers(false).from_path(path);
     unsafe {
         ffi::lua_createtable(state, 0, 0);
     }
+
     match res {
         Ok(mut reader) => {
             unsafe {
@@ -19,13 +20,16 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
                         .to_str()
                         .unwrap_or_default(),
                 );
-                ffi::lua_setfield(state, -2, cstr!("name"));
+                ffi::lua_setfield(state, -2, cstr!("sheet_name"));
                 ffi::lua_createtable(state, 1024, 0);
             }
 
-            let mut idx: i64 = 0;
+            let mut idx: usize = 0;
 
             for result in reader.records() {
+                if idx >= max_row {
+                    break;
+                }
                 match result {
                     Ok(record) => unsafe {
                         ffi::lua_createtable(state, 0, record.len() as i32);
@@ -34,7 +38,7 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
                             ffi::lua_rawseti(state, -2, (i + 1) as i64);
                         }
                         idx += 1;
-                        ffi::lua_rawseti(state, -2, idx);
+                        ffi::lua_rawseti(state, -2, idx as i64);
                     },
                     Err(err) => unsafe {
                         ffi::lua_pushboolean(state, 0);
@@ -68,7 +72,7 @@ fn read_csv(state: *mut ffi::lua_State, path: &Path) -> c_int {
     }
 }
 
-fn read_xlxs(state: *mut ffi::lua_State, path: &Path) -> c_int {
+fn read_xlxs(state: *mut ffi::lua_State, path: &Path, max_row: usize) -> c_int {
     let res: Result<Xlsx<_>, _> = open_workbook(path);
     match res {
         Ok(mut workbook) => {
@@ -82,10 +86,13 @@ fn read_xlxs(state: *mut ffi::lua_State, path: &Path) -> c_int {
                         ffi::lua_createtable(state, 0, 2);
                         laux::lua_push(state, sheet.as_str());
 
-                        ffi::lua_setfield(state, -2, cstr!("name"));
+                        ffi::lua_setfield(state, -2, cstr!("sheet_name"));
 
                         ffi::lua_createtable(state, range.rows().len() as i32, 0);
                         for (i, row) in range.rows().enumerate() {
+                            if i >= max_row {
+                                break;
+                            }
                             //rows
                             ffi::lua_createtable(state, row.len() as i32, 0);
 
@@ -128,14 +135,15 @@ fn read_xlxs(state: *mut ffi::lua_State, path: &Path) -> c_int {
 
 extern "C-unwind" fn lua_excel_read(state: *mut ffi::lua_State) -> c_int {
     let filename: &str = laux::lua_get(state, 1);
+    let max_row: usize = laux::lua_opt(state, 2).unwrap_or(usize::MAX);
     let path = Path::new(filename);
 
     match path.extension() {
         Some(ext) => {
             let ext = ext.to_string_lossy().to_string();
             match ext.as_str() {
-                "csv" => read_csv(state, path),
-                "xlsx" => read_xlxs(state, path),
+                "csv" => read_csv(state, path, max_row),
+                "xlsx" => read_xlxs(state, path, max_row),
                 _ => unsafe {
                     ffi::lua_pushboolean(state, 0);
                     laux::lua_push(state, format!("unsupport file type: {}", ext));

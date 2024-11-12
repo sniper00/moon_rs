@@ -2,7 +2,7 @@ use lib_core::{buffer::Buffer, check_buffer};
 use lib_lua::{
     self, cstr,
     ffi::{self, luaL_Reg},
-    laux::{self},
+    laux::{self, LuaType},
     lreg, lreg_null,
 };
 use std::ffi::c_int;
@@ -347,7 +347,7 @@ extern "C-unwind" fn lua_socket_read(state: *mut ffi::lua_State) -> c_int {
     let owner = actor.id;
     let session = actor.next_uuid();
 
-    let op = if laux::lua_type(state, 2) == ffi::LUA_TNUMBER {
+    let op = if laux::lua_type(state, 2) == LuaType::Number {
         let max_size = laux::lua_get(state, 2);
         let read_timeout = laux::lua_opt(state, 3).unwrap_or(0);
 

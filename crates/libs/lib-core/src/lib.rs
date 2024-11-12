@@ -1,7 +1,7 @@
 use buffer::Buffer;
 use lib_lua::{
     cstr, ffi,
-    laux::{lua_get, lua_type, LuaStateRaw},
+    laux::{lua_get, lua_type, LuaStateRaw, LuaType},
 };
 
 pub mod actor;
@@ -14,12 +14,12 @@ pub mod log;
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn check_buffer(state: LuaStateRaw, index: i32) -> Option<Box<Buffer>> {
     match lua_type(state, index) {
-        ffi::LUA_TSTRING => Some(Box::new(lua_get::<&[u8]>(state, index).into())),
-        ffi::LUA_TLIGHTUSERDATA => unsafe {
+        LuaType::String => Some(Box::new(lua_get::<&[u8]>(state, index).into())),
+        LuaType::LightUserData => unsafe {
             let ptr = ffi::lua_touserdata(state, index) as *mut Buffer;
             Some(Box::from_raw(ptr))
         },
-        ffi::LUA_TNIL => None,
+        LuaType::Nil => None,
         _ => {
             unsafe {
                 ffi::luaL_argerror(

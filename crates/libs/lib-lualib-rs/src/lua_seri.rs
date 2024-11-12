@@ -583,7 +583,11 @@ unsafe extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
         len = ffi::luaL_checkinteger(state, 2) as usize;
     }
 
-    if data.is_null() || len == 0 {
+    if len == 0 {
+        return 0;
+    }
+
+    if data.is_null(){
         ffi::luaL_error(state, cstr!("deserialize null pointer"));
     }
 

@@ -3,7 +3,7 @@ use base64::{engine, Engine};
 use lib_core::{
     actor::LuaActor, check_buffer, context::{self, LuaActorParam, Message, CONTEXT, LOGGER}, log::Logger
 };
-use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null};
+use lib_lua::{self, cstr, ffi::{self, luaL_Reg}, laux::{self, LuaType}, lreg, lreg_null};
 
 use crate::lua_utils;
 use std::{
@@ -311,7 +311,7 @@ pub fn remove_actor(id: i64) -> Result<(), String> {
 }
 
 extern "C-unwind" fn lua_actor_query(state: *mut ffi::lua_State) -> c_int {
-    if laux::lua_type(state, 1) == ffi::LUA_TNUMBER {
+    if laux::lua_type(state, 1) == LuaType::Number {
         return 1;
     }
 
@@ -536,7 +536,7 @@ extern "C-unwind" fn clock(state: *mut ffi::lua_State) -> c_int {
 }
 
 unsafe extern "C-unwind" fn tostring(state: *mut ffi::lua_State) -> c_int {
-    if laux::lua_type(state, 1) == ffi::LUA_TLIGHTUSERDATA {
+    if laux::lua_type(state, 1) == LuaType::LightUserData {
         let data = ffi::lua_touserdata(state, 1) as *const u8;
         ffi::luaL_argcheck(
             state,

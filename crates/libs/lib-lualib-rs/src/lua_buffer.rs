@@ -1,4 +1,4 @@
-use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, ffi::lua_Integer, laux, lreg, lreg_null};
+use lib_lua::{self, cstr, ffi::{self, luaL_Reg, lua_Integer}, laux::{self, LuaType}, lreg, lreg_null};
 use std::ffi::{c_int, c_void};
 
 use lib_core::buffer::{self, Buffer};
@@ -42,33 +42,33 @@ fn concat_one(
     }
 
     match laux::lua_type(state, index) {
-        ffi::LUA_TNIL => {}
-        ffi::LUA_TNUMBER => {
+        LuaType::Nil => {}
+        LuaType::Number => {
             if unsafe { ffi::lua_isinteger(state, index) } != 0 {
                 writer.write_chars(unsafe { ffi::lua_tointeger(state, index) });
             } else {
                 writer.write_chars(unsafe { ffi::lua_tonumber(state, index) });
             }
         }
-        ffi::LUA_TBOOLEAN => {
+        LuaType::Boolean => {
             let n = unsafe { ffi::lua_toboolean(state, index) };
             let s = if n != 0 { "true" } else { "false" };
             writer.write_slice(s.as_bytes());
         }
-        ffi::LUA_TSTRING => {
+        LuaType::String => {
             let mut sz = 0;
             let str = unsafe { ffi::lua_tolstring(state, index, &mut sz) as *const u8 };
             unsafe {
                 writer.write_slice(std::slice::from_raw_parts(str, sz).as_ref());
             }
         }
-        ffi::LUA_TTABLE => {
+        LuaType::Table => {
             concat_table(state, writer, index, depth + 1)?;
         }
         t => {
             return Err(format!(
                 "buffer.concat unsupport type :{}",
-                laux::type_name(state, t)
+                laux::type_name(state, t.into())
             ));
         }
     }
@@ -144,7 +144,7 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
     let top = unsafe { ffi::lua_gettop(state) };
 
     unsafe {
-        if laux::lua_type(state, 2) == ffi::LUA_TSTRING {
+        if laux::lua_type(state, 2) == LuaType::String {
             let opt: &str = laux::lua_opt(state, 2).unwrap_or_default();
             let mut pos = ffi::luaL_optinteger(state, 3, 0) as usize;
             let len = buf.len();
@@ -268,24 +268,24 @@ extern "C-unwind" fn write_front(state: *mut ffi::lua_State) -> c_int {
 
 fn write_string(state: *mut ffi::lua_State, buf: &mut Buffer, index: i32) -> Result<(), String> {
     match laux::lua_type(state, index) {
-        ffi::LUA_TNIL => {}
-        ffi::LUA_TSTRING => {
+        LuaType::Nil => {}
+        LuaType::String => {
             buf.write_slice(laux::lua_get::<&[u8]>(state, index));
         }
-        ffi::LUA_TNUMBER => {
+        LuaType::Number => {
             if unsafe { ffi::lua_isinteger(state, index) } != 0 {
                 buf.write_chars(unsafe { ffi::lua_tointeger(state, index) });
             } else {
                 buf.write_chars(unsafe { ffi::lua_tonumber(state, index) });
             }
         }
-        ffi::LUA_TBOOLEAN => {
+        LuaType::Boolean => {
             let n = unsafe { ffi::lua_toboolean(state, index) };
             let s = if n != 0 { "true" } else { "false" };
             buf.write_slice(s.as_bytes());
         }
         ltype => {
-            return Err(format!("unsupport type :{}", laux::type_name(state, ltype)));
+            return Err(format!("unsupport type :{}", laux::type_name(state, ltype.into())));
         }
     }
     Ok(())
