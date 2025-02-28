@@ -2,108 +2,128 @@ local moon = require("moon")
 
 local conf = ...
 
-if conf.recever then
-    local command = {}
+local sttime = 0
+local counter = 0
 
-    command.TEST = function(sender, ...)
-        moon.send('lua', sender, 'TEST', ...)
+
+local times = 200
+
+local nreceiver = 8
+local ncount = 1000
+local avg = 0
+
+if conf.sender then
+    local command = {}
+    local total_counter = 0
+    local total_time = 0
+    sttime = moon.clock()
+    command.TEST = function()
+        counter = counter + 1
+        if counter == ncount*nreceiver then
+            local cost = moon.clock() - sttime
+            avg = avg + math.floor(ncount*nreceiver/cost)
+            print(string.format("cost %.03fs, %s op/s", cost, math.floor(ncount*nreceiver/cost)))
+            counter = 0
+            sttime = moon.clock()
+            total_time = total_time + cost
+        end
+        total_counter = total_counter + 1
+    end
+
+    command.RUN = function(receivers)
+        local i = 0
+        while i < times do    
+            for _, id in ipairs(receivers) do
+                for _=1,ncount do
+                    moon.send('lua', id, "TEST", 1, 2, 3, 4 , {a=1, b=2 , c = {d=1, e=2, f=3}})
+                end
+            end
+
+            for _, id in ipairs(receivers) do
+                assert(moon.call('lua', id, "TEST2"))
+            end
+
+            i= i+1
+        end
+
+        while total_counter < ncount*nreceiver*times do
+            moon.sleep(500)
+        end
+
+        for _, id in ipairs(receivers) do
+            moon.kill(id)
+        end
+
+        print("avg", avg/times, "per sec")
+        moon.quit()
+        moon.exit(0)
     end
 
     moon.dispatch('lua',function(sender, session, cmd, ...)
         -- body
         local f = command[cmd]
         if f then
-            f(sender,...)
+            f(...)
         else
             error(string.format("Unknown command %s", tostring(cmd)))
         end
     end)
 
-    -- moon.shutdown(function ()
-    --     moon.quit()
-    -- end)
+    moon.shutdown(function ()
+        moon.quit()
+    end)
 
-    return true
-end
+    return
 
+elseif conf.receiver then
 
-local sttime = 0
-local counter = 0
+    local command = {}
 
-local times = 100
-
-local nreceiver = 16
-local ncount = 1000
-
-local avg = 0
-
-local command = {}
-
-command.TEST = function()
-    counter = counter + 1
-    if counter == ncount*nreceiver then
-        local cost = moon.clock() - sttime
-        avg = avg + math.floor(ncount*nreceiver/cost)
-        print(string.format("cost %.03fs, %s op/s", cost, math.floor(ncount*nreceiver/cost)))
-        counter = 0
+    command.TEST = function(sender, ...)
+        moon.send('lua', sender, 'TEST', ...)
     end
-end
 
-moon.dispatch('lua',function(sender, session, cmd, ...)
-    local f = command[cmd]
-    if f then
-        f(...)
-    else
-        error(string.format("Unknown command %s", tostring(cmd)))
+    command.TEST2 = function(...)
+        return true
     end
-end)
-
+    
+    moon.dispatch('lua',function(sender, session, cmd, ...)
+        -- body
+        local f = command[cmd]
+        if f then
+            moon.response( 'lua', sender, session, f(sender,...))
+        else
+            error(string.format("Unknown command %s", tostring(cmd)))
+        end
+    end)
+    return
+end
 
 
 moon.async(function()
 
-    local receivers = {}
+    local sender = moon.new_service( {
+        unique = true,
+        name = "sender",
+        source = "benchmark_send.lua",
+        sender = true
+    })
+    assert(sender>0)
 
+    local receivers = {}
     for i=1, nreceiver do
         local id = moon.new_service( {
-            name = "receiver"..i,
+            name = "receiver",
             source = "benchmark_send.lua",
-            recever = true,
+            receiver = true
         })
 
         table.insert(receivers, id)
     end
 
-
-    local i = 0
-    while i < times do
-        sttime = moon.clock()
-
-        for _=1,ncount do
-            for _, id in ipairs(receivers) do
-                moon.send('lua', id, "TEST", 1, 2, 3, 4 , {a=1, b=2 , c = {d=1, e=2, f=3}})
-            end
-        end
-
-        moon.sleep(0)
-        i= i+1
-    end
-
-    moon.sleep(500)
-
-    for _, id in ipairs(receivers) do
-        moon.kill(id)
-    end
-
-    moon.quit()
-
-    print("avg", avg/times)
-
+    moon.send('lua', moon.query('sender'), "RUN", receivers)
 end)
 
-moon.shutdown(function ()
-    moon.quit()
-end)
 
 
 
