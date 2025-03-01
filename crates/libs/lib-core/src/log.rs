@@ -153,12 +153,22 @@ impl Logger {
 
     pub fn string_to_level(lv: String) -> Level {
         match lv.to_uppercase().as_str() {
-            "ERROR" => Level::Error,
+            "EROR" => Level::Error,
             "WARN" => Level::Warn,
             "INFO" => Level::Info,
-            "DEBUG" => Level::Debug,
-            "TRACE" => Level::Trace,
+            "DBUG" => Level::Debug,
+            "TRCE" => Level::Trace,
             _ => Level::Trace,
+        }
+    }
+
+    pub fn level_to_string(level: Level) -> &'static str {
+        match level {
+            Level::Error => "EROR|",
+            Level::Warn => "WARN|",
+            Level::Info => "INFO|",
+            Level::Debug => "DBUG|",
+            Level::Trace => "TRCE|",
         }
     }
 
@@ -183,12 +193,12 @@ impl Logger {
             CONTEXT
                 .now()
                 .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S.%3f | ")
+                .format("%Y-%m-%d %H:%M:%S.%3f ")
                 .to_string()
                 .as_str(),
         );
 
-        line.write_str(format!("{:<6}| ", level).to_uppercase().as_str());
+        line.write_str(Self::level_to_string(level));
 
         line
     }

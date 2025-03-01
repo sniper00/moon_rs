@@ -16,6 +16,8 @@ use tokio::{
     time::timeout,
 };
 
+use crate::escape_print;
+
 use super::{actor::LuaActor, buffer::Buffer, log::Logger};
 
 pub const PTYPE_SYSTEM: i8 = 1;
@@ -37,7 +39,6 @@ static GLOBAL_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
 lazy_static! {
     pub static ref CONTEXT: LuaActorServer = {
-
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
 
         LuaActorServer {
@@ -66,13 +67,40 @@ thread_local! {
     static THREAD_ID: u64 = GLOBAL_THREAD_ID.fetch_add(1, Ordering::SeqCst);
 }
 
-#[derive(Debug)]
+pub enum MessageData {
+    ISize(isize),
+    Buffer(Box<Buffer>),
+    None,
+}
+
+impl std::fmt::Display for MessageData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageData::ISize(i) => return write!(f, "ISize({})", i),
+            MessageData::Buffer(data) => {
+                return write!(f, "Buffer({:?})", escape_print(data.as_slice()))
+            }
+            MessageData::None => return write!(f, "None"),
+        }
+    }
+}
+
 pub struct Message {
     pub ptype: i8,
     pub from: i64,
     pub to: i64,
     pub session: i64,
-    pub data: Option<Box<Buffer>>,
+    pub data: MessageData,
+}
+
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Message {{ ptype: {}, from: 0x{:08x}, to: 0x{:08x}, session: {}, data: {} }}",
+            self.ptype, self.from, self.to, self.session, self.data
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -113,11 +141,13 @@ pub struct LuaActorServer {
 }
 
 impl LuaActorServer {
-    pub fn add_actor(&self, actor: &mut LuaActor) -> Result<(), String> {
-        let id: i64 = self.actor_uuid.fetch_add(1, Ordering::AcqRel);
+    pub fn add_actor(
+        &self,
+        actor: &mut LuaActor,
+        tx: mpsc::UnboundedSender<Message>,
+    ) -> Result<(), String> {
         self.actor_counter.fetch_add(1, Ordering::AcqRel);
-        self.actors.insert(id, actor.tx.clone());
-        actor.id = id;
+        self.actors.insert(actor.id, tx);
         if actor.unique {
             if let Some(v) = self.unique_actors.insert(actor.name.clone(), actor.id) {
                 self.unique_actors.insert(actor.name.clone(), v);
@@ -142,6 +172,10 @@ impl LuaActorServer {
         }
         self.actor_counter.fetch_sub(1, Ordering::AcqRel);
 
+        if id == BOOTSTRAP_ACTOR_ADDR {
+            self.shutdown(-1);
+        }
+
         //notify actor exit to unique actors
         self.unique_actors.iter().for_each(|v| {
             self.send(Message {
@@ -149,7 +183,7 @@ impl LuaActorServer {
                 from: id,
                 to: *v.value(),
                 session: 0,
-                data: Some(Box::new(
+                data: MessageData::Buffer(Box::new(
                     format!("_service_exit,Actor id:{} quited", id)
                         .into_bytes()
                         .into(),
@@ -197,7 +231,7 @@ impl LuaActorServer {
                 from: 0,
                 to: 0,
                 session: 0,
-                data: None,
+                data: MessageData::None,
             });
         });
     }
@@ -212,6 +246,14 @@ impl LuaActorServer {
             }
         }
         Some(msg)
+    }
+
+    pub fn next_actor_id(&self) -> i64 {
+        let id: i64 = self.actor_uuid.fetch_add(1, Ordering::AcqRel);
+        if id == i64::MAX {
+            panic!("actor id overflow");
+        }
+        id
     }
 
     pub fn next_net_fd(&self) -> i64 {
@@ -255,7 +297,7 @@ impl LuaActorServer {
                 from,
                 to,
                 session: -session,
-                data: Some(Box::new(err.into_bytes().into())),
+                data: MessageData::Buffer(Box::new(err.into_bytes().into())),
             });
         }
     }
@@ -286,7 +328,7 @@ impl LuaActorServer {
                     from: v.to,
                     to: BOOTSTRAP_ACTOR_ADDR,
                     session: 0,
-                    data: Some(Box::new(s.into())),
+                    data: MessageData::Buffer(Box::new(s.into())),
                 });
             }
         });
@@ -310,7 +352,10 @@ impl LuaActorServer {
         let client = if proxy.is_empty() {
             builder.build().unwrap_or_default()
         } else {
-            builder.proxy(reqwest::Proxy::all(proxy).unwrap()).build().unwrap_or_default()
+            builder
+                .proxy(reqwest::Proxy::all(proxy).unwrap())
+                .build()
+                .unwrap_or_default()
         };
 
         self.http_clients.insert(name.to_string(), client.clone());
@@ -372,7 +417,7 @@ pub fn run_timer() {
                         from: timer.timer_id,
                         to: timer.owner,
                         session: 0,
-                        data: None,
+                        data: MessageData::None,
                     });
                     btree_map.pop_first();
                 } else {
@@ -385,6 +430,7 @@ pub fn run_timer() {
 }
 
 pub struct LuaActorParam {
+    pub id: i64,
     pub unique: bool,
     pub creator: i64,
     pub session: i64,

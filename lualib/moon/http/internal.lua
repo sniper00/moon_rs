@@ -239,11 +239,11 @@ local function read_response(fd, method, read_timeout)
 end
 
 local function parse_query(request)
-    return c.parse_query_string(request.query_string)
+    return c.form_urldecode(request.query_string)
 end
 
 local function parse_form(request)
-    return c.parse_query_string(request.body)
+    return c.form_urldecode(request.body)
 end
 
 local function parse_header(data)

@@ -488,8 +488,8 @@ reg_protocol {
     pack = function(...)
         return ...
     end,
-    unpack = function(sz, len)
-        return math.tointeger(moon.tostring(sz, len))
+    unpack = function(val)
+        return val
     end,
     dispatch = function()
         error("PTYPE_INTEGER dispatch not implemented")
@@ -678,15 +678,6 @@ reg_protocol {
         else
             moon.response("debug", sender, session, "unknow debug cmd " .. cmd)
         end
-    end
-}
-
-reg_protocol {
-    name = "httpc",
-    PTYPE = moon.PTYPE_HTTP,
-    unpack = moon.tostring,
-    dispatch = function(sender, session, cmd, ...)
-        error("PTYPE_HTTP dispatch not implemented")
     end
 }
 

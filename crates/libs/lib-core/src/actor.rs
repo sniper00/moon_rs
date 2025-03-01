@@ -1,4 +1,6 @@
 use lib_lua::laux::{LuaState, LuaThread};
+use crate::context::LuaActorParam;
+
 use super::context::Message;
 pub use lib_lua as ffi;
 use tokio::sync::mpsc;
@@ -9,7 +11,6 @@ pub struct LuaActor {
     pub id: i64,
     uuid: i64,
     pub name: String,
-    pub tx: mpsc::UnboundedSender<Message>,
     pub rx: mpsc::UnboundedReceiver<Message>,
     pub main_state: LuaState,
     pub callback_state: LuaThread,
@@ -19,15 +20,13 @@ pub struct LuaActor {
 }
 
 impl LuaActor {
-    pub fn new(name: String, unique: bool) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn new(params: &LuaActorParam, rx: mpsc::UnboundedReceiver<Message>) -> Self {
         LuaActor {
             ok: false,
-            unique,
-            id: 0,
+            unique: params.unique,
+            id: params.id,
             uuid: 0,
-            name,
-            tx,
+            name: params.name.clone(),
             rx,
             main_state: LuaState::new(std::ptr::null_mut()),
             callback_state: LuaThread::new(std::ptr::null_mut()),
@@ -46,7 +45,7 @@ impl LuaActor {
         get_extra_object::<Self>(state)
     }
 
-    pub fn next_uuid(&mut self) -> i64 {
+    pub fn next_session(&mut self) -> i64 {
         self.uuid += 1;
         self.uuid
     }
@@ -55,14 +54,14 @@ impl LuaActor {
 fn set_extra_object<T>(state: *mut ffi::lua_State, obj: &T) {
     unsafe {
         let space = ffi::lua_getextraspace(state) as *mut usize;
-        std::ptr::write_unaligned(space, obj as *const T as usize);
+        std::ptr::write(space, obj as *const T as usize);
     }
 }
 
 fn get_extra_object<T>(state: *mut ffi::lua_State) -> &'static mut T {
     unsafe {
         let space = ffi::lua_getextraspace(state) as *mut usize;
-        let v = std::ptr::read_unaligned(space);
+        let v = std::ptr::read(space);
         debug_assert!(v != 0);
         &mut *(v as *mut T)
     }

@@ -615,9 +615,9 @@ pub enum LuaType {
     Thread,
 }
 
-impl Into<i32> for LuaType {
-    fn into(self) -> i32 {
-        match self {
+impl From<LuaType> for i32 {
+    fn from(lua_type: LuaType) -> Self {
+        match lua_type {
             LuaType::Nil => 0,
             LuaType::Boolean => 1,
             LuaType::LightUserData => 2,
@@ -746,6 +746,14 @@ pub fn lua_checktype(state: LuaStateRaw, index: i32, ltype: i32) {
 
 #[inline]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn luaL_checkstack(state: LuaStateRaw, sz: i32, msg: *const c_char) {
+    unsafe {
+        ffi::luaL_checkstack(state, sz, msg);
+    }
+}
+
+#[inline]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn push_c_string(state: LuaStateRaw, s: *const i8) {
     unsafe {
         ffi::lua_pushstring(state, s);
@@ -861,4 +869,116 @@ pub fn lua_touserdata<T>(state: *mut ffi::lua_State, index: i32) -> Option<&'sta
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn lua_isinteger(state: LuaStateRaw, index: i32) -> bool {
     unsafe { ffi::lua_isinteger(state, index) != 0 }
+}
+
+#[inline]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn lua_from_raw_parts(state: LuaStateRaw, mut index: i32) -> &'static [u8] {
+    unsafe {
+        if index < 0 {
+            index = ffi::lua_gettop(state) + index + 1;
+        }
+        ffi::luaL_checktype(state, index, ffi::LUA_TLIGHTUSERDATA);
+        let ptr = ffi::lua_touserdata(state, 1);
+        let len = lua_get(state, index + 1);
+        std::slice::from_raw_parts(ptr as *const u8, len)
+    }
+}
+
+/// Converts an `isize` value from Lua state at the given index into a Rust `T` object.
+/// 
+/// # Arguments
+/// 
+/// * `state` - The Lua state.
+/// * `index` - The index in the Lua stack.
+/// 
+/// # Safety
+/// 
+/// This function is unsafe because it dereferences a raw pointer.
+/// 
+/// # Returns
+/// 
+/// A `Box<T>` containing the Rust object.
+pub fn lua_into_userdata<T>(state: LuaStateRaw, index: i32) -> Box<T> {
+    let p_as_isize: isize = lua_get(state, index);
+    unsafe { Box::from_raw(p_as_isize as *mut T) }
+}
+
+pub struct LuaTable {
+    state: LuaStateRaw,
+    index: i32,
+}
+
+impl LuaTable {
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn new(state: LuaStateRaw, narr: usize, nrec: usize) -> Self {
+        unsafe {
+            ffi::lua_createtable(state, narr as i32, nrec as i32);
+            LuaTable {
+                state,
+                index: ffi::lua_gettop(state),
+            }
+        }
+    }
+
+    pub fn from_raw(state: LuaStateRaw, index: i32) -> Self {
+        LuaTable { state, index }
+    }
+
+    pub fn len(&self) -> usize {
+        lua_rawlen(self.state, self.index)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn seti(&self, n: i64) {
+        unsafe {
+            ffi::lua_seti(self.state, self.index, n);
+        }
+    }
+
+    pub fn new_table<K>(&self, key: K, narr: usize, nrec: usize) -> LuaTable
+    where K: LuaValue {
+        unsafe {
+            K::push_lua(self.state, key);
+            ffi::lua_createtable(self.state, narr as i32, nrec as i32);
+            LuaTable {
+                state: self.state,
+                index: ffi::lua_gettop(self.state),
+            }
+        }
+    }
+
+    pub fn rawset(&self) {
+        unsafe {
+            ffi::lua_rawset(self.state, self.index);
+        }
+    }
+
+    pub fn set<K,V>(&self, key: K, val: V)
+    where
+        K : LuaValue,
+        V: LuaValue,
+    {
+        unsafe {
+            K::push_lua(self.state, key);
+            V::push_lua(self.state, val);
+            ffi::lua_rawset(self.state, self.index);
+        }
+    }
+
+    pub fn foreach<F>(&self, mut f: F)
+    where
+        F: FnMut(i32, i32),
+    {
+        unsafe {
+            ffi::lua_pushnil(self.state);
+            while ffi::lua_next(self.state, self.index) != 0 {
+                f(-2, -1);
+                ffi::lua_pop(self.state, 1);
+            }
+        }
+    }
 }

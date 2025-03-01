@@ -1,4 +1,4 @@
-use lib_core::{buffer::Buffer, check_buffer};
+use lib_core::{buffer::Buffer, check_buffer, context::MessageData};
 use lib_lua::{
     self, cstr,
     ffi::{self, luaL_Reg},
@@ -99,7 +99,7 @@ async fn read_until(
                             from: 0,
                             to: owner,
                             session,
-                            data: Some(buffer),
+                            data: MessageData::Buffer(buffer),
                         })
                         .is_some()
                     {
@@ -165,7 +165,7 @@ async fn read_bytes(
                     from: 0,
                     to: owner,
                     session,
-                    data: Some(buffer),
+                    data: MessageData::Buffer(buffer),
                 })
                 .is_some()
             {
@@ -233,7 +233,7 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
             from: 0,
             to: owner,
             session,
-            data: Some(Box::new(fd.to_string().into())),
+            data: MessageData::ISize(fd as isize),
         })
         .is_some()
     {
@@ -320,7 +320,7 @@ extern "C-unwind" fn lua_socket_accept(state: *mut ffi::lua_State) -> c_int {
     let fd = laux::lua_get(state, 1);
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
-    let session = actor.next_uuid();
+    let session = actor.next_session();
 
     if let Some(channel) = CONTEXT.net.get(&fd) {
         match channel.value().0.try_send(NetOp::Accept(owner, session)) {
@@ -345,7 +345,7 @@ extern "C-unwind" fn lua_socket_read(state: *mut ffi::lua_State) -> c_int {
 
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
-    let session = actor.next_uuid();
+    let session = actor.next_session();
 
     let op = if laux::lua_type(state, 2) == LuaType::Number {
         let max_size = laux::lua_get(state, 2);
@@ -416,7 +416,7 @@ extern "C-unwind" fn lua_socket_connect(state: *mut ffi::lua_State) -> c_int {
 
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
-    let session = actor.next_uuid();
+    let session = actor.next_session();
 
     tokio::spawn(async move {
         match timeout(

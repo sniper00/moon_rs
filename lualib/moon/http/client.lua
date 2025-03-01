@@ -2,25 +2,19 @@ local moon = require "moon"
 local json = require "json"
 local core = require "http.core"
 
+moon.register_protocol {
+    name = "http",
+    PTYPE = moon.PTYPE_HTTP,
+    pack = function(...) return ... end,
+    unpack =  function (val)
+        return core.decode(val)
+    end,
+}
+
 ---@return table
 local function tojson(response)
     if response.status_code ~= 200 then return {} end
     return json.decode(response.body)
-end
-
----@return HttpResponse
-local function parse_raw_response(raw_response, err)
-    if not raw_response then
-        return { status_code = -1, content = err }
-    end
-
-    local header_len = string.unpack("<I", raw_response)
-
-    local raw_header = string.sub(raw_response, 5, 4 + header_len)
-    local response = assert(core.parse_response(raw_header))
-    response.body = string.sub(raw_response, 5 + header_len)
-
-    return response
 end
 
 ---@class HttpRequestOptions
@@ -37,7 +31,7 @@ function client.get(url, opts)
     opts = opts or {}
     opts.url = url
     opts.method = "GET"
-    return parse_raw_response(moon.wait(core.request(opts)))
+    return moon.wait(core.request(opts))
 end
 
 local json_content_type = { ["Content-Type"] = "application/json" }
@@ -60,7 +54,7 @@ function client.post_json(url, data, opts)
     opts.method = "POST"
     opts.body = json.encode(data)
 
-    local res = parse_raw_response(moon.wait(core.request(opts)))
+    local res = moon.wait(core.request(opts))
 
     if res.status_code == 200 then
         res.body = tojson(res)
@@ -77,7 +71,7 @@ function client.post(url, data, opts)
     opts.url = url
     opts.body = data
     opts.method = "POST"
-    return parse_raw_response(moon.wait(core.request(opts)))
+    return moon.wait(core.request(opts))
 end
 
 local form_headers = { ["Content-Type"] = "application/x-www-form-urlencoded" }
@@ -103,9 +97,9 @@ function client.post_form(url, data, opts)
 
     opts.url = url
     opts.method = "POST"
-    opts.body = core.encode_query_string(opts.body)
+    opts.body = core.form_urlencode(opts.body)
 
-    return parse_raw_response(moon.wait(core.request(opts)))
+    return moon.wait(core.request(opts))
 end
 
 return client

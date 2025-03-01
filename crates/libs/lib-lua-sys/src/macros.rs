@@ -33,7 +33,31 @@ macro_rules! lua_rawsetfield {
         unsafe {
             ffi::lua_pushstring($state, cstr!($kname));
             $valueexp;
-            ffi::lua_rawset($state, $tbindex);
+            ffi::lua_rawset($state, $tbindex-2);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! push_lua_table {
+    ($state:expr, $( $key:expr => $value:expr ),* ) => {
+        unsafe {
+            ffi::lua_createtable($state, 0, 0);
+            $(
+                laux::lua_push($state, $key);
+                laux::lua_push($state, $value);
+                ffi::lua_settable($state, -3);
+            )*
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! luaL_newlib {
+    ($state:expr, $l:expr) => {
+        unsafe {
+            ffi::lua_createtable($state, 0, $l.len() as i32);
+            ffi::luaL_setfuncs($state, $l.as_ptr(), 0);
         }
     };
 }

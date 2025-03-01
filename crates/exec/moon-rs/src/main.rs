@@ -248,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("system start. ({}:{})", file!(), line!());
 
     lua_actor::new_actor(LuaActorParam {
+        id: CONTEXT.next_actor_id(),
         unique: true,
         creator: 0,
         session: 0,

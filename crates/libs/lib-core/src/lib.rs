@@ -32,3 +32,21 @@ pub fn check_buffer(state: LuaStateRaw, index: i32) -> Option<Box<Buffer>> {
         }
     }
 }
+
+pub fn escape_print(input: &[u8]) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut result = String::with_capacity(input.len());
+    
+    for byte in input {
+        if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
+            result.push(*byte as char);
+        } else {
+            result.push('\\');
+            result.push('x');
+            result.push(HEX[(byte >> 4) as usize] as char);
+            result.push(HEX[(byte & 0xf) as usize] as char);
+        }
+    }
+    
+    result
+}
