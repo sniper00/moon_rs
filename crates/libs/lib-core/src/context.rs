@@ -32,6 +32,7 @@ pub const PTYPE_SOCKET_UDP: i8 = 9;
 pub const PTYPE_INTEGER: i8 = 12;
 pub const PTYPE_HTTP: i8 = 13;
 pub const PTYPE_QUIT: i8 = 14;
+pub const PTYPE_SQLX: i8 = 15;
 
 pub const BOOTSTRAP_ACTOR_ADDR: i64 = 1;
 
@@ -76,11 +77,11 @@ pub enum MessageData {
 impl std::fmt::Display for MessageData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MessageData::ISize(i) => return write!(f, "ISize({})", i),
+            MessageData::ISize(i) => write!(f, "ISize({})", i),
             MessageData::Buffer(data) => {
-                return write!(f, "Buffer({:?})", escape_print(data.as_slice()))
+                write!(f, "Buffer({:?})", escape_print(data.as_slice()))
             }
-            MessageData::None => return write!(f, "None"),
+            MessageData::None => write!(f, "None"),
         }
     }
 }
@@ -246,6 +247,19 @@ impl LuaActorServer {
             }
         }
         Some(msg)
+    }
+
+    pub fn send_value<T>(&self,protocol_type: i8, owner: i64, session: i64, res: T)-> Option<Message> {
+
+        let ptr = Box::into_raw(Box::new(res));
+
+        self.send(Message {
+            ptype: protocol_type,
+            from: 0,
+            to: owner,
+            session,
+            data: MessageData::ISize(ptr as isize),
+        })
     }
 
     pub fn next_actor_id(&self) -> i64 {

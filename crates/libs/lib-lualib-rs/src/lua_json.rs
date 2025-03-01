@@ -39,10 +39,20 @@ const HEX_DIGITS: [u8; 16] = [
     b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'A', b'B', b'C', b'D', b'E', b'F',
 ];
 
-struct JsonOptions {
+pub struct JsonOptions {
     empty_as_array: bool,
     enable_number_key: bool,
     enable_sparse_array: bool,
+}
+
+impl Default for JsonOptions {
+    fn default() -> Self {
+        Self {
+            empty_as_array: true,
+            enable_number_key: true,
+            enable_sparse_array: true,
+        }
+    }
 }
 
 extern "C-unwind" fn set_options(state: LuaStateRaw) -> i32 {
@@ -72,7 +82,7 @@ extern "C-unwind" fn set_options(state: LuaStateRaw) -> i32 {
     1
 }
 
-fn fetch_options(state: LuaStateRaw) -> &'static mut JsonOptions {
+pub fn fetch_options(state: LuaStateRaw) -> &'static mut JsonOptions {
     let opts = laux::lua_touserdata::<JsonOptions>(state, ffi::lua_upvalueindex(1));
     if opts.is_none() {
         laux::lua_error(state, "expect json options");
@@ -80,7 +90,8 @@ fn fetch_options(state: LuaStateRaw) -> &'static mut JsonOptions {
     opts.unwrap()
 }
 
-unsafe fn encode_one(
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn encode_one(
     state: *mut ffi::lua_State,
     writer: &mut Vec<u8>,
     idx: i32,
@@ -134,11 +145,11 @@ unsafe fn encode_one(
         LuaType::Nil => {
             writer.extend_from_slice(JSON_NULL.as_bytes());
         }
-        LuaType::LightUserData => {
+        LuaType::LightUserData => unsafe {
             if ffi::lua_touserdata(state, idx).is_null() {
                 writer.extend_from_slice(JSON_NULL.as_bytes());
             }
-        }
+        },
         ltype => {
             return Err(format!(
                 "json encode: unsupport value type :{}",
@@ -264,7 +275,7 @@ unsafe fn encode_object(
     Ok(())
 }
 
-unsafe fn encode_table(
+fn encode_table(
     state: *mut ffi::lua_State,
     writer: &mut Vec<u8>,
     mut idx: i32,
@@ -278,15 +289,17 @@ unsafe fn encode_table(
     }
 
     if idx < 0 {
-        idx = ffi::lua_gettop(state) + idx + 1;
+        idx = laux::lua_top(state) + idx + 1;
     }
 
-    ffi::luaL_checkstack(state, 6, cstr!("json.encode.table"));
-    let arr_size = lua_array_size(state, idx);
-    if arr_size > 0 {
-        encode_array(state, arr_size, writer, idx, depth, fmt, options)?;
-    } else {
-        encode_object(state, writer, idx, depth, fmt, options)?;
+    unsafe {
+        ffi::luaL_checkstack(state, 6, cstr!("json.encode.table"));
+        let arr_size = lua_array_size(state, idx);
+        if arr_size > 0 {
+            encode_array(state, arr_size, writer, idx, depth, fmt, options)?;
+        } else {
+            encode_object(state, writer, idx, depth, fmt, options)?;
+        }
     }
 
     Ok(())
@@ -620,7 +633,7 @@ fn concat_resp_one(
                 }
             } else {
                 let mut w = Buffer::new();
-                unsafe { encode_one(state, w.as_mut_vec(), index, 0, false, options)? };
+                encode_one(state, w.as_mut_vec(), index, 0, false, options)?;
                 write_resp(writer, w.as_str());
             }
         }
@@ -687,10 +700,16 @@ extern "C-unwind" fn concat_resp(state: *mut ffi::lua_State) -> c_int {
     2
 }
 
+/// # Safety
+///
+/// This function is unsafe because it dereferences a raw pointer `state`.
+/// The caller must ensure that `state` is a valid pointer to a `lua_State`
+/// and that it remains valid for the duration of the function call.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C-unwind" fn luaopen_json(state: *mut ffi::lua_State) -> c_int {
     let l = [
-        lreg!("decode", ffi::lua_json_decode),
-        lreg!("decode_v2", decode),
+        lreg!("decode", decode),
         lreg!("encode", encode),
         lreg!("concat", concat),
         lreg!("concat_resp", concat_resp),

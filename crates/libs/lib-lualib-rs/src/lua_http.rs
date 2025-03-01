@@ -1,6 +1,6 @@
 use lib_core::{
     actor::LuaActor,
-    context::{self, Message, MessageData, CONTEXT},
+    context::{self, CONTEXT},
 };
 use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null, lua_rawsetfield};
 use percent_encoding::percent_decode;
@@ -47,21 +47,11 @@ async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
         .send()
         .await?;
 
-    let response = HttpResponse {
+    CONTEXT.send_value(context::PTYPE_HTTP, req.id, req.session, HttpResponse {
         version: response.version(),
         status_code: response.status().as_u16() as i32,
         headers: response.headers().clone(),
         body: response.bytes().await?,
-    };
-
-    let ptr = Box::into_raw(Box::new(response));
-
-    CONTEXT.send(Message {
-        ptype: context::PTYPE_HTTP,
-        from: 0,
-        to: req.id,
-        session: req.session,
-        data: MessageData::ISize(ptr as isize),
     });
 
     Ok(())
@@ -124,19 +114,11 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
 
     tokio::spawn(async move {
         if let Err(err) = http_request(req).await {
-            let ptr = Box::into_raw(Box::new(HttpResponse{
+            CONTEXT.send_value(context::PTYPE_HTTP, id, session, HttpResponse {
                 version: Version::HTTP_11,
                 status_code: -1,
                 headers: HeaderMap::new(),
                 body: err.to_string().into(),
-            }));
-
-            CONTEXT.send(Message {
-                ptype: context::PTYPE_HTTP,
-                from: 0,
-                to: id,
-                session,
-                data: MessageData::ISize(ptr as isize),
             });
         }
     });

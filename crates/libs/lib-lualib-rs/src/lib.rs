@@ -4,11 +4,11 @@ mod lua_buffer;
 mod lua_excel;
 mod lua_fs;
 mod lua_http;
-mod lua_json;
 mod lua_seri;
 mod lua_socket;
 mod lua_utils;
-
+mod lua_sqlx;
+pub mod lua_json;
 pub mod lua_actor;
 
 macro_rules! lua_require {
@@ -29,4 +29,5 @@ pub fn luaopen_custom_libs(state: *mut ffi::lua_State) {
     lua_require!(state, "json", lua_json::luaopen_json);
     lua_require!(state, "buffer", lua_buffer::luaopen_buffer);
     lua_require!(state, "seri", lua_seri::luaopen_seri);
+    lua_require!(state, "sqlx.core", lua_sqlx::luaopen_sqlx);
 }

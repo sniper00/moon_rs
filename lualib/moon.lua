@@ -44,7 +44,8 @@ moon.PTYPE_SOCKET_UDP = 9
 -- moon.PTYPE_SOCKET_MOON = 11
 moon.PTYPE_INTEGER = 12
 moon.PTYPE_HTTP = 13
--- moon.PTYPE_QUIT = 13
+-- moon.PTYPE_QUIT = 14
+moon.PTYPE_SQLX = 15
 
 --moon.codecache = require("codecache")
 

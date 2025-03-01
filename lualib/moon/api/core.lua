@@ -55,7 +55,7 @@ function core.collect(force) end
 function core.log(loglv,...) end
 
 --- set or get log level
----@param lv? string @DEBUG, INFO, WARN, ERROR
+---@param lv? string @DBUG, INFO, WARN, EROR
 ---@return integer @ log level
 function core.loglevel(lv) end
 

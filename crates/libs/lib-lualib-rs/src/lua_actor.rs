@@ -361,7 +361,7 @@ extern "C-unwind" fn lua_actor_send(state: *mut ffi::lua_State) -> c_int {
         from,
         to,
         session: -session,
-        data: data.map_or(MessageData::None, |d| MessageData::Buffer(d)),
+        data: data.map_or(MessageData::None, MessageData::Buffer),
     }) {
         CONTEXT.response_error(
             m.to,
@@ -474,7 +474,7 @@ extern "C-unwind" fn lua_loglevel(state: *mut ffi::lua_State) -> c_int {
     }
 
     let level = laux::lua_get(state, 1);
-    LOGGER.set_log_level(Logger::u8_to_level(level));
+    LOGGER.set_log_level(Logger::string_to_level(level));
     0
 }
 
