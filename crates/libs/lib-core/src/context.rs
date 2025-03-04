@@ -304,7 +304,7 @@ impl LuaActorServer {
 
     pub fn response_error(&self, from: i64, to: i64, session: i64, err: String) {
         if session >= 0 {
-            log::debug!("{}. ({}:{})", err, file!(), line!());
+            log::error!("{}. ({}:{})", err, file!(), line!());
         } else {
             self.send(Message {
                 ptype: PTYPE_ERROR,

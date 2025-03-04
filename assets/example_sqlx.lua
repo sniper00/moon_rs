@@ -30,11 +30,11 @@ moon.async(function()
     }
 
     local sql = string.format([[
-        --create userdata table
         drop table if exists userdata;
     ]])
 
     local sql2 = [[
+        --create userdata table
         create table userdata (
             uid	bigint,
             key		text,
@@ -51,8 +51,10 @@ moon.async(function()
         return
     end
 
-    print_r(db:query(sql))
-    print_r(db:query(sql2))
+    print_r(db:transaction({
+        {sql},
+        {sql2},
+    }))
 
     local result = db:query(
         "INSERT INTO userdata (uid, key, value) values($1, $2, $3) on conflict (uid, key) do update set value = excluded.value;",
@@ -60,7 +62,15 @@ moon.async(function()
     print_r(result)
 
     local st = moon.clock()
+    local trans = {}
     for i = 1, 10000 do
+        trans[#trans+1] = {"INSERT INTO userdata (uid, key, value) values($1, $2, $3) on conflict (uid, key) do update set value = excluded.value;", 235, "info2", info}
+    end
+    print_r(db:transaction(trans))
+    print("trans cost", moon.clock() - st)
+
+    local st = moon.clock()
+    for i = 10001, 20000 do
         local res = db:query(
             "INSERT INTO userdata (uid, key, value) values($1, $2, $3) on conflict (uid, key) do update set value = excluded.value;",
             235, "info2", info)
