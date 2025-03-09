@@ -33,6 +33,7 @@ pub const PTYPE_INTEGER: i8 = 12;
 pub const PTYPE_HTTP: i8 = 13;
 pub const PTYPE_QUIT: i8 = 14;
 pub const PTYPE_SQLX: i8 = 15;
+pub const PTYPE_MONGODB: i8 = 16;
 
 pub const BOOTSTRAP_ACTOR_ADDR: i64 = 1;
 

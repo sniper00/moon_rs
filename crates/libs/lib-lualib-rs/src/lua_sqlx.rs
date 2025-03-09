@@ -1,9 +1,9 @@
-use crate::lua_json::{encode_one, JsonOptions};
+use crate::lua_json::{encode_table, JsonOptions};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use lib_core::actor::LuaActor;
 use lib_core::context::{self, CONTEXT};
-use lib_lua::laux::{lua_into_userdata, LuaTable};
+use lib_lua::laux::{lua_into_userdata, LuaTable, LuaValue};
 use lib_lua::luaL_newlib;
 use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null, push_lua_table};
 use sqlx::migrate::MigrateDatabase;
@@ -158,8 +158,8 @@ impl DatabasePool {
 }
 
 enum DatabaseOp {
-    Query(i64, DatabaseQuery),                 // session, QueryBuilder
-    Transaction(i64, Box<Vec<DatabaseQuery>>), // session, Vec<QueryBuilder>
+    Query(i64, DatabaseQuery),            // session, QueryBuilder
+    Transaction(i64, Vec<DatabaseQuery>), // session, Vec<QueryBuilder>
     Close(),
 }
 
@@ -251,7 +251,12 @@ async fn database_handler(
             DatabaseOp::Transaction(session, query_ops) => loop {
                 match pool.transaction(query_ops).await {
                     Ok(_) => {
-                        CONTEXT.send_value(protocol_type, owner, *session, DatabaseResult::Transaction);
+                        CONTEXT.send_value(
+                            protocol_type,
+                            owner,
+                            *session,
+                            DatabaseResult::Transaction,
+                        );
                         if failed_times > 0 {
                             log::info!(
                                 "Database '{}' recover from error. Retry success. ({}:{})",
@@ -340,37 +345,24 @@ extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
 fn get_query_param(state: *mut ffi::lua_State, i: i32) -> Result<QueryParams, String> {
     let options = JsonOptions::default();
 
-    let ltype = laux::lua_type(state, i);
-    let res = match ltype {
-        laux::LuaType::Boolean => {
-            if laux::lua_opt::<bool>(state, i).unwrap_or_default() {
-                QueryParams::Bool(true)
-            } else {
-                QueryParams::Bool(false)
-            }
-        }
-        laux::LuaType::Number => {
-            if laux::is_integer(state, i) {
-                QueryParams::Int(laux::lua_to::<i64>(state, i))
-            } else {
-                QueryParams::Float(laux::lua_to::<f64>(state, i))
-            }
-        }
-        laux::LuaType::String => {
-            let s = laux::lua_get::<&str>(state, i);
-            if s.starts_with('{') || s.starts_with('[') {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
+    let res = match LuaValue::from_stack(state, i) {
+        LuaValue::Boolean(val) => QueryParams::Bool(val),
+        LuaValue::Number(val) => QueryParams::Float(val),
+        LuaValue::Integer(val) => QueryParams::Int(val),
+        LuaValue::String(val) => {
+            if val.starts_with(b"{") || val.starts_with(b"[") {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(val) {
                     QueryParams::Json(value)
                 } else {
-                    QueryParams::Text(s.to_string())
+                    QueryParams::Text(unsafe { String::from_utf8_unchecked(val.to_vec()) })
                 }
             } else {
-                QueryParams::Text(s.to_string())
+                QueryParams::Text(unsafe { String::from_utf8_unchecked(val.to_vec()) })
             }
         }
-        laux::LuaType::Table => {
+        LuaValue::Table(val) => {
             let mut buffer = Vec::new();
-            if let Err(err) = encode_one(state, &mut buffer, i, 0, false, &options) {
+            if let Err(err) = encode_table(&mut buffer, &val, 0, false, &options) {
                 drop(buffer);
                 laux::lua_error(state, &err);
             }
@@ -384,14 +376,14 @@ fn get_query_param(state: *mut ffi::lua_State, i: i32) -> Result<QueryParams, St
                 QueryParams::Bytes(buffer)
             }
         }
-        _ => {
+        _t => {
             return Err(format!(
                 "get_query_param: unsupport value type :{}",
-                laux::type_name(state, ltype as i32)
+                laux::type_name(state, i)
             ));
         }
     };
-    return Ok(res);
+    Ok(res)
 }
 
 extern "C-unwind" fn query(state: *mut ffi::lua_State) -> c_int {
@@ -445,7 +437,7 @@ extern "C-unwind" fn query(state: *mut ffi::lua_State) -> c_int {
 }
 
 struct TransactionQuerys {
-    querys: Box<Vec<DatabaseQuery>>,
+    querys: Vec<DatabaseQuery>,
 }
 
 extern "C-unwind" fn push_transaction_query(state: *mut ffi::lua_State) -> c_int {
@@ -479,9 +471,7 @@ extern "C-unwind" fn push_transaction_query(state: *mut ffi::lua_State) -> c_int
 extern "C-unwind" fn make_transaction(state: *mut ffi::lua_State) -> c_int {
     laux::lua_newuserdata(
         state,
-        TransactionQuerys {
-            querys: Box::new(Vec::new()),
-        },
+        TransactionQuerys { querys: Vec::new() },
         cstr!("sqlx_transaction_metatable"),
         &[lreg!("push", push_transaction_query), lreg_null!()],
     );
@@ -496,7 +486,6 @@ extern "C-unwind" fn transaction(state: *mut ffi::lua_State) -> c_int {
 
     let querys = laux::lua_touserdata::<TransactionQuerys>(state, 3)
         .expect("Invalid transaction query pointer");
-
 
     match conn.tx.try_send(DatabaseOp::Transaction(
         session,
@@ -577,29 +566,29 @@ where
             match row.try_get_raw(*index) {
                 Ok(value) => match *column_type_name {
                     "NULL" => {
-                        row_table.set(*column_name, ffi::LUA_TNIL);
+                        row_table.rawset(*column_name, ffi::LUA_TNIL);
                     }
                     "BOOL" | "BOOLEAN" => {
-                        row_table.set(
+                        row_table.rawset(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(false),
                         );
                     }
                     "INT2" | "INT4" | "INT8" | "TINYINT" | "SMALLINT" | "INT" | "MEDIUMINT"
                     | "BIGINT" | "INTEGER" => {
-                        row_table.set(
+                        row_table.rawset(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(0),
                         );
                     }
                     "FLOAT4" | "FLOAT8" | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL" => {
-                        row_table.set(
+                        row_table.rawset(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(0.0),
                         );
                     }
                     "TEXT" => {
-                        row_table.set(
+                        row_table.rawset(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(""),
                         );
@@ -607,7 +596,7 @@ where
                     _ => {
                         let column_value: &[u8] =
                             sqlx::decode::Decode::decode(value).unwrap_or(b"");
-                        row_table.set(*column_name, column_value);
+                        row_table.rawset(*column_name, column_value);
                     }
                 },
                 Err(error) => {
@@ -738,7 +727,7 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
 extern "C-unwind" fn stats(state: *mut ffi::lua_State) -> c_int {
     let table = LuaTable::new(state, 0, DATABASE_CONNECTIONSS.len());
     DATABASE_CONNECTIONSS.iter().for_each(|pair| {
-        table.set(
+        table.rawset(
             pair.key().as_str(),
             pair.value()
                 .counter

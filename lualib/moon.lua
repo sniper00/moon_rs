@@ -46,6 +46,7 @@ moon.PTYPE_INTEGER = 12
 moon.PTYPE_HTTP = 13
 -- moon.PTYPE_QUIT = 14
 moon.PTYPE_SQLX = 15
+moon.PTYPE_MONGODB = 16
 
 --moon.codecache = require("codecache")
 

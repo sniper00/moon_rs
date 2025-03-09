@@ -327,7 +327,7 @@ pub fn remove_actor(id: i64) -> Result<(), String> {
 }
 
 extern "C-unwind" fn lua_actor_query(state: *mut ffi::lua_State) -> c_int {
-    if laux::lua_type(state, 1) == LuaType::Number {
+    if laux::lua_type(state, 1) == LuaType::Integer {
         return 1;
     }
 
@@ -369,9 +369,7 @@ extern "C-unwind" fn lua_actor_send(state: *mut ffi::lua_State) -> c_int {
             m.session,
             format!(
                 "Dead service 0x{:08x} recv message from 0x{:08x}: {}.",
-                to,
-                from,
-                m.data
+                to, from, m.data
             ),
         );
     }

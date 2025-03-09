@@ -32,8 +32,7 @@ http_server.listen("127.0.0.1:19991")
 print("http_server start", "127.0.0.1", 19991)
 
 moon.async(function()
-
-    local response = httpc.get("https://baidu.com?a=1&b=2")
+    local response = httpc.get("https://bing.com")
     assert(response.status_code == 200, "GET request failed")
     
     -- Test case for GET request
