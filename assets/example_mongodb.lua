@@ -3,7 +3,7 @@ local moon = require "moon"
 local mongodb = require "moon.db.mongodb"
 
 moon.async(function()
-    local db = mongodb.connect("mongodb://127.0.0.1:27017", "gamedb1")
+    local db = mongodb.connect("mongodb://127.0.0.1:27017/?serverSelectionTimeoutMS=2000", "gamedb1")
     if db.kind then
         print("connect failed", db.message)
         return

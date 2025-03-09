@@ -36,10 +36,9 @@ local M = {}
 ---@nodiscard
 ---@param database_url string Database url e. "mongodb://127.0.0.1:27017"
 ---@param name string Connection name for find by other services
----@param timeout? integer Connect timeout. Default 5000ms
 ---@return MongoDB
-function M.connect(database_url, name, timeout)
-    local res = moon.wait(c.connect(database_url, name, timeout))
+function M.connect(database_url, name)
+    local res = moon.wait(c.connect(database_url, name))
     if res.kind then
         error(string.format("connect database failed: %s", res.message))
     end
@@ -51,7 +50,7 @@ end
 ---@return MongoDB
 function M.find_connection(name)
     local o = {
-        obj = c.find_connection(name)
+        obj = assert(c.find_connection(name), "connection not found")
     }
     return setmetatable(o, { __index = M })
 end

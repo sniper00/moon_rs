@@ -21,7 +21,6 @@ use mongodb::{
 };
 use mongodb::{results, Collection, IndexModel};
 use std::time::Duration;
-use tokio::time::timeout;
 
 use futures::stream::TryStreamExt;
 
@@ -88,18 +87,9 @@ struct DatabaseState {
 impl DatabaseState {
     async fn connect(
         protocol_type: u8,
-        database_url: String,
-        timeout_duration: Duration,
+        database_url: String
     ) -> Result<Self, Error> {
-        async fn with_timeout<F, T>(timeout_duration: Duration, future: F) -> Result<T, Error>
-        where
-            F: std::future::Future<Output = Result<T, Error>>,
-        {
-            timeout(timeout_duration, future)
-                .await
-                .map_err(|err| Error::custom(format!("Connection error: {}", err)))?
-        }
-        let options = with_timeout(timeout_duration, ClientOptions::parse(&database_url)).await?;
+        let options = ClientOptions::parse(&database_url).await?;
 
         Ok(DatabaseState {
             protocol_type,
@@ -150,7 +140,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    db.create_collection(collection_name, None)
+                    db.create_collection(collection_name)
                         .await
                         .map(|_| DatabaseResponse::CreateCollection),
                 );
@@ -161,7 +151,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.insert_one(doc, None)
+                    coll.insert_one(doc)
                         .await
                         .map(DatabaseResponse::InsertOne),
                 );
@@ -172,7 +162,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.insert_many(docs, None)
+                    coll.insert_many(docs)
                         .await
                         .map(DatabaseResponse::InsertMany),
                 );
@@ -183,7 +173,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.delete_one(filter.clone(), None)
+                    coll.delete_one(filter.clone())
                         .await
                         .map(DatabaseResponse::DeleteOne),
                 );
@@ -194,7 +184,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.delete_many(filter.clone(), None)
+                    coll.delete_many(filter.clone())
                         .await
                         .map(DatabaseResponse::DeleteMany),
                 );
@@ -212,7 +202,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.update_one(filter.clone(), update.clone(), None)
+                    coll.update_one(filter.clone(), update.clone())
                         .await
                         .map(DatabaseResponse::UpdateOne),
                 );
@@ -230,7 +220,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.update_many(filter.clone(), update.clone(), None)
+                    coll.update_many(filter.clone(), update.clone())
                         .await
                         .map(DatabaseResponse::UpdateMany),
                 );
@@ -241,7 +231,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.find_one(filter.clone(), None)
+                    coll.find_one(filter.clone())
                         .await
                         .map(|doc: Option<Document>| DatabaseResponse::FindOne(doc)),
                 );
@@ -249,7 +239,7 @@ async fn database_handler(
             DatabaseRequest::Find(owner, session, db_name, collection_name, filter, options) => {
                 let db = state.client.database(&db_name);
                 let coll: Collection<Document> = db.collection(&collection_name);
-                let result = coll.find(filter.clone(), *options).await;
+                let result = coll.find(filter.clone()).with_options(*options).await;
                 match result {
                     Ok(cur) => {
                         state.send_result(
@@ -276,7 +266,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.replace_one(filter.clone(), replacement.clone(), None)
+                    coll.replace_one(filter.clone(), replacement.clone())
                         .await
                         .map(DatabaseResponse::ReplacOne),
                 );
@@ -287,7 +277,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.count_documents(filter.clone(), None)
+                    coll.count_documents(filter.clone())
                         .await
                         .map(DatabaseResponse::Count),
                 );
@@ -298,7 +288,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.find_one(filter.clone(), None)
+                    coll.find_one(filter.clone())
                         .await
                         .map(|doc: Option<Document>| {
                             if doc.is_some() {
@@ -322,7 +312,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.create_index(*index, *options)
+                    coll.create_index(*index).with_options(*options)
                         .await
                         .map(DatabaseResponse::CreateIndex),
                 );
@@ -340,28 +330,20 @@ extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
     let mut args = LuaArgs::new(1);
     let database_url: &str = laux::lua_get(state, args.iter_arg());
     let name: &str = laux::lua_get(state, args.iter_arg());
-    let connect_timeout: u64 = laux::lua_opt(state, args.iter_arg()).unwrap_or(5000);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
     let session = actor.next_session();
 
     tokio::spawn(async move {
+        
         match DatabaseState::connect(
             context::PTYPE_MONGODB,
-            database_url.to_string(),
-            Duration::from_millis(connect_timeout),
+            database_url.to_string()
         )
         .await
         {
             Ok(state) => {
-                CONTEXT.send_value(
-                    context::PTYPE_MONGODB,
-                    owner,
-                    session,
-                    DatabaseResponse::Connect,
-                );
-
                 let (tx, rx) = mpsc::unbounded_channel();
                 let counter = Arc::new(AtomicI64::new(0));
                 DATABASE_CONNECTIONSS.insert(
@@ -370,6 +352,13 @@ extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
                         tx: tx.clone(),
                         counter: counter.clone(),
                     },
+                );
+
+                CONTEXT.send_value(
+                    context::PTYPE_MONGODB,
+                    owner,
+                    session,
+                    DatabaseResponse::Connect,
                 );
 
                 database_handler(state, rx, counter).await;
@@ -680,7 +669,14 @@ fn make_request(
         "replace_one" => {
             let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
             let replacement = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
-            DatabaseRequest::ReplacOne(owner, session, db_name, collection_name, filter, replacement)
+            DatabaseRequest::ReplacOne(
+                owner,
+                session,
+                db_name,
+                collection_name,
+                filter,
+                replacement,
+            )
         }
         "count" => {
             let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
