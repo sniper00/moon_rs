@@ -124,7 +124,7 @@ impl DatabasePool {
         }
     }
 
-    async fn transaction(&self, requests: &[DatabaseQuery]) -> Result<(), sqlx::Error> {
+    async fn transaction(&self, requests: &[DatabaseQuery]) -> Result<DatabaseResult, sqlx::Error> {
         match self {
             DatabasePool::MySql(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -133,7 +133,7 @@ impl DatabasePool {
                     query.execute(&mut *transaction).await?;
                 }
                 transaction.commit().await?;
-                Ok(())
+                Ok(DatabaseResult::Transaction)
             }
             DatabasePool::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -142,7 +142,7 @@ impl DatabasePool {
                     query.execute(&mut *transaction).await?;
                 }
                 transaction.commit().await?;
-                Ok(())
+                Ok(DatabaseResult::Transaction)
             }
             DatabasePool::Sqlite(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -151,15 +151,15 @@ impl DatabasePool {
                     query.execute(&mut *transaction).await?;
                 }
                 transaction.commit().await?;
-                Ok(())
+                Ok(DatabaseResult::Transaction)
             }
         }
     }
 }
 
 enum DatabaseOp {
-    Query(i64, DatabaseQuery),            // session, QueryBuilder
-    Transaction(i64, Vec<DatabaseQuery>), // session, Vec<QueryBuilder>
+    Query(i64, i64, DatabaseQuery),            // session, QueryBuilder
+    Transaction(i64, i64, Vec<DatabaseQuery>), // session, Vec<QueryBuilder>
     Close(),
 }
 
@@ -195,9 +195,59 @@ struct DatabaseQuery {
     binds: Vec<QueryParams>,
 }
 
-async fn database_handler(
-    protocol_type: i8,
+async fn handle_result(
+    database_url: &str,
+    failed_times: &mut i32,
+    counter: &Arc<AtomicI64>,
+    protocol_type: u8,
     owner: i64,
+    session: i64,
+    res: Result<DatabaseResult, sqlx::Error>,
+) -> bool {
+    match res {
+        Ok(rows) => {
+            CONTEXT.send_value(protocol_type, owner, session, rows);
+            if *failed_times > 0 {
+                log::info!(
+                    "Database '{}' recover from error. Retry success. ({}:{})",
+                    database_url,
+                    file!(),
+                    line!()
+                );
+            }
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            false
+        }
+        Err(err) => {
+            if session != 0 {
+                CONTEXT.send_value(
+                    protocol_type,
+                    owner,
+                    session,
+                    DatabaseResult::Error(err),
+                );
+                counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                false
+            } else {
+                if *failed_times > 0 {
+                    log::error!(
+                        "Database '{}' error: '{:?}'. Will retry. ({}:{})",
+                        database_url,
+                        err.to_string(),
+                        file!(),
+                        line!()
+                    );
+                }
+                *failed_times += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                true
+            }
+        }
+    }
+}
+
+async fn database_handler(
+    protocol_type: u8,
     pool: &DatabasePool,
     mut rx: mpsc::Receiver<DatabaseOp>,
     database_url: &str,
@@ -206,95 +256,32 @@ async fn database_handler(
     while let Some(op) = rx.recv().await {
         let mut failed_times = 0;
         match &op {
-            DatabaseOp::Query(session, query_op) => loop {
-                match pool.query(query_op).await {
-                    Ok(rows) => {
-                        CONTEXT.send_value(protocol_type, owner, *session, rows);
-                        if failed_times > 0 {
-                            log::info!(
-                                "Database '{}' recover from error. Retry success. ({}:{})",
-                                database_url,
-                                file!(),
-                                line!()
-                            );
-                        }
-                        counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
-                        break;
-                    }
-                    Err(err) => {
-                        let session = *session;
-                        if session != 0 {
-                            CONTEXT.send_value(
-                                protocol_type,
-                                owner,
-                                session,
-                                DatabaseResult::Error(err),
-                            );
-                            counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
-                            break;
-                        } else {
-                            if failed_times > 0 {
-                                log::error!(
-                                    "Database '{}' error: '{:?}'. Will retry. ({}:{})",
-                                    database_url,
-                                    err.to_string(),
-                                    file!(),
-                                    line!()
-                                );
-                            }
-                            failed_times += 1;
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            },
-            DatabaseOp::Transaction(session, query_ops) => loop {
-                match pool.transaction(query_ops).await {
-                    Ok(_) => {
-                        CONTEXT.send_value(
-                            protocol_type,
-                            owner,
-                            *session,
-                            DatabaseResult::Transaction,
-                        );
-                        if failed_times > 0 {
-                            log::info!(
-                                "Database '{}' recover from error. Retry success. ({}:{})",
-                                database_url,
-                                file!(),
-                                line!()
-                            );
-                        }
-                        counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
-                        break;
-                    }
-                    Err(err) => {
-                        let session = *session;
-                        if session != 0 {
-                            CONTEXT.send_value(
-                                protocol_type,
-                                owner,
-                                session,
-                                DatabaseResult::Error(err),
-                            );
-                            counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
-                            break;
-                        } else {
-                            if failed_times > 0 {
-                                log::error!(
-                                    "Database '{}' transaction error: '{:?}'. Will retry. ({}:{})",
-                                    database_url,
-                                    err.to_string(),
-                                    file!(),
-                                    line!()
-                                );
-                            }
-                            failed_times += 1;
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            },
+            DatabaseOp::Query(owner, session, query_op) => {
+                while handle_result(
+                    database_url,
+                    &mut failed_times,
+                    &counter,
+                    protocol_type,
+                    *owner,
+                    *session,
+                    pool.query(query_op).await,
+                )
+                .await
+                {}
+            }
+            DatabaseOp::Transaction(owner, session, query_ops) => {
+                while handle_result(
+                    database_url,
+                    &mut failed_times,
+                    &counter,
+                    protocol_type,
+                    *owner,
+                    *session,
+                    pool.transaction(query_ops).await,
+                )
+                .await
+                {}
+            }
             DatabaseOp::Close() => {
                 break;
             }
@@ -325,7 +312,7 @@ extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
                     },
                 );
                 CONTEXT.send_value(protocol_type, owner, session, DatabaseResult::Connect);
-                database_handler(protocol_type, owner, &pool, rx, database_url, counter).await;
+                database_handler(protocol_type, &pool, rx, database_url, counter).await;
             }
             Err(err) => {
                 CONTEXT.send_value(
@@ -412,7 +399,10 @@ extern "C-unwind" fn query(state: *mut ffi::lua_State) -> c_int {
         }
     }
 
+    let owner = LuaActor::from_lua_state(state).id;
+
     match conn.tx.try_send(DatabaseOp::Query(
+        owner,
         session,
         DatabaseQuery {
             sql: sql.to_string(),
@@ -487,7 +477,10 @@ extern "C-unwind" fn transaction(state: *mut ffi::lua_State) -> c_int {
     let querys = laux::lua_touserdata::<TransactionQuerys>(state, 3)
         .expect("Invalid transaction query pointer");
 
+    let owner = LuaActor::from_lua_state(state).id;
+
     match conn.tx.try_send(DatabaseOp::Transaction(
+        owner,
         session,
         std::mem::take(&mut querys.querys),
     )) {

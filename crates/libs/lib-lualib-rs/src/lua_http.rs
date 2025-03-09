@@ -6,7 +6,7 @@ use lib_lua::{
     self, cstr,
     ffi::{self, luaL_Reg},
     laux::{self, LuaTable, LuaValue},
-    lreg, lreg_null,
+    lreg, lreg_null, luaL_newlib,
 };
 use percent_encoding::percent_decode;
 use reqwest::{header::HeaderMap, Method, Version};
@@ -320,8 +320,8 @@ pub unsafe extern "C-unwind" fn luaopen_http(state: *mut ffi::lua_State) -> c_in
         lreg_null!(),
     ];
 
-    ffi::lua_createtable(state, 0, l.len() as c_int);
-    ffi::luaL_setfuncs(state, l.as_ptr(), 0);
+
+    luaL_newlib!(state, l);
 
     1
 }

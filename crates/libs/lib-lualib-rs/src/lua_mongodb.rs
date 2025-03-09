@@ -80,14 +80,14 @@ struct DatabaseConnection {
 }
 
 struct DatabaseState {
-    protocol_type: i8,
+    protocol_type: u8,
     database_url: String,
     client: Client,
 }
 
 impl DatabaseState {
     async fn connect(
-        protocol_type: i8,
+        protocol_type: u8,
         database_url: String,
         timeout_duration: Duration,
     ) -> Result<Self, Error> {
@@ -337,9 +337,10 @@ async fn database_handler(
 }
 
 extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
-    let database_url: &str = laux::lua_get(state, 1);
-    let name: &str = laux::lua_get(state, 2);
-    let connect_timeout: u64 = laux::lua_opt(state, 3).unwrap_or(5000);
+    let mut args = LuaArgs::new(1);
+    let database_url: &str = laux::lua_get(state, args.iter_arg());
+    let name: &str = laux::lua_get(state, args.iter_arg());
+    let connect_timeout: u64 = laux::lua_opt(state, args.iter_arg()).unwrap_or(5000);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
@@ -734,8 +735,8 @@ extern "C-unwind" fn operators(state: *mut ffi::lua_State) -> c_int {
     let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
         .expect("Invalid database connect pointer");
 
-    let op_name = laux::lua_get::<&str>(state, args.iter_arg());
     let session = laux::lua_get(state, args.iter_arg());
+    let op_name = laux::lua_get::<&str>(state, args.iter_arg());
     let db_name = laux::lua_get(state, args.iter_arg());
     let collection_name = laux::lua_get(state, args.iter_arg());
 

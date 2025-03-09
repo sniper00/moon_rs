@@ -20,20 +20,20 @@ use crate::escape_print;
 
 use super::{actor::LuaActor, buffer::Buffer, log::Logger};
 
-pub const PTYPE_SYSTEM: i8 = 1;
-pub const PTYPE_TEXT: i8 = 2;
-pub const PTYPE_LUA: i8 = 3;
-pub const PTYPE_ERROR: i8 = 4;
-pub const PTYPE_DEBUG: i8 = 5;
-pub const PTYPE_SHUTDOWN: i8 = 6;
-pub const PTYPE_TIMER: i8 = 7;
-pub const PTYPE_SOCKET_TCP: i8 = 8;
-pub const PTYPE_SOCKET_UDP: i8 = 9;
-pub const PTYPE_INTEGER: i8 = 12;
-pub const PTYPE_HTTP: i8 = 13;
-pub const PTYPE_QUIT: i8 = 14;
-pub const PTYPE_SQLX: i8 = 15;
-pub const PTYPE_MONGODB: i8 = 16;
+pub const PTYPE_SYSTEM: u8 = 1;
+pub const PTYPE_TEXT: u8 = 2;
+pub const PTYPE_LUA: u8 = 3;
+pub const PTYPE_ERROR: u8 = 4;
+pub const PTYPE_DEBUG: u8 = 5;
+pub const PTYPE_SHUTDOWN: u8 = 6;
+pub const PTYPE_TIMER: u8 = 7;
+pub const PTYPE_SOCKET_TCP: u8 = 8;
+pub const PTYPE_SOCKET_UDP: u8 = 9;
+pub const PTYPE_INTEGER: u8 = 12;
+pub const PTYPE_HTTP: u8 = 13;
+pub const PTYPE_QUIT: u8 = 14;
+pub const PTYPE_SQLX: u8 = 15;
+pub const PTYPE_MONGODB: u8 = 16;
 
 pub const BOOTSTRAP_ACTOR_ADDR: i64 = 1;
 
@@ -88,7 +88,7 @@ impl std::fmt::Display for MessageData {
 }
 
 pub struct Message {
-    pub ptype: i8,
+    pub ptype: u8,
     pub from: i64,
     pub to: i64,
     pub session: i64,
@@ -117,7 +117,7 @@ pub enum NetOp {
 pub struct NetChannel(pub mpsc::Sender<NetOp>, pub mpsc::Sender<NetOp>);
 
 struct Monitor {
-    ptype: i8,
+    ptype: u8,
     tm: f64,
     from: i64,
     to: i64,
@@ -250,7 +250,7 @@ impl LuaActorServer {
         Some(msg)
     }
 
-    pub fn send_value<T>(&self,protocol_type: i8, owner: i64, session: i64, res: T)-> Option<Message> {
+    pub fn send_value<T>(&self,protocol_type: u8, owner: i64, session: i64, res: T)-> Option<Message> {
 
         let ptr = Box::into_raw(Box::new(res));
 
@@ -317,7 +317,7 @@ impl LuaActorServer {
         }
     }
 
-    pub fn update_monitor(&self, ptype: i8, tm: f64, from: i64, to: i64) {
+    pub fn update_monitor(&self, ptype: u8, tm: f64, from: i64, to: i64) {
         THREAD_ID.with(|id| {
             self.monitor.insert(
                 *id,

@@ -11,7 +11,7 @@ moon.register_protocol {
 }
 
 local function operators(self, ...)
-    local res = self.obj:operators(self.op_name, moon.next_session(), self.db_name, self.col_name, ...)
+    local res = self.obj:operators(moon.next_session(), self.op_name, self.db_name, self.col_name, ...)
     if type(res) == "table" then
         return res
     end
