@@ -1,13 +1,18 @@
+use dashmap::DashMap;
+use lazy_static::lazy_static;
 use lib_core::{buffer::Buffer, check_buffer, context::MessageData};
 use lib_lua::{
     self, cstr,
     ffi::{self, luaL_Reg},
     laux::{self, LuaType},
-    lreg, lreg_null,
+    lreg, lreg_null, luaL_newlib,
 };
-use std::ffi::c_int;
 use std::net::TcpStream;
 use std::time::Duration;
+use std::{
+    ffi::c_int,
+    sync::atomic::{AtomicI64, Ordering},
+};
 use tokio::io::AsyncReadExt;
 
 use tokio::{
@@ -22,8 +27,32 @@ use tokio::{
 
 use lib_core::{
     actor::LuaActor,
-    context::{self, Message, NetChannel, NetOp, CONTEXT},
+    context::{self, Message, CONTEXT},
 };
+
+lazy_static! {
+    static ref NET: DashMap<i64, NetChannel> = DashMap::new();
+    static ref NET_UUID: AtomicI64 = AtomicI64::new(1);
+}
+
+#[derive(Debug)]
+pub enum NetOp {
+    Accept(i64, i64),                         //owner,session
+    ReadUntil(i64, i64, usize, Vec<u8>, u64), //owner,session,max_size
+    ReadBytes(i64, i64, usize, u64),          //owner,session,size
+    Write(i64, Box<Buffer>, bool),            //owner,data
+    Close(),
+}
+
+pub struct NetChannel(pub mpsc::Sender<NetOp>, pub mpsc::Sender<NetOp>);
+
+fn next_net_fd() -> i64 {
+    let fd = NET_UUID.fetch_add(1, Ordering::AcqRel);
+    if fd == i64::MAX {
+        panic!("net fd overflow");
+    }
+    fd
+}
 
 // pub const SOCKET_ACCEPT: i8 = 1;
 // pub const SOCKET_READ: i8 = 2;
@@ -222,10 +251,10 @@ async fn handle_write(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<NetOp>)
 }
 
 async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) {
-    let fd = CONTEXT.next_net_fd();
+    let fd = next_net_fd();
     let (tx_reader, rx_reader) = mpsc::channel::<NetOp>(1);
     let (tx_writer, rx_writer) = mpsc::channel::<NetOp>(100);
-    CONTEXT.net.insert(fd, NetChannel(tx_reader, tx_writer));
+    NET.insert(fd, NetChannel(tx_reader, tx_writer));
 
     if CONTEXT
         .send(Message {
@@ -273,8 +302,8 @@ fn listen(addr: &str) -> Result<i64> {
     let listener = TcpListener::from_std(listener)?;
 
     let (tx, mut rx) = mpsc::channel::<NetOp>(1);
-    let fd = CONTEXT.next_net_fd();
-    CONTEXT.net.insert(fd, NetChannel(tx.clone(), tx));
+    let fd = next_net_fd();
+    NET.insert(fd, NetChannel(tx.clone(), tx));
 
     tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
@@ -322,7 +351,7 @@ extern "C-unwind" fn lua_socket_accept(state: *mut ffi::lua_State) -> c_int {
     let owner = actor.id;
     let session = actor.next_session();
 
-    if let Some(channel) = CONTEXT.net.get(&fd) {
+    if let Some(channel) = NET.get(&fd) {
         match channel.value().0.try_send(NetOp::Accept(owner, session)) {
             Ok(_) => {}
             Err(err) => {
@@ -364,7 +393,7 @@ extern "C-unwind" fn lua_socket_read(state: *mut ffi::lua_State) -> c_int {
         NetOp::ReadUntil(owner, session, max_size, delim.to_vec(), read_timeout)
     };
 
-    if let Some(channel) = CONTEXT.net.get(&fd) {
+    if let Some(channel) = NET.get(&fd) {
         if let Err(err) = channel.value().0.try_send(op) {
             laux::lua_push(state, false);
             laux::lua_push(state, format!("socket_read channel send error: {}", err));
@@ -388,7 +417,7 @@ extern "C-unwind" fn lua_socket_write(state: *mut ffi::lua_State) -> c_int {
     let data = check_buffer(state, 2);
     let close = laux::lua_opt(state, 3).unwrap_or_default();
 
-    if let Some(channel) = CONTEXT.net.get(&fd) {
+    if let Some(channel) = NET.get(&fd) {
         match channel
             .value()
             .1
@@ -447,7 +476,7 @@ extern "C-unwind" fn lua_socket_connect(state: *mut ffi::lua_State) -> c_int {
 extern "C-unwind" fn lua_socket_close(state: *mut ffi::lua_State) -> c_int {
     let fd = laux::lua_get(state, 1);
 
-    if let Some(channel) = CONTEXT.net.get(&fd) {
+    if let Some(channel) = NET.get(&fd) {
         match channel.value().1.try_send(NetOp::Close()) {
             Ok(_) => {
                 laux::lua_push(state, true);
@@ -473,7 +502,7 @@ extern "C-unwind" fn lua_host(state: *mut ffi::lua_State) -> c_int {
     0
 }
 
-pub unsafe extern "C-unwind" fn luaopen_socket(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_socket(state: *mut ffi::lua_State) -> c_int {
     let l = [
         lreg!("listen", lua_socket_listen),
         lreg!("accept", lua_socket_accept),
@@ -485,7 +514,6 @@ pub unsafe extern "C-unwind" fn luaopen_socket(state: *mut ffi::lua_State) -> c_
         lreg_null!(),
     ];
 
-    ffi::lua_createtable(state, 0, l.len() as c_int);
-    ffi::luaL_setfuncs(state, l.as_ptr(), 0);
+    luaL_newlib!(state, l);
     1
 }

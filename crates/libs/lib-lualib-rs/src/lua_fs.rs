@@ -1,3 +1,4 @@
+use lib_lua::luaL_newlib;
 use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null};
 use std::ffi::c_int;
 use std::{
@@ -248,8 +249,7 @@ pub unsafe extern "C-unwind" fn luaopen_fs(state: *mut ffi::lua_State) -> c_int 
         lreg_null!(),
     ];
 
-    ffi::lua_createtable(state, 0, l.len() as c_int);
-    ffi::luaL_setfuncs(state, l.as_ptr(), 0);
+    luaL_newlib!(state, l);
 
     1
 }

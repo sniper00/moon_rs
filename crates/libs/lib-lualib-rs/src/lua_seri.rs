@@ -4,7 +4,7 @@ use lib_lua::{
     self, cstr,
     ffi::{self, luaL_Reg, LUA_TLIGHTUSERDATA, LUA_TSTRING},
     laux::{self},
-    lreg, lreg_null,
+    lreg, lreg_null, luaL_newlib,
 };
 
 use lib_core::buffer::Buffer;
@@ -138,32 +138,35 @@ fn write_table_array(
     Ok(array_size)
 }
 
-unsafe fn write_table_hash(
+fn write_table_hash(
     state: *mut ffi::lua_State,
     buf: &mut Vec<u8>,
     index: i32,
     depth: i32,
     array_size: usize,
 ) -> Result<(), String> {
-    ffi::lua_pushnil(state);
-    while ffi::lua_next(state, index) != 0 {
-        if ffi::lua_type(state, -2) == ffi::LUA_TNUMBER && ffi::lua_isinteger(state, -2) != 0 {
-            let x = ffi::lua_tointeger(state, -2);
-            if x > 0 && x <= array_size as i64 {
-                ffi::lua_pop(state, 1);
-                continue;
+    unsafe {
+        ffi::lua_pushnil(state);
+        while ffi::lua_next(state, index) != 0 {
+            if ffi::lua_type(state, -2) == ffi::LUA_TNUMBER && ffi::lua_isinteger(state, -2) != 0 {
+                let x = ffi::lua_tointeger(state, -2);
+                if x > 0 && x <= array_size as i64 {
+                    ffi::lua_pop(state, 1);
+                    continue;
+                }
             }
+            pack_one(state, buf, -2, depth)?;
+            pack_one(state, buf, -1, depth)?;
+            ffi::lua_pop(state, 1);
         }
-        pack_one(state, buf, -2, depth)?;
-        pack_one(state, buf, -1, depth)?;
-        ffi::lua_pop(state, 1);
     }
+
     write_nil(buf);
 
     Ok(())
 }
 
-unsafe fn write_table_metapairs(
+fn write_table_metapairs(
     state: *mut ffi::lua_State,
     buf: &mut Vec<u8>,
     index: i32,
@@ -172,52 +175,57 @@ unsafe fn write_table_metapairs(
     let n = combine_type!(TYPE_TABLE, 0);
     buf.push(n);
 
-    ffi::lua_pushvalue(state, index);
-    if ffi::lua_pcall(state, 1, 3, 0) != ffi::LUA_OK {
-        return Ok(1);
-    }
-    loop {
-        ffi::lua_pushvalue(state, -2);
-        ffi::lua_pushvalue(state, -2);
-        ffi::lua_copy(state, -5, -3);
-        if ffi::lua_pcall(state, 2, 2, 0) != ffi::LUA_OK {
+    unsafe {
+        ffi::lua_pushvalue(state, index);
+        if ffi::lua_pcall(state, 1, 3, 0) != ffi::LUA_OK {
             return Ok(1);
         }
-        let type_ = ffi::lua_type(state, -2);
-        if type_ == ffi::LUA_TNIL {
-            ffi::lua_pop(state, 4);
-            break;
+        loop {
+            ffi::lua_pushvalue(state, -2);
+            ffi::lua_pushvalue(state, -2);
+            ffi::lua_copy(state, -5, -3);
+            if ffi::lua_pcall(state, 2, 2, 0) != ffi::LUA_OK {
+                return Ok(1);
+            }
+            let type_ = ffi::lua_type(state, -2);
+            if type_ == ffi::LUA_TNIL {
+                ffi::lua_pop(state, 4);
+                break;
+            }
+            pack_one(state, buf, -2, depth)?;
+            pack_one(state, buf, -1, depth)?;
+            ffi::lua_pop(state, 1);
         }
-        pack_one(state, buf, -2, depth)?;
-        pack_one(state, buf, -1, depth)?;
-        ffi::lua_pop(state, 1);
     }
+
     write_nil(buf);
 
     Ok(0)
 }
 
-unsafe fn write_table(
+fn write_table(
     state: *mut ffi::lua_State,
     buf: &mut Vec<u8>,
     mut index: i32,
     depth: i32,
 ) -> Result<i32, String> {
-    if ffi::lua_checkstack(state, ffi::LUA_MINSTACK) == 0 {
-        ffi::lua_pushstring(state, cstr!("out of memory"));
-        return Ok(1);
-    }
+    unsafe {
+        if ffi::lua_checkstack(state, ffi::LUA_MINSTACK) == 0 {
+            ffi::lua_pushstring(state, cstr!("out of memory"));
+            return Ok(1);
+        }
 
-    if index < 0 {
-        index = ffi::lua_gettop(state) + index + 1;
-    };
+        if index < 0 {
+            index = ffi::lua_gettop(state) + index + 1;
+        };
 
-    if ffi::luaL_getmetafield(state, index, cstr!("__pairs")) != ffi::LUA_TNIL {
-        write_table_metapairs(state, buf, index, depth)
-    } else {
-        let array_size = write_table_array(state, buf, index, depth)?;
-        write_table_hash(state, buf, index, depth, array_size)?;
-        Ok(0)
+        if ffi::luaL_getmetafield(state, index, cstr!("__pairs")) != ffi::LUA_TNIL {
+            write_table_metapairs(state, buf, index, depth)
+        } else {
+            let array_size = write_table_array(state, buf, index, depth)?;
+            write_table_hash(state, buf, index, depth, array_size)?;
+            Ok(0)
+        }
     }
 }
 
@@ -569,92 +577,96 @@ extern "C-unwind" fn pack_string(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-unsafe extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
-    if ffi::lua_isnoneornil(state, 1) == 1 {
-        return 0;
-    }
-
-    let mut len = 0;
-    let data;
-    if ffi::lua_type(state, 1) == LUA_TSTRING {
-        data = ffi::lua_tolstring(state, 1, &mut len) as *const u8;
-    } else {
-        data = ffi::lua_touserdata(state, 1) as *const u8;
-        len = ffi::luaL_checkinteger(state, 2) as usize;
-    }
-
-    if len == 0 {
-        return 0;
-    }
-
-    if data.is_null(){
-        ffi::luaL_error(state, cstr!("deserialize null pointer"));
-    }
-
-    ffi::lua_settop(state, 1);
-
-    let br = &mut ReadBlock {
-        buf: std::slice::from_raw_parts(data, len),
-        pos: 0,
-        state,
-    };
-
-    let mut i = 0;
-    loop {
-        if i % 8 == 7 {
-            ffi::luaL_checkstack(state, 8, std::ptr::null());
+extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        if ffi::lua_isnoneornil(state, 1) == 1 {
+            return 0;
         }
-        i += 1;
 
-        if let Some(type_) = br.try_read_byte() {
-            let cookie = type_ >> 3;
-            push_value(state, br, type_ & 0x7, cookie);
+        let mut len = 0;
+        let data;
+        if ffi::lua_type(state, 1) == LUA_TSTRING {
+            data = ffi::lua_tolstring(state, 1, &mut len) as *const u8;
         } else {
-            break;
+            data = ffi::lua_touserdata(state, 1) as *const u8;
+            len = ffi::luaL_checkinteger(state, 2) as usize;
         }
-    }
 
-    ffi::lua_gettop(state) - 1
+        if len == 0 {
+            return 0;
+        }
+
+        if data.is_null() {
+            ffi::luaL_error(state, cstr!("deserialize null pointer"));
+        }
+
+        ffi::lua_settop(state, 1);
+
+        let br = &mut ReadBlock {
+            buf: std::slice::from_raw_parts(data, len),
+            pos: 0,
+            state,
+        };
+
+        let mut i = 0;
+        loop {
+            if i % 8 == 7 {
+                ffi::luaL_checkstack(state, 8, std::ptr::null());
+            }
+            i += 1;
+
+            if let Some(type_) = br.try_read_byte() {
+                let cookie = type_ >> 3;
+                push_value(state, br, type_ & 0x7, cookie);
+            } else {
+                break;
+            }
+        }
+
+        ffi::lua_gettop(state) - 1
+    }
 }
 
-unsafe extern "C-unwind" fn peek_one(state: *mut ffi::lua_State) -> c_int {
-    if ffi::lua_isnoneornil(state, 1) == 1 {
-        return 0;
+extern "C-unwind" fn peek_one(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        if ffi::lua_isnoneornil(state, 1) == 1 {
+            return 0;
+        }
+
+        if ffi::lua_type(state, 1) != LUA_TLIGHTUSERDATA {
+            ffi::luaL_argerror(state, 1, cstr!("peek_one need lightuserdata"));
+        }
+
+        let seek = laux::lua_opt(state, 2).unwrap_or(false);
+
+        let buf = ffi::lua_touserdata(state, 1) as *mut Buffer;
+        if buf.is_null() {
+            ffi::luaL_argerror(state, 1, cstr!("null buffer pointer"));
+        }
+
+        if (*buf).is_empty() {
+            return 0;
+        }
+
+        let br = &mut ReadBlock {
+            buf: std::slice::from_raw_parts((*buf).as_ptr(), (*buf).len()),
+            pos: 0,
+            state,
+        };
+
+        let type_ = br.read_byte();
+
+        push_value(state, br, type_ & 0x7, type_ >> 3);
+
+        if seek {
+            (*buf).consume(br.offset());
+        }
+
+        ffi::lua_pushlightuserdata(state, br.as_ptr() as *mut c_void);
+        ffi::lua_pushinteger(state, br.len() as i64);
+
+        3
     }
-
-    if ffi::lua_type(state, 1) != LUA_TLIGHTUSERDATA {
-        ffi::luaL_argerror(state, 1, cstr!("peek_one need lightuserdata"));
-    }
-
-    let seek = laux::lua_opt(state, 2).unwrap_or(false);
-
-    let buf = unsafe { ffi::lua_touserdata(state, 1) as *mut Buffer };
-    if buf.is_null() {
-        ffi::luaL_argerror(state, 1, cstr!("null buffer pointer"));
-    }
-
-    if (*buf).is_empty() {
-        return 0;
-    }
-
-    let br = &mut ReadBlock {
-        buf: std::slice::from_raw_parts((*buf).as_ptr(), (*buf).len()),
-        pos: 0,
-        state,
-    };
-
-    let type_ = br.read_byte();
-
-    push_value(state, br, type_ & 0x7, type_ >> 3);
-
-    if seek {
-        (*buf).consume(br.offset());
-    }
-
-    ffi::lua_pushlightuserdata(state, br.as_ptr() as *mut c_void);
-    ffi::lua_pushinteger(state, br.len() as i64);
-
-    3
 }
 
 pub unsafe extern "C-unwind" fn luaopen_seri(state: *mut ffi::lua_State) -> c_int {
@@ -666,8 +678,7 @@ pub unsafe extern "C-unwind" fn luaopen_seri(state: *mut ffi::lua_State) -> c_in
         lreg_null!(),
     ];
 
-    ffi::lua_createtable(state, 0, l.len() as c_int);
-    ffi::luaL_setfuncs(state, l.as_ptr(), 0);
+    luaL_newlib!(state, l);
 
     1
 }

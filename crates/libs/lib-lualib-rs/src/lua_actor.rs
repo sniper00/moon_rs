@@ -21,107 +21,111 @@ use std::{
     slice,
 };
 
-unsafe extern "C-unwind" fn lua_actor_protect_init(state: *mut ffi::lua_State) -> c_int {
-    let param = ffi::lua_touserdata(state, 1) as *mut LuaActorParam;
-    if param.is_null() {
-        ffi::luaL_error(state, cstr!("invalid param"));
+extern "C-unwind" fn lua_actor_protect_init(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        let param = ffi::lua_touserdata(state, 1) as *mut LuaActorParam;
+        if param.is_null() {
+            ffi::luaL_error(state, cstr!("invalid param"));
+        }
+
+        ffi::luaL_openlibs(state);
+
+        ffi::luaL_requiref(state, cstr!("moon.core"), luaopen_core, 0);
+        ffi::lua_pop(state, 1);
+
+        luaopen_custom_libs(state);
+
+        let source = CString::new((*param).source.as_str()).unwrap();
+        if ffi::luaL_loadfile(state, source.as_ptr()) != ffi::LUA_OK {
+            return 1;
+        }
+
+        let params = CString::new((*param).params.as_str()).unwrap();
+        if ffi::luaL_dostring(state, params.as_ptr()) != ffi::LUA_OK {
+            return 1;
+        }
+
+        ffi::lua_call(state, 1, 0);
+
+        0
     }
-
-    ffi::luaL_openlibs(state);
-
-    ffi::luaL_requiref(state, cstr!("moon.core"), luaopen_core, 0);
-    ffi::lua_pop(state, 1);
-
-    luaopen_custom_libs(state);
-
-    let source = CString::new((*param).source.as_str()).unwrap();
-    if ffi::luaL_loadfile(state, source.as_ptr()) != ffi::LUA_OK {
-        return 1;
-    }
-
-    let params = CString::new((*param).params.as_str()).unwrap();
-    if ffi::luaL_dostring(state, params.as_ptr()) != ffi::LUA_OK {
-        return 1;
-    }
-
-    ffi::lua_call(state, 1, 0);
-
-    0
 }
 
-unsafe extern "C-unwind" fn allocator(
+extern "C-unwind" fn allocator(
     extra: *mut c_void,
     ptr: *mut c_void,
     osize: usize,
     nsize: usize,
 ) -> *mut c_void {
-    let actor = &mut *(extra as *mut LuaActor);
+    unsafe {
+        let actor = &mut *(extra as *mut LuaActor);
 
-    if nsize == 0 {
+        if nsize == 0 {
+            if !ptr.is_null() {
+                let layout = Layout::from_size_align_unchecked(osize, lib_lua::SYS_MIN_ALIGN);
+                alloc::dealloc(ptr as *mut u8, layout);
+                actor.mem -= osize as isize;
+            }
+            return std::ptr::null_mut();
+        }
+
+        // Do not allocate more than isize::MAX
+        if nsize > isize::MAX as usize {
+            return std::ptr::null_mut();
+        }
+
+        // Are we fit to the memory limits?
+        let mut mem_diff = nsize as isize;
         if !ptr.is_null() {
-            let layout = Layout::from_size_align_unchecked(osize, lib_lua::SYS_MIN_ALIGN);
-            alloc::dealloc(ptr as *mut u8, layout);
-            actor.mem -= osize as isize;
+            mem_diff -= osize as isize;
         }
-        return std::ptr::null_mut();
-    }
 
-    // Do not allocate more than isize::MAX
-    if nsize > isize::MAX as usize {
-        return std::ptr::null_mut();
-    }
+        let mem_limit = actor.mem_limit;
+        let new_used_memory = actor.mem + mem_diff;
 
-    // Are we fit to the memory limits?
-    let mut mem_diff = nsize as isize;
-    if !ptr.is_null() {
-        mem_diff -= osize as isize;
-    }
+        if mem_limit > 0 && new_used_memory > mem_limit {
+            log::error!(
+                "Actor id:{:?} name:{:?} memory limit exceed: {}",
+                actor.id,
+                actor.name,
+                actor.mem_limit
+            );
+            return std::ptr::null_mut();
+        }
 
-    let mem_limit = actor.mem_limit;
-    let new_used_memory = actor.mem + mem_diff;
+        actor.mem += mem_diff;
 
-    if mem_limit > 0 && new_used_memory > mem_limit {
-        log::error!(
-            "Actor id:{:?} name:{:?} memory limit exceed: {}",
-            actor.id,
-            actor.name,
-            actor.mem_limit
-        );
-        return std::ptr::null_mut();
-    }
+        if actor.mem > actor.mem_warning {
+            actor.mem_warning *= 2;
+            log::warn!(
+                "Actor id:{:?} name:{:?} memory warning: {:.2}MB",
+                actor.id,
+                actor.name,
+                (actor.mem / (1024 * 1024)) as f32
+            );
+        }
 
-    actor.mem += mem_diff;
+        if ptr.is_null() {
+            // Allocate new memory
+            let new_layout = match Layout::from_size_align(nsize, lib_lua::SYS_MIN_ALIGN) {
+                Ok(layout) => layout,
+                Err(_) => return std::ptr::null_mut(),
+            };
+            let new_ptr = alloc::alloc(new_layout) as *mut c_void;
+            if new_ptr.is_null() {
+                alloc::handle_alloc_error(new_layout);
+            }
+            return new_ptr;
+        }
 
-    if actor.mem > actor.mem_warning {
-        actor.mem_warning *= 2;
-        log::warn!(
-            "Actor id:{:?} name:{:?} memory warning: {:.2}MB",
-            actor.id,
-            actor.name,
-            (actor.mem / (1024 * 1024)) as f32
-        );
-    }
-
-    if ptr.is_null() {
-        // Allocate new memory
-        let new_layout = match Layout::from_size_align(nsize, lib_lua::SYS_MIN_ALIGN) {
-            Ok(layout) => layout,
-            Err(_) => return std::ptr::null_mut(),
-        };
-        let new_ptr = alloc::alloc(new_layout) as *mut c_void;
+        // Reallocate memory
+        let old_layout = Layout::from_size_align_unchecked(osize, lib_lua::SYS_MIN_ALIGN);
+        let new_ptr = alloc::realloc(ptr as *mut u8, old_layout, nsize) as *mut c_void;
         if new_ptr.is_null() {
-            alloc::handle_alloc_error(new_layout);
+            alloc::handle_alloc_error(old_layout);
         }
-        return new_ptr;
+        new_ptr
     }
-
-    // Reallocate memory
-    let old_layout = Layout::from_size_align_unchecked(osize, lib_lua::SYS_MIN_ALIGN);
-    let new_ptr = alloc::realloc(ptr as *mut u8, old_layout, nsize) as *mut c_void;
-    if new_ptr.is_null() {
-        alloc::handle_alloc_error(old_layout);
-    }
-    new_ptr
 }
 
 pub fn new_actor(params: LuaActorParam) {
@@ -430,24 +434,26 @@ extern "C-unwind" fn lua_new_actor(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-unsafe extern "C-unwind" fn lua_actor_callback(state: *mut ffi::lua_State) -> c_int {
-    ffi::luaL_checktype(state, 1, ffi::LUA_TFUNCTION);
-    ffi::lua_settop(state, 1);
-    let actor = LuaActor::from_lua_state(state);
-    ffi::lua_newuserdatauv(state, 1, 1);
-    actor.callback_state.0 = ffi::lua_newthread(state);
-    ffi::lua_pushcfunction(actor.callback_state.0, laux::lua_traceback);
-    ffi::lua_setuservalue(state, -2);
-    ffi::lua_setfield(state, ffi::LUA_REGISTRYINDEX, cstr!("callback_context"));
-    ffi::lua_xmove(state, actor.callback_state.0, 1);
+extern "C-unwind" fn lua_actor_callback(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        ffi::luaL_checktype(state, 1, ffi::LUA_TFUNCTION);
+        ffi::lua_settop(state, 1);
+        let actor = LuaActor::from_lua_state(state);
+        ffi::lua_newuserdatauv(state, 1, 1);
+        actor.callback_state.0 = ffi::lua_newthread(state);
+        ffi::lua_pushcfunction(actor.callback_state.0, laux::lua_traceback);
+        ffi::lua_setuservalue(state, -2);
+        ffi::lua_setfield(state, ffi::LUA_REGISTRYINDEX, cstr!("callback_context"));
+        ffi::lua_xmove(state, actor.callback_state.0, 1);
 
-    0
+        0
+    }
 }
 
 extern "C-unwind" fn lua_timeout(state: *mut ffi::lua_State) -> c_int {
     let interval: i64 = laux::lua_get(state, 1);
     let owner = LuaActor::from_lua_state(state).id;
-    let timer_id = CONTEXT.next_timer_id();
+    let timer_id = LuaActor::from_lua_state(state).next_session();
 
     if interval <= 0 {
         CONTEXT.send(Message {
@@ -547,19 +553,21 @@ extern "C-unwind" fn clock(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-unsafe extern "C-unwind" fn tostring(state: *mut ffi::lua_State) -> c_int {
-    if laux::lua_type(state, 1) == LuaType::LightUserData {
-        let data = ffi::lua_touserdata(state, 1) as *const u8;
-        ffi::luaL_argcheck(
-            state,
-            if !data.is_null() { 1 } else { 0 },
-            1,
-            cstr!("lightuserdata(char*) expected"),
-        );
-        let len = ffi::luaL_checkinteger(state, 2) as usize;
-        ffi::lua_pushlstring(state, data as *const c_char, len);
+extern "C-unwind" fn tostring(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        if laux::lua_type(state, 1) == LuaType::LightUserData {
+            let data = ffi::lua_touserdata(state, 1) as *const u8;
+            ffi::luaL_argcheck(
+                state,
+                if !data.is_null() { 1 } else { 0 },
+                1,
+                cstr!("lightuserdata(char*) expected"),
+            );
+            let len = ffi::luaL_checkinteger(state, 2) as usize;
+            ffi::lua_pushlstring(state, data as *const c_char, len);
+        }
+        1
     }
-    1
 }
 
 fn get_message_pointer(state: *mut ffi::lua_State) -> &'static mut Message {
@@ -664,15 +672,17 @@ unsafe extern "C-unwind" fn luaopen_core(state: *mut ffi::lua_State) -> c_int {
         lreg_null!(),
     ];
 
-    ffi::lua_createtable(state, 0, l.len() as c_int);
-    ffi::luaL_setfuncs(state, l.as_ptr(), 0);
+    unsafe {
+        ffi::lua_createtable(state, 0, l.len() as c_int);
+        ffi::luaL_setfuncs(state, l.as_ptr(), 0);
 
-    let actor = LuaActor::from_lua_state(state);
-    laux::lua_push(state, actor.id);
-    ffi::lua_setfield(state, -2, cstr!("id"));
+        let actor = LuaActor::from_lua_state(state);
+        laux::lua_push(state, actor.id);
+        ffi::lua_setfield(state, -2, cstr!("id"));
 
-    laux::lua_push(state, actor.name.as_str());
-    ffi::lua_setfield(state, -2, cstr!("name"));
+        laux::lua_push(state, actor.name.as_str());
+        ffi::lua_setfield(state, -2, cstr!("name"));
 
-    1
+        1
+    }
 }

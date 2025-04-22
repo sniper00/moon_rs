@@ -3,23 +3,28 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use lib_core::actor::LuaActor;
 use lib_core::context::{self, CONTEXT};
-use lib_lua::laux::{lua_into_userdata, LuaTable, LuaValue};
-use lib_lua::luaL_newlib;
-use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null, push_lua_table};
-use sqlx::migrate::MigrateDatabase;
-use sqlx::mysql::MySqlRow;
-use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::sqlite::SqliteRow;
-use sqlx::ColumnIndex;
-use sqlx::{
-    Column, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo,
+use lib_lua::{
+    self, cstr, ffi,
+    ffi::luaL_Reg,
+    laux,
+    laux::{lua_into_userdata, LuaArgs, LuaNil, LuaTable, LuaValue},
+    lreg, lreg_null, luaL_newlib, push_lua_table,
 };
-use std::ffi::c_int;
-use std::sync::atomic::AtomicI64;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
+use sqlx::{
+    self,
+    migrate::MigrateDatabase,
+    mysql::MySqlRow,
+    postgres::{PgPoolOptions, PgRow},
+    sqlite::SqliteRow,
+    Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool,
+    TypeInfo, ValueRef,
+};
+use std::{
+    ffi::c_int,
+    sync::{atomic::AtomicI64, Arc},
+    time::Duration,
+};
+use tokio::{sync::mpsc, time::timeout};
 
 lazy_static! {
     static ref DATABASE_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
@@ -104,27 +109,30 @@ impl DatabasePool {
         Ok(query)
     }
 
-    async fn query(&self, request: &DatabaseQuery) -> Result<DatabaseResult, sqlx::Error> {
+    async fn query(&self, request: &DatabaseQuery) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
             DatabasePool::MySql(pool) => {
                 let query = Self::make_query(&request.sql, &request.binds)?;
                 let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResult::MysqlRows(rows))
+                Ok(DatabaseResponse::MysqlRows(rows))
             }
             DatabasePool::Postgres(pool) => {
                 let query = Self::make_query(&request.sql, &request.binds)?;
                 let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResult::PgRows(rows))
+                Ok(DatabaseResponse::PgRows(rows))
             }
             DatabasePool::Sqlite(pool) => {
                 let query = Self::make_query(&request.sql, &request.binds)?;
                 let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResult::SqliteRows(rows))
+                Ok(DatabaseResponse::SqliteRows(rows))
             }
         }
     }
 
-    async fn transaction(&self, requests: &[DatabaseQuery]) -> Result<DatabaseResult, sqlx::Error> {
+    async fn transaction(
+        &self,
+        requests: &[DatabaseQuery],
+    ) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
             DatabasePool::MySql(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -133,7 +141,7 @@ impl DatabasePool {
                     query.execute(&mut *transaction).await?;
                 }
                 transaction.commit().await?;
-                Ok(DatabaseResult::Transaction)
+                Ok(DatabaseResponse::Transaction)
             }
             DatabasePool::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -142,7 +150,7 @@ impl DatabasePool {
                     query.execute(&mut *transaction).await?;
                 }
                 transaction.commit().await?;
-                Ok(DatabaseResult::Transaction)
+                Ok(DatabaseResponse::Transaction)
             }
             DatabasePool::Sqlite(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -151,25 +159,25 @@ impl DatabasePool {
                     query.execute(&mut *transaction).await?;
                 }
                 transaction.commit().await?;
-                Ok(DatabaseResult::Transaction)
+                Ok(DatabaseResponse::Transaction)
             }
         }
     }
 }
 
-enum DatabaseOp {
-    Query(i64, i64, DatabaseQuery),            // session, QueryBuilder
-    Transaction(i64, i64, Vec<DatabaseQuery>), // session, Vec<QueryBuilder>
+enum DatabaseRequest {
+    Query(i64, i64, DatabaseQuery), //owner, session, QueryBuilder
+    Transaction(i64, i64, Vec<DatabaseQuery>), //owner, session, Vec<QueryBuilder>
     Close(),
 }
 
 #[derive(Clone)]
 struct DatabaseConnection {
-    tx: mpsc::Sender<DatabaseOp>,
+    tx: mpsc::Sender<DatabaseRequest>,
     counter: Arc<AtomicI64>,
 }
 
-enum DatabaseResult {
+enum DatabaseResponse {
     Connect,
     PgRows(Vec<PgRow>),
     MysqlRows(Vec<MySqlRow>),
@@ -202,7 +210,7 @@ async fn handle_result(
     protocol_type: u8,
     owner: i64,
     session: i64,
-    res: Result<DatabaseResult, sqlx::Error>,
+    res: Result<DatabaseResponse, sqlx::Error>,
 ) -> bool {
     match res {
         Ok(rows) => {
@@ -220,12 +228,7 @@ async fn handle_result(
         }
         Err(err) => {
             if session != 0 {
-                CONTEXT.send_value(
-                    protocol_type,
-                    owner,
-                    session,
-                    DatabaseResult::Error(err),
-                );
+                CONTEXT.send_value(protocol_type, owner, session, DatabaseResponse::Error(err));
                 counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
                 false
             } else {
@@ -249,14 +252,14 @@ async fn handle_result(
 async fn database_handler(
     protocol_type: u8,
     pool: &DatabasePool,
-    mut rx: mpsc::Receiver<DatabaseOp>,
+    mut rx: mpsc::Receiver<DatabaseRequest>,
     database_url: &str,
     counter: Arc<AtomicI64>,
 ) {
     while let Some(op) = rx.recv().await {
         let mut failed_times = 0;
         match &op {
-            DatabaseOp::Query(owner, session, query_op) => {
+            DatabaseRequest::Query(owner, session, query_op) => {
                 while handle_result(
                     database_url,
                     &mut failed_times,
@@ -269,7 +272,7 @@ async fn database_handler(
                 .await
                 {}
             }
-            DatabaseOp::Transaction(owner, session, query_ops) => {
+            DatabaseRequest::Transaction(owner, session, query_ops) => {
                 while handle_result(
                     database_url,
                     &mut failed_times,
@@ -282,7 +285,7 @@ async fn database_handler(
                 .await
                 {}
             }
-            DatabaseOp::Close() => {
+            DatabaseRequest::Close() => {
                 break;
             }
         }
@@ -311,7 +314,7 @@ extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
                         counter: counter.clone(),
                     },
                 );
-                CONTEXT.send_value(protocol_type, owner, session, DatabaseResult::Connect);
+                CONTEXT.send_value(protocol_type, owner, session, DatabaseResponse::Connect);
                 database_handler(protocol_type, &pool, rx, database_url, counter).await;
             }
             Err(err) => {
@@ -319,7 +322,7 @@ extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
                     protocol_type,
                     owner,
                     session,
-                    DatabaseResult::Timeout(err.to_string()),
+                    DatabaseResponse::Timeout(err.to_string()),
                 );
             }
         };
@@ -374,15 +377,16 @@ fn get_query_param(state: *mut ffi::lua_State, i: i32) -> Result<QueryParams, St
 }
 
 extern "C-unwind" fn query(state: *mut ffi::lua_State) -> c_int {
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1)
+    let mut args = LuaArgs::new(1);
+    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
         .expect("Invalid database connect pointer");
 
-    let session = laux::lua_get(state, 2);
+    let session = laux::lua_get(state, args.iter_arg());
 
-    let sql = laux::lua_get::<&str>(state, 3);
+    let sql = laux::lua_get::<&str>(state, args.iter_arg());
     let mut params = Vec::new();
     let top = laux::lua_top(state);
-    for i in 4..=top {
+    for i in args.iter_arg()..=top {
         let param = get_query_param(state, i);
         match param {
             Ok(value) => {
@@ -401,7 +405,7 @@ extern "C-unwind" fn query(state: *mut ffi::lua_State) -> c_int {
 
     let owner = LuaActor::from_lua_state(state).id;
 
-    match conn.tx.try_send(DatabaseOp::Query(
+    match conn.tx.try_send(DatabaseRequest::Query(
         owner,
         session,
         DatabaseQuery {
@@ -469,17 +473,18 @@ extern "C-unwind" fn make_transaction(state: *mut ffi::lua_State) -> c_int {
 }
 
 extern "C-unwind" fn transaction(state: *mut ffi::lua_State) -> c_int {
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1)
+    let mut args = LuaArgs::new(1);
+    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
         .expect("Invalid database connect pointer");
 
-    let session = laux::lua_get(state, 2);
+    let session = laux::lua_get(state, args.iter_arg());
 
-    let querys = laux::lua_touserdata::<TransactionQuerys>(state, 3)
+    let querys = laux::lua_touserdata::<TransactionQuerys>(state, args.iter_arg())
         .expect("Invalid transaction query pointer");
 
     let owner = LuaActor::from_lua_state(state).id;
 
-    match conn.tx.try_send(DatabaseOp::Transaction(
+    match conn.tx.try_send(DatabaseRequest::Transaction(
         owner,
         session,
         std::mem::take(&mut querys.querys),
@@ -505,7 +510,7 @@ extern "C-unwind" fn close(state: *mut ffi::lua_State) -> c_int {
     let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1)
         .expect("Invalid database connect pointer");
 
-    match conn.tx.try_send(DatabaseOp::Close()) {
+    match conn.tx.try_send(DatabaseRequest::Close()) {
         Ok(_) => {
             laux::lua_push(state, true);
             1
@@ -548,18 +553,18 @@ where
             .iter()
             .enumerate()
             .for_each(|(index, column)| {
-                column_info.push((index, column.name(), column.type_info().name()));
+                column_info.push((index, column.name()));
             });
     }
 
     let mut i = 0;
     for row in rows.iter() {
         let row_table = LuaTable::new(state, 0, row.len());
-        for (index, column_name, column_type_name) in column_info.iter() {
+        for (index, column_name) in column_info.iter() {
             match row.try_get_raw(*index) {
-                Ok(value) => match *column_type_name {
+                Ok(value) => match value.type_info().name() {
                     "NULL" => {
-                        row_table.rawset(*column_name, ffi::LUA_TNIL);
+                        row_table.rawset(*column_name, LuaNil {});
                     }
                     "BOOL" | "BOOLEAN" => {
                         row_table.rawset(
@@ -639,10 +644,10 @@ extern "C-unwind" fn find_connection(state: *mut ffi::lua_State) -> c_int {
 
 extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
     laux::luaL_checkstack(state, 6, std::ptr::null());
-    let result = lua_into_userdata::<DatabaseResult>(state, 1);
+    let result = lua_into_userdata::<DatabaseResponse>(state, 1);
 
     match *result {
-        DatabaseResult::PgRows(rows) => {
+        DatabaseResponse::PgRows(rows) => {
             return process_rows::<Postgres>(state, &rows)
                 .map_err(|e| {
                     push_lua_table!(
@@ -653,7 +658,7 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
                 })
                 .unwrap_or(1);
         }
-        DatabaseResult::MysqlRows(rows) => {
+        DatabaseResponse::MysqlRows(rows) => {
             return process_rows::<MySql>(state, &rows)
                 .map_err(|e| {
                     push_lua_table!(
@@ -664,7 +669,7 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
                 })
                 .unwrap_or(1);
         }
-        DatabaseResult::SqliteRows(rows) => {
+        DatabaseResponse::SqliteRows(rows) => {
             return process_rows::<Sqlite>(state, &rows)
                 .map_err(|e| {
                     push_lua_table!(
@@ -675,21 +680,21 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
                 })
                 .unwrap_or(1);
         }
-        DatabaseResult::Transaction => {
+        DatabaseResponse::Transaction => {
             push_lua_table!(
                 state,
                 "message" => "ok"
             );
             return 1;
         }
-        DatabaseResult::Connect => {
+        DatabaseResponse::Connect => {
             push_lua_table!(
                 state,
                 "message" => "success"
             );
             return 1;
         }
-        DatabaseResult::Error(err) => match err.as_database_error() {
+        DatabaseResponse::Error(err) => match err.as_database_error() {
             Some(db_err) => {
                 push_lua_table!(
                     state,
@@ -705,7 +710,7 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
                 );
             }
         },
-        DatabaseResult::Timeout(err) => {
+        DatabaseResponse::Timeout(err) => {
             push_lua_table!(
                 state,
                 "kind" => "TIMEOUT",
@@ -730,7 +735,7 @@ extern "C-unwind" fn stats(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_sqlx(state: *mut ffi::lua_State) -> c_int {
     let l = [

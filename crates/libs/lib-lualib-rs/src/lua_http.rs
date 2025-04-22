@@ -1,3 +1,5 @@
+use dashmap::DashMap;
+use lazy_static::lazy_static;
 use lib_core::{
     actor::LuaActor,
     context::{self, CONTEXT},
@@ -9,9 +11,14 @@ use lib_lua::{
     lreg, lreg_null, luaL_newlib,
 };
 use percent_encoding::percent_decode;
+use reqwest::ClientBuilder;
 use reqwest::{header::HeaderMap, Method, Version};
-use std::{error::Error, ffi::c_int, str::FromStr};
+use std::{error::Error, ffi::c_int, str::FromStr, time::Duration};
 use url::form_urlencoded::{self};
+
+lazy_static! {
+    static ref HTTP_CLIENTS: DashMap<String, reqwest::Client> = DashMap::new();
+}
 
 struct HttpRequest {
     id: i64,
@@ -31,6 +38,34 @@ struct HttpResponse {
     body: bytes::Bytes,
 }
 
+pub fn get_http_client(timeout: u64, proxy: &String) -> reqwest::Client {
+    let name = format!("{}_{}", timeout, proxy);
+    if let Some(client) = HTTP_CLIENTS.get(&name) {
+        return client.clone();
+    }
+
+    if timeout > 100 {
+        log::warn!("http client timeout {} is too long", timeout);
+    }
+
+    let builder = ClientBuilder::new()
+        .timeout(Duration::from_secs(timeout))
+        .use_rustls_tls()
+        .tcp_nodelay(true);
+
+    let client = if proxy.is_empty() {
+        builder.build().unwrap_or_default()
+    } else {
+        builder
+            .proxy(reqwest::Proxy::all(proxy).unwrap())
+            .build()
+            .unwrap_or_default()
+    };
+
+    HTTP_CLIENTS.insert(name.to_string(), client.clone());
+    client
+}
+
 fn version_to_string(version: &reqwest::Version) -> &str {
     match *version {
         reqwest::Version::HTTP_09 => "HTTP/0.9",
@@ -43,7 +78,7 @@ fn version_to_string(version: &reqwest::Version) -> &str {
 }
 
 async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
-    let http_client = &CONTEXT.get_http_client(req.timeout, &req.proxy);
+    let http_client = &get_http_client(req.timeout, &req.proxy);
 
     let response = http_client
         .request(Method::from_str(req.method.as_str())?, req.url)
@@ -319,7 +354,6 @@ pub unsafe extern "C-unwind" fn luaopen_http(state: *mut ffi::lua_State) -> c_in
         lreg!("parse_request", lua_http_parse_request),
         lreg_null!(),
     ];
-
 
     luaL_newlib!(state, l);
 

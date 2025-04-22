@@ -7,6 +7,8 @@ use std::{
 
 pub type LuaStateRef = *mut ffi::lua_State;
 
+pub struct LuaNil;
+
 pub trait LuaStack {
     fn from_checked(state: LuaStateRef, index: i32) -> Self;
 
@@ -232,6 +234,41 @@ impl LuaStack for String {
     fn push(state: LuaStateRef, v: String) {
         unsafe {
             ffi::lua_pushlstring(state, v.as_ptr() as *const c_char, v.len());
+        }
+    }
+}
+
+impl LuaStack for LuaNil {
+    #[inline]
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn from_checked(state: LuaStateRef, index: i32) -> LuaNil {
+        unsafe {
+            ffi::luaL_checktype(state, index, ffi::LUA_TNIL);
+        }
+        LuaNil {}
+    }
+
+    #[inline]
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn from_unchecked(_state: LuaStateRef, _index: i32) -> LuaNil {
+        LuaNil {}
+    }
+
+    #[inline]
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn from_opt(state: LuaStateRef, index: i32) -> Option<LuaNil> {
+        if unsafe { ffi::lua_isnil(state, index) == 1 } {
+            Some(LuaNil {})
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn push(state: LuaStateRef, _v: LuaNil) {
+        unsafe {
+            ffi::lua_pushnil(state);
         }
     }
 }

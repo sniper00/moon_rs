@@ -2,7 +2,7 @@ use lib_lua::{
     self, cstr,
     ffi::{self, luaL_Reg, lua_Integer},
     laux::{self, LuaTable, LuaType, LuaValue},
-    lreg, lreg_null,
+    lreg, lreg_null, luaL_newlib,
 };
 use std::ffi::{c_int, c_void};
 
@@ -291,17 +291,13 @@ extern "C-unwind" fn prepare(state: *mut ffi::lua_State) -> c_int {
     let buf = get_mut_buffer(state);
     let len = laux::lua_get(state, 2);
     let space: *mut u8 = buf.prepare(len).as_mut_ptr();
-    unsafe {
-        ffi::lua_pushlightuserdata(state, space as *mut c_void);
-    }
+    laux::lua_pushlightuserdata(state, space as *mut c_void);
     1
 }
 
 extern "C-unwind" fn size(state: *mut ffi::lua_State) -> c_int {
     let buf = get_mut_buffer(state);
-    unsafe {
-        ffi::lua_pushinteger(state, buf.len() as lua_Integer);
-    }
+    laux::lua_push(state, buf.len());
     1
 }
 
@@ -311,7 +307,7 @@ extern "C-unwind" fn clear(state: *mut ffi::lua_State) -> c_int {
     0
 }
 
-pub unsafe extern "C-unwind" fn luaopen_buffer(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_buffer(state: *mut ffi::lua_State) -> c_int {
     let l = [
         lreg!("new", buffer_new),
         lreg!("drop", buffer_drop),
@@ -329,8 +325,7 @@ pub unsafe extern "C-unwind" fn luaopen_buffer(state: *mut ffi::lua_State) -> c_
         lreg_null!(),
     ];
 
-    ffi::lua_createtable(state, 0, l.len() as c_int);
-    ffi::luaL_setfuncs(state, l.as_ptr(), 0);
+    luaL_newlib!(state, l);
 
     1
 }

@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-lib-core = { path = "../../libs/lib-core"}
-lib-lualib-rs = { path = "../../libs/lib-lualib-rs"}
-lib-lua = {package = "lib-lua-sys", path = "../../libs/lib-lua-sys",features = ["lua54"]}
-lib-common = {package= "lib-common-sys", path = "../../libs/lib-common-sys", version = "0.1.0"}
-mimalloc = "0.1.39"
-tokio = { version = "1", features = ["full"] }
-log = "0.4.0"
+lib-core = { workspace = true }
+lib-lualib-rs = { workspace = true }
+lib-lua ={ workspace = true }
+lib-common = { workspace = true }
+mimalloc = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
 

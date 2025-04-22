@@ -166,7 +166,7 @@ extern "C-unwind" fn lua_excel_read(state: *mut ffi::lua_State) -> c_int {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_excel(state: *mut ffi::lua_State) -> c_int {
     let l = [lreg!("read", lua_excel_read), lreg_null!()];

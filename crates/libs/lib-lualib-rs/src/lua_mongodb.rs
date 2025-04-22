@@ -1,28 +1,26 @@
 use dashmap::DashMap;
+use futures::stream::TryStreamExt;
 use lazy_static::lazy_static;
 use lib_core::actor::LuaActor;
 use lib_core::context::{self, CONTEXT};
-use lib_lua::laux::{LuaArgs, LuaStateRef, LuaTable, LuaValue};
-use lib_lua::luaL_newlib;
-use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null, push_lua_table};
-use mongodb::options::{CreateIndexOptions, FindOptions, IndexOptions, ReadConcern};
-use std::ffi::c_int;
-use std::str::FromStr;
-use std::sync::atomic::AtomicI64;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-
-use mongodb::bson::{doc, oid};
-use mongodb::error::Error;
-use mongodb::{
-    bson::{Bson, Document},
-    options::ClientOptions,
-    Client,
+use lib_lua::{
+    self, cstr, ffi,
+    laux::{self, LuaArgs, LuaStateRef, LuaTable, LuaValue},
+    lreg, lreg_null, luaL_Reg, luaL_newlib, push_lua_table,
 };
-use mongodb::{results, Collection, IndexModel};
-use std::time::Duration;
-
-use futures::stream::TryStreamExt;
+use mongodb::{
+    bson::{doc, oid, Bson, Document},
+    error::Error,
+    options::{ClientOptions, CreateIndexOptions, FindOptions, IndexOptions, ReadConcern},
+    results, Client, Collection, IndexModel,
+};
+use std::{
+    ffi::c_int,
+    str::FromStr,
+    sync::{atomic::AtomicI64, Arc},
+    time::Duration,
+};
+use tokio::sync::mpsc;
 
 lazy_static! {
     static ref DATABASE_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
@@ -85,10 +83,7 @@ struct DatabaseState {
 }
 
 impl DatabaseState {
-    async fn connect(
-        protocol_type: u8,
-        database_url: String
-    ) -> Result<Self, Error> {
+    async fn connect(protocol_type: u8, database_url: String) -> Result<Self, Error> {
         let options = ClientOptions::parse(&database_url).await?;
 
         Ok(DatabaseState {
@@ -151,9 +146,7 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.insert_one(doc)
-                        .await
-                        .map(DatabaseResponse::InsertOne),
+                    coll.insert_one(doc).await.map(DatabaseResponse::InsertOne),
                 );
             }
             DatabaseRequest::InsertMany(owner, session, db_name, collection_name, docs) => {
@@ -312,7 +305,8 @@ async fn database_handler(
                 state.send_result(
                     owner,
                     session,
-                    coll.create_index(*index).with_options(*options)
+                    coll.create_index(*index)
+                        .with_options(*options)
                         .await
                         .map(DatabaseResponse::CreateIndex),
                 );
@@ -336,13 +330,7 @@ extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
     let session = actor.next_session();
 
     tokio::spawn(async move {
-        
-        match DatabaseState::connect(
-            context::PTYPE_MONGODB,
-            database_url.to_string()
-        )
-        .await
-        {
+        match DatabaseState::connect(context::PTYPE_MONGODB, database_url.to_string()).await {
             Ok(state) => {
                 let (tx, rx) = mpsc::unbounded_channel();
                 let counter = Arc::new(AtomicI64::new(0));
@@ -457,9 +445,8 @@ fn extract_find_options(options: LuaTable) -> Result<FindOptions, String> {
                 }
                 "read_concern" => {
                     if let LuaValue::String(val) = value {
-                        find_options.read_concern = Some(ReadConcern::custom(
-                            String::from_utf8_lossy(val).into_owned(),
-                        ));
+                        find_options.read_concern =
+                            Some(ReadConcern::custom(String::from_utf8_lossy(val)));
                     }
                 }
                 _ => {
@@ -1055,7 +1042,7 @@ extern "C-unwind" fn tt(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_mongodb(state: *mut ffi::lua_State) -> c_int {
     let l = [

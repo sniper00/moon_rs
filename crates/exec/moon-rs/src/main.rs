@@ -1,6 +1,6 @@
 use lib_core::{
     context::{self, LuaActorParam, CONTEXT, LOGGER},
-    error::Error,
+    error::{Error, Result},
 };
 use lib_lua::{
     self, cstr, ffi,
@@ -107,7 +107,7 @@ fn setup_signal() {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     setup_signal();
 
     unsafe {
@@ -122,19 +122,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut argn = 1;
     if args.len() <= argn {
         print_usage();
-        return Error::from_string("invalid arguments".to_string());
+        return Err(Error::Custom("invalid arguments".to_string()));
     }
 
     let mut bootstrap = args[argn].clone();
     let path = Path::new(&bootstrap);
     if !path.is_file() {
         print_usage();
-        return Error::from_string(format!("bootstrap file not found: {}", bootstrap));
+        return Err(Error::Custom(format!(
+            "bootstrap file not found: {}",
+            bootstrap
+        )));
     }
 
     if path.extension().and_then(std::ffi::OsStr::to_str) != Some("lua") {
         print_usage();
-        return Error::from_string(format!("bootstrap is not a lua file: {}", bootstrap));
+        return Err(Error::Custom(format!(
+            "bootstrap is not a lua file: {}",
+            bootstrap
+        )));
     }
 
     argn += 1;
@@ -162,26 +168,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ffi::LUA_OK
                 != ffi::luaL_loadfile(lua_state, CString::new(bootstrap.as_str())?.as_ptr())
             {
-                return Error::from_string(format!(
+                return Err(Error::Custom(format!(
                     "loadfile {}",
                     laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string())
-                ));
+                )));
             }
 
             if ffi::LUA_OK != ffi::luaL_dostring(lua_state, CString::new(arg.as_str())?.as_ptr()) {
-                return Error::from_string(
+                return Err(Error::Custom(
                     laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
-                );
+                ));
             }
 
             if ffi::LUA_OK != ffi::lua_pcall(lua_state, 1, 1, 1) {
-                return Error::from_string(
+                return Err(Error::Custom(
                     laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
-                );
+                ));
             }
 
             if ffi::LUA_TTABLE != ffi::lua_type(lua_state, -1) {
-                return Error::from_string("init code must return a table".to_string());
+                return Err(Error::Custom("init code must return a table".to_string()));
             }
 
             logfile = laux::opt_field(lua_state, -1, "logfile");
@@ -202,10 +208,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if !search_path.is_dir() {
-            return Error::from_string(format!(
+            return Err(Error::Custom(format!(
                 "lualib dir not found: {}",
                 search_path.to_str().unwrap_or("")
-            ));
+            )));
         }
 
         if let Some(path_with_no_prefix) = search_path.to_string_lossy().strip_prefix(r"\\?\") {
@@ -233,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     CONTEXT.set_env("ARG", &arg);
 
     if let Err(err) = LOGGER.setup_logger(enable_stdout, logfile, loglevel) {
-        return Error::from_string(err.to_string());
+        return Err(Error::Custom(err.to_string()));
     }
 
     let package_path = CONTEXT.get_env("PATH").unwrap_or_default();
@@ -266,8 +272,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    CONTEXT.net.clear();
-
     let error_code = CONTEXT.exit_code();
 
     log::info!(
@@ -284,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if error_code != 0 {
-        return Error::from_string(error_code.to_string());
+        return Err(error_code.to_string().into());
     }
 
     Ok(())

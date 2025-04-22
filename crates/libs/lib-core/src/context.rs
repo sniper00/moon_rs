@@ -1,7 +1,6 @@
 use chrono::{DateTime, Local, Utc};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use reqwest::ClientBuilder;
 use std::{
     collections::BTreeSet,
     sync::{
@@ -45,16 +44,12 @@ lazy_static! {
 
         LuaActorServer {
             actor_uuid: AtomicI64::new(1),
-            timer_uuid: AtomicI64::new(1),
-            net_uuid: AtomicI64::new(1),
             actor_counter: AtomicU32::new(0),
             exit_code: AtomicI32::new(i32::MAX),
             actors: DashMap::new(),
             unique_actors: DashMap::new(),
             clock: Instant::now(),
-            http_clients: DashMap::new(),
             env: DashMap::new(),
-            net: DashMap::new(),
             monitor: DashMap::new(),
             timer_tx,
             timer_rx: Mutex::new(timer_rx),
@@ -105,17 +100,6 @@ impl std::fmt::Display for Message {
     }
 }
 
-#[derive(Debug)]
-pub enum NetOp {
-    Accept(i64, i64),                         //owner,session
-    ReadUntil(i64, i64, usize, Vec<u8>, u64), //owner,session,max_size
-    ReadBytes(i64, i64, usize, u64),          //owner,session,size
-    Write(i64, Box<Buffer>, bool),            //owner,data
-    Close(),
-}
-
-pub struct NetChannel(pub mpsc::Sender<NetOp>, pub mpsc::Sender<NetOp>);
-
 struct Monitor {
     ptype: u8,
     tm: f64,
@@ -125,8 +109,6 @@ struct Monitor {
 
 pub struct LuaActorServer {
     actor_uuid: AtomicI64,
-    timer_uuid: AtomicI64,
-    net_uuid: AtomicI64,
     actor_counter: AtomicU32,
     exit_code: AtomicI32,
     actors: DashMap<i64, mpsc::UnboundedSender<Message>>,
@@ -137,9 +119,7 @@ pub struct LuaActorServer {
     timer_tx: mpsc::UnboundedSender<Timer>,
     timer_rx: Mutex<mpsc::UnboundedReceiver<Timer>>,
     now: DateTime<Utc>,
-    time_offset: AtomicU64,
-    pub net: DashMap<i64, NetChannel>,
-    http_clients: DashMap<String, reqwest::Client>,
+    time_offset: AtomicU64
 }
 
 impl LuaActorServer {
@@ -271,22 +251,6 @@ impl LuaActorServer {
         id
     }
 
-    pub fn next_net_fd(&self) -> i64 {
-        let fd = self.net_uuid.fetch_add(1, Ordering::AcqRel);
-        if fd == i64::MAX {
-            panic!("net fd overflow");
-        }
-        fd
-    }
-
-    pub fn next_timer_id(&self) -> i64 {
-        let id = self.timer_uuid.fetch_add(1, Ordering::AcqRel);
-        if id == 0 {
-            panic!("timer fd overflow");
-        }
-        id
-    }
-
     pub fn clock(&self) -> f64 {
         self.clock.elapsed().as_secs_f64()
     }
@@ -347,34 +311,6 @@ impl LuaActorServer {
                 });
             }
         });
-    }
-
-    pub fn get_http_client(&self, timeout: u64, proxy: &String) -> reqwest::Client {
-        let name = format!("{}_{}", timeout, proxy);
-        if let Some(client) = self.http_clients.get(&name) {
-            return client.clone();
-        }
-
-        if timeout > 100 {
-            log::warn!("http client timeout {} is too long", timeout);
-        }
-
-        let builder = ClientBuilder::new()
-            .timeout(Duration::from_secs(timeout))
-            .use_rustls_tls()
-            .tcp_nodelay(true);
-
-        let client = if proxy.is_empty() {
-            builder.build().unwrap_or_default()
-        } else {
-            builder
-                .proxy(reqwest::Proxy::all(proxy).unwrap())
-                .build()
-                .unwrap_or_default()
-        };
-
-        self.http_clients.insert(name.to_string(), client.clone());
-        client
     }
 }
 

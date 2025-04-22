@@ -8,14 +8,15 @@ edition = "2021"
 doctest = false
 
 [dependencies]
-lib-lua = {package = "lib-lua-sys", path = "../../libs/lib-lua-sys",features = ["lua54"]}
-lib-common = {package= "lib-common-sys", path = "../../libs/lib-common-sys", version = "0.1.0"}
-tokio = { version = "1", features = ["full"] }
-dashmap = "5.5.3"
-lazy_static = "1.4.0"
-log = "0.4.0"
-reqwest = { version = "0.11", features = ["rustls-tls","trust-dns"],default-features = false}
-serde = { version = "1.0", features = ["derive"]}
-serde_json = {version = "1.0"}
-colored = "2.0"
-chrono = { version = "0.4.19", features = ["serde"] }
+lib-lua = { workspace = true}
+lib-common = { workspace = true}
+tokio = { workspace = true}
+dashmap = { workspace = true}
+lazy_static = { workspace = true}
+log = { workspace = true}
+reqwest = { workspace = true}
+serde = { workspace = true}
+serde_json = { workspace = true}
+colored = { workspace = true}
+chrono = { workspace = true}
+derive_more = { workspace = true}

@@ -281,7 +281,7 @@ pub fn encode_table(
 }
 
 unsafe extern "C-unwind" fn encode(state: *mut ffi::lua_State) -> c_int {
-    ffi::luaL_checkany(state, 1);
+    unsafe { ffi::luaL_checkany(state, 1) };
 
     {
         let options = fetch_options(state);
@@ -306,54 +306,52 @@ unsafe fn decode_one(state: *mut ffi::lua_State, val: &Value, options: &JsonOpti
     match val {
         Value::Object(map) => {
             laux::luaL_checkstack(state, 6, cstr!("json.decode.object"));
-            ffi::lua_createtable(state, 0, map.len() as i32);
-            for (k, v) in map {
-                if !k.is_empty() {
-                    let c = k.as_bytes()[0];
-                    if (c.is_ascii_digit() || c == b'-') && options.enable_number_key {
-                        if let Ok(n) = k.parse::<ffi::lua_Integer>() {
-                            //try convert k to integer
-                            ffi::lua_pushinteger(state, n);
+            unsafe {
+                ffi::lua_createtable(state, 0, map.len() as i32);
+                for (k, v) in map {
+                    if !k.is_empty() {
+                        let c = k.as_bytes()[0];
+                        if (c.is_ascii_digit() || c == b'-') && options.enable_number_key {
+                            if let Ok(n) = k.parse::<ffi::lua_Integer>() {
+                                //try convert k to integer
+                                ffi::lua_pushinteger(state, n);
+                            } else {
+                                ffi::lua_pushlstring(state, k.as_ptr() as *const c_char, k.len());
+                            }
                         } else {
                             ffi::lua_pushlstring(state, k.as_ptr() as *const c_char, k.len());
                         }
-                    } else {
-                        ffi::lua_pushlstring(state, k.as_ptr() as *const c_char, k.len());
+                        decode_one(state, v, options);
+                        ffi::lua_rawset(state, -3);
                     }
-                    decode_one(state, v, options);
-                    ffi::lua_rawset(state, -3);
                 }
             }
         }
         Value::Array(arr) => {
-            ffi::luaL_checkstack(state, 6, cstr!("json.decode.array"));
-            ffi::lua_createtable(state, arr.len() as i32, 0);
-            for (i, v) in arr.iter().enumerate() {
-                decode_one(state, v, options);
-                ffi::lua_rawseti(state, -2, (i + 1) as ffi::lua_Integer);
+            laux::luaL_checkstack(state, 6, cstr!("json.decode.array"));
+            unsafe {
+                ffi::lua_createtable(state, arr.len() as i32, 0);
+                for (i, v) in arr.iter().enumerate() {
+                    decode_one(state, v, options);
+                    ffi::lua_rawseti(state, -2, (i + 1) as ffi::lua_Integer);
+                }
             }
         }
         Value::Bool(b) => {
-            ffi::lua_pushboolean(
-                state,
-                match b {
-                    true => 1,
-                    false => 0,
-                },
-            );
+            laux::lua_push(state, *b);
         }
         Value::Number(n) => {
             if n.is_f64() {
-                ffi::lua_pushnumber(state, n.as_f64().unwrap_or_default());
+                laux::lua_push(state, n.as_f64().unwrap_or_default());
             } else {
-                ffi::lua_pushinteger(state, n.as_i64().unwrap_or_default());
+                laux::lua_push(state, n.as_i64().unwrap_or_default());
             }
         }
         Value::Null => {
-            ffi::lua_pushlightuserdata(state, std::ptr::null_mut());
+            laux::lua_pushlightuserdata(state, std::ptr::null_mut());
         }
         Value::String(s) => {
-            ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len());
+            laux::lua_push(state, s.as_str());
         }
     }
 }
@@ -410,17 +408,17 @@ unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
         laux::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);
         return 1;
     }
-    ffi::luaL_checktype(state, 1, ffi::LUA_TTABLE);
 
-    ffi::lua_settop(state, 1);
+    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
+
+    laux::lua_settop(state, 1);
 
     let mut writer = Box::new(Buffer::new());
-    let array_len = ffi::lua_rawlen(state, 1);
     let mut has_error = false;
 
-    for i in 1..=array_len {
-        ffi::lua_rawgeti(state, 1, i as ffi::lua_Integer);
-        match LuaValue::from_stack(state, -1) {
+    let t = LuaTable::from_stack(state, 1);
+    for v in t.array_iter(t.len()) {
+        match v {
             LuaValue::String(val) => writer.write_slice(val),
             LuaValue::Number(val) => writer.write_chars(val),
             LuaValue::Integer(val) => writer.write_chars(val),
@@ -450,7 +448,6 @@ unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
                 break;
             }
         }
-        laux::lua_pop(state, 1);
     }
 
     if has_error {
@@ -458,7 +455,7 @@ unsafe extern "C-unwind" fn concat(state: *mut ffi::lua_State) -> c_int {
         laux::throw_error(state);
     }
 
-    ffi::lua_pushlightuserdata(state, Box::into_raw(writer) as *mut c_void);
+    laux::lua_pushlightuserdata(state, Box::into_raw(writer) as *mut c_void);
 
     1
 }
@@ -592,7 +589,7 @@ extern "C-unwind" fn concat_resp(state: *mut ffi::lua_State) -> c_int {
 /// This function is unsafe because it dereferences a raw pointer `state`.
 /// The caller must ensure that `state` is a valid pointer to a `lua_State`
 /// and that it remains valid for the duration of the function call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C-unwind" fn luaopen_json(state: *mut ffi::lua_State) -> c_int {
     let l = [
@@ -604,22 +601,24 @@ pub unsafe extern "C-unwind" fn luaopen_json(state: *mut ffi::lua_State) -> c_in
         lreg_null!(),
     ];
 
-    ffi::lua_createtable(state, 0, l.len() as c_int);
-    laux::lua_newuserdata(
-        state,
-        JsonOptions {
-            empty_as_array: true,
-            enable_number_key: true,
-            enable_sparse_array: false,
-        },
-        cstr!("json_options_meta"),
-        &[lreg_null!()],
-    );
+    unsafe {
+        ffi::lua_createtable(state, 0, l.len() as c_int);
+        laux::lua_newuserdata(
+            state,
+            JsonOptions {
+                empty_as_array: true,
+                enable_number_key: true,
+                enable_sparse_array: false,
+            },
+            cstr!("json_options_meta"),
+            &[lreg_null!()],
+        );
 
-    ffi::luaL_setfuncs(state, l.as_ptr(), 1);
+        ffi::luaL_setfuncs(state, l.as_ptr(), 1);
 
-    ffi::lua_pushlightuserdata(state, std::ptr::null_mut());
-    ffi::lua_setfield(state, -2, cstr!("null"));
+        ffi::lua_pushlightuserdata(state, std::ptr::null_mut());
+        ffi::lua_setfield(state, -2, cstr!("null"));
+    }
 
     1
 }
