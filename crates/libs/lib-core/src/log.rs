@@ -47,12 +47,12 @@ impl log::Log for Logger {
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
             if let Some(str_record) = record.args().as_str() {
-                let mut line = self.make_line(true, record.level(), str_record.bytes().len());
+                let mut line = self.make_line(true, record.level(), str_record.len());
                 line.write_str(str_record);
                 self.write(line);
             } else {
                 let str_record = record.args().to_string();
-                let mut line = self.make_line(true, record.level(), str_record.bytes().len());
+                let mut line = self.make_line(true, record.level(), str_record.len());
                 line.write_str(str_record.as_str());
                 self.write(line);
             }

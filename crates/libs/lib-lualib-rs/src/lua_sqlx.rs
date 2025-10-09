@@ -1,4 +1,4 @@
-use crate::lua_json::{encode_table, JsonOptions};
+use crate::lua_json::{JsonOptions, encode_table};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use lib_core::actor::LuaActor;
@@ -6,21 +6,20 @@ use lib_core::context::{self, CONTEXT};
 use lib_lua::laux::LuaState;
 use lib_lua::{
     cstr, ffi, laux,
-    laux::{lua_into_userdata, LuaArgs, LuaNil, LuaTable, LuaValue},
+    laux::{LuaArgs, LuaNil, LuaTable, LuaValue, lua_into_userdata},
     lreg, lreg_null, luaL_newlib, push_lua_table,
 };
 use sqlx::{
-    self,
+    self, Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite,
+    SqlitePool, TypeInfo, ValueRef,
     migrate::MigrateDatabase,
     mysql::MySqlRow,
     postgres::{PgPoolOptions, PgRow},
     sqlite::SqliteRow,
-    Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool,
-    TypeInfo, ValueRef,
 };
 use std::{
     ffi::c_int,
-    sync::{atomic::AtomicI64, Arc},
+    sync::{Arc, atomic::AtomicI64},
     time::Duration,
 };
 use tokio::{sync::mpsc, time::timeout};
@@ -47,10 +46,7 @@ impl DatabasePool {
             timeout(timeout_duration, connect_future)
                 .await
                 .map_err(|err| {
-                    sqlx::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Connection error: {}", err),
-                    ))
+                    sqlx::Error::Io(std::io::Error::other(format!("Connection error: {}", err)))
                 })?
         }
 
@@ -525,10 +521,7 @@ extern "C-unwind" fn close(state: LuaState) -> c_int {
     }
 }
 
-fn process_rows<'a, DB>(
-    state: LuaState,
-    rows: &'a [<DB as Database>::Row],
-) -> Result<i32, String>
+fn process_rows<'a, DB>(state: LuaState, rows: &'a [<DB as Database>::Row]) -> Result<i32, String>
 where
     DB: sqlx::Database,
     usize: ColumnIndex<<DB as Database>::Row>,

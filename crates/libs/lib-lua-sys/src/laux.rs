@@ -621,7 +621,7 @@ impl LuaTable {
         self
     }
 
-    pub fn rawget<K>(&self, key: K) -> LuaScopeValue
+    pub fn rawget<K>(&self, key: K) -> LuaScopeValue<'_> 
     where
         K: LuaStack,
     {
@@ -638,7 +638,7 @@ impl LuaTable {
 
     #[inline(always)]
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn getmetafield(&self, e: *const c_char) -> Option<LuaScopeValue> {
+    pub fn getmetafield(&self, e: *const c_char) -> Option<LuaScopeValue<'_> > {
         unsafe {
             if ffi::luaL_getmetafield(self.state.as_ptr(), self.index, e) == ffi::LUA_TNIL {
                 None
@@ -652,7 +652,7 @@ impl LuaTable {
         }
     }
 
-    pub fn iter(&self) -> LuaTableIterator {
+    pub fn iter(&self) -> LuaTableIterator<'_>  {
         unsafe {
             ffi::lua_pushnil(self.state.as_ptr());
         }
@@ -663,7 +663,7 @@ impl LuaTable {
         }
     }
 
-    pub fn array_iter(&self) -> LuaArrayIterator {
+    pub fn array_iter(&self) -> LuaArrayIterator<'_>  {
         LuaArrayIterator {
             table: self,
             pos: 0,
@@ -673,7 +673,7 @@ impl LuaTable {
         }
     }
 
-    pub fn expected_array_iter(&self, len: usize) -> LuaArrayIterator {
+    pub fn expected_array_iter(&self, len: usize) -> LuaArrayIterator<'_>  {
         LuaArrayIterator {
             table: self,
             pos: 0,

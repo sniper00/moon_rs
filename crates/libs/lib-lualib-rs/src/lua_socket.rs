@@ -17,8 +17,8 @@ use tokio::io::AsyncReadExt;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Result},
     net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::mpsc,
     time::{sleep, timeout},
@@ -26,7 +26,7 @@ use tokio::{
 
 use lib_core::{
     actor::LuaActor,
-    context::{self, Message, CONTEXT},
+    context::{self, CONTEXT, Message},
 };
 
 lazy_static! {
@@ -490,13 +490,12 @@ extern "C-unwind" fn lua_socket_close(state: LuaState) -> c_int {
 }
 
 extern "C-unwind" fn lua_host(state: LuaState) -> c_int {
-    if let Ok(addr) = laux::lua_opt(state, 1).unwrap_or("1.1.1.1:80").parse() {
-        if let Ok(socket) = TcpStream::connect_timeout(&addr, Duration::from_millis(1000)) {
-            if let Ok(local_addr) = socket.local_addr() {
-                laux::lua_push(state, local_addr.ip().to_string());
-                return 1;
-            }
-        }
+    if let Ok(addr) = laux::lua_opt(state, 1).unwrap_or("1.1.1.1:80").parse()
+        && let Ok(socket) = TcpStream::connect_timeout(&addr, Duration::from_millis(1000))
+        && let Ok(local_addr) = socket.local_addr()
+    {
+        laux::lua_push(state, local_addr.ip().to_string());
+        return 1;
     }
     0
 }

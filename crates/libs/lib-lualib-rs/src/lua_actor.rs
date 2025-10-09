@@ -347,23 +347,14 @@ extern "C-unwind" fn lua_actor_query(state: LuaState) -> c_int {
 
 extern "C-unwind" fn lua_actor_send(state: LuaState) -> c_int {
     let ptype = laux::lua_get(state, 1);
-    unsafe {
-        ffi::luaL_argcheck(
-            state.as_ptr(),
-            (ptype > 0) as i32,
-            1,
-            cstr!("PTYPE must > 0"),
-        )
+
+    if ptype <= 0 {
+        laux::lua_arg_error(state, 1, cstr!("PTYPE must > 0"));
     }
 
     let to: i64 = laux::lua_get(state, 2);
-    unsafe {
-        ffi::luaL_argcheck(
-            state.as_ptr(),
-            (to > 0) as i32,
-            2,
-            cstr!("receiver must > 0"),
-        )
+    if to <= 0 {
+        laux::lua_arg_error(state, 2, cstr!("receiver must > 0"));
     }
 
     let data = check_buffer(state, 3);
@@ -649,7 +640,7 @@ extern "C-unwind" fn lua_message_decode(state: LuaState) -> c_int {
             }
         }
     }
-    unsafe { ffi::lua_gettop(state.as_ptr()) - top }
+    laux::lua_top(state) - top
 }
 
 extern "C-unwind" fn next_session(state: LuaState) -> c_int {

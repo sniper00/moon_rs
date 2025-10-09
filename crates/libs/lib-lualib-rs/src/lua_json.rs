@@ -183,11 +183,11 @@ fn encode_array(
         }
         format_space(writer, fmt, depth);
 
-        if let LuaValue::Nil = val {
-            if !options.enable_sparse_array {
-                writer.truncate(bsize);
-                return encode_object(writer, table, depth, fmt, options);
-            }
+        if let LuaValue::Nil = val
+            && !options.enable_sparse_array
+        {
+            writer.truncate(bsize);
+            return encode_object(writer, table, depth, fmt, options);
         }
         encode_one(writer, val, depth, fmt, options)?;
         format_new_line(writer, fmt)
@@ -536,21 +536,20 @@ extern "C-unwind" fn concat_resp(state: LuaState) -> i32 {
     let mut writer = Box::new(Buffer::new());
     let mut has_error = false;
     let mut hash = 1;
-    if laux::lua_type(state, 2) != LuaType::Table {
-        if let Some(key) = laux::lua_opt::<&str>(state, 1) {
-            if !key.is_empty() {
-                let hash_part = if n > 2 && (key.starts_with('h') || key.starts_with('H')) {
-                    laux::lua_opt::<&str>(state, 3)
-                } else if n > 1 {
-                    laux::lua_opt::<&str>(state, 2)
-                } else {
-                    None
-                };
+    if laux::lua_type(state, 2) != LuaType::Table
+        && let Some(key) = laux::lua_opt::<&str>(state, 1)
+        && !key.is_empty()
+    {
+        let hash_part = if n > 2 && (key.starts_with('h') || key.starts_with('H')) {
+            laux::lua_opt::<&str>(state, 3)
+        } else if n > 1 {
+            laux::lua_opt::<&str>(state, 2)
+        } else {
+            None
+        };
 
-                if let Some(part) = hash_part {
-                    hash = hash_string(part);
-                }
-            }
+        if let Some(part) = hash_part {
+            hash = hash_string(part);
         }
     }
 
