@@ -10,7 +10,7 @@ macro_rules! cstr {
 #[macro_export]
 macro_rules! lreg {
     ($name:expr, $func:expr) => {
-        luaL_Reg {
+        laux::LuaReg {
             name: cstr!($name),
             func: $func,
         }
@@ -20,7 +20,7 @@ macro_rules! lreg {
 #[macro_export]
 macro_rules! lreg_null {
     () => {
-        luaL_Reg {
+        laux::LuaReg {
             name: std::ptr::null(),
             func: laux::lua_null_function,
         }
@@ -42,11 +42,11 @@ macro_rules! lua_rawsetfield {
 macro_rules! push_lua_table {
     ($state:expr, $( $key:expr => $value:expr ),* ) => {
         unsafe {
-            ffi::lua_createtable($state, 0, 0);
+            ffi::lua_createtable($state.as_ptr(), 0, 0);
             $(
                 laux::lua_push($state, $key);
                 laux::lua_push($state, $value);
-                ffi::lua_settable($state, -3);
+                ffi::lua_settable($state.as_ptr(), -3);
             )*
         }
     };
@@ -56,8 +56,8 @@ macro_rules! push_lua_table {
 macro_rules! luaL_newlib {
     ($state:expr, $l:expr) => {
         unsafe {
-            ffi::lua_createtable($state, 0, $l.len() as i32);
-            ffi::luaL_setfuncs($state, $l.as_ptr(), 0);
+            ffi::lua_createtable($state.as_ptr(), 0, $l.len() as i32);
+            ffi::luaL_setfuncs($state.as_ptr(), $l.as_ptr() as *const ffi::luaL_Reg, 0);
         }
     };
 }

@@ -1,13 +1,12 @@
 use base64::{engine, Engine};
 use lib_lua::{
     self,
-    ffi::{self},
-    laux::{self},
+    laux::{self, LuaState},
 };
 use sha2::digest::DynDigest;
 use std::{ffi::c_int, time::Duration};
 
-pub extern "C-unwind" fn num_cpus(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn num_cpus(state: LuaState) -> c_int {
     laux::lua_push(state, num_cpus::get());
     1
 }
@@ -41,7 +40,7 @@ fn to_hex_string(bytes: &[u8]) -> String {
     s
 }
 
-pub extern "C-unwind" fn hash(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn hash(state: LuaState) -> c_int {
     let hasher_type = laux::lua_get(state, 1);
     let data = laux::lua_get::<&[u8]>(state, 2);
     if let Some(mut hasher) = select_hasher(hasher_type) {
@@ -56,20 +55,20 @@ pub extern "C-unwind" fn hash(state: *mut ffi::lua_State) -> c_int {
     );
 }
 
-pub extern "C-unwind" fn thread_sleep(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn thread_sleep(state: LuaState) -> c_int {
     let ms: u64 = laux::lua_get(state, 1);
     std::thread::sleep(Duration::from_millis(ms as u64));
     0
 }
 
-pub extern "C-unwind" fn base64_encode(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn base64_encode(state: LuaState) -> c_int {
     let data = laux::lua_get::<&[u8]>(state, 1);
     let base64_string = engine::general_purpose::STANDARD.encode(data);
     laux::lua_push(state, base64_string);
     1
 }
 
-pub extern "C-unwind" fn base64_decode(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn base64_decode(state: LuaState) -> c_int {
     let base64_string = laux::lua_get::<&str>(state, 1);
     let data = engine::general_purpose::STANDARD.decode(base64_string);
     if data.is_err() {

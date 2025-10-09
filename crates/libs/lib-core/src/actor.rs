@@ -1,5 +1,5 @@
-use lib_lua::laux::{LuaState, LuaThread};
 use crate::context::LuaActorParam;
+use lib_lua::laux::{LuaState, LuaStateBox, LuaThread};
 
 use super::context::Message;
 pub use lib_lua as ffi;
@@ -12,7 +12,7 @@ pub struct LuaActor {
     uuid: i64,
     pub name: String,
     pub rx: mpsc::UnboundedReceiver<Message>,
-    pub main_state: LuaState,
+    pub main_state: Option<LuaStateBox>,
     pub callback_state: LuaThread,
     pub mem: isize,
     pub mem_limit: isize,
@@ -28,7 +28,7 @@ impl LuaActor {
             uuid: 0,
             name: params.name.clone(),
             rx,
-            main_state: LuaState::new(std::ptr::null_mut()),
+            main_state: None,
             callback_state: LuaThread::new(std::ptr::null_mut()),
             mem: 0,
             mem_limit: 0,
@@ -36,12 +36,12 @@ impl LuaActor {
         }
     }
 
-    pub fn set_main_state(&mut self, state: *mut ffi::lua_State) {
-        self.main_state.0 = state;
+    pub fn set_main_state(&mut self, state: LuaState) {
+        self.main_state = Some(LuaStateBox::new(state));
         set_extra_object(state, self);
     }
 
-    pub fn from_lua_state(state: *mut ffi::lua_State) -> &'static mut Self {
+    pub fn from_lua_state(state: LuaState) -> &'static mut Self {
         get_extra_object::<Self>(state)
     }
 
@@ -51,16 +51,16 @@ impl LuaActor {
     }
 }
 
-fn set_extra_object<T>(state: *mut ffi::lua_State, obj: &T) {
+fn set_extra_object<T>(state: LuaState, obj: &T) {
     unsafe {
-        let space = ffi::lua_getextraspace(state) as *mut usize;
+        let space = ffi::lua_getextraspace(state.as_ptr()) as *mut usize;
         std::ptr::write(space, obj as *const T as usize);
     }
 }
 
-fn get_extra_object<T>(state: *mut ffi::lua_State) -> &'static mut T {
+fn get_extra_object<T>(state: LuaState) -> &'static mut T {
     unsafe {
-        let space = ffi::lua_getextraspace(state) as *mut usize;
+        let space = ffi::lua_getextraspace(state.as_ptr()) as *mut usize;
         let v = std::ptr::read(space);
         debug_assert!(v != 0);
         &mut *(v as *mut T)

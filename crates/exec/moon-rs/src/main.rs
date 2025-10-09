@@ -6,7 +6,7 @@ use lib_lua::{
     self, cstr, ffi,
     laux::{self, LuaState},
 };
-use lib_lualib_rs::lua_actor;
+use lib_lualib_rs::{lua_actor, not_null_wrapper};
 use mimalloc::MiMalloc;
 use std::{
     env,
@@ -157,16 +157,19 @@ async fn main() -> Result<()> {
         //has init options
         unsafe {
             let lua = LuaState::new(ffi::luaL_newstate());
-            let lua_state = lua.0;
-            ffi::luaL_openlibs(lua_state);
-            ffi::lua_pushboolean(lua_state, 1);
-            ffi::lua_setglobal(lua_state, cstr!("__init__"));
+            let lua_state = lua.unwrap();
+            ffi::luaL_openlibs(lua_state.as_ptr());
+            ffi::lua_pushboolean(lua_state.as_ptr(), 1);
+            ffi::lua_setglobal(lua_state.as_ptr(), cstr!("__init__"));
 
-            ffi::lua_pushcfunction(lua_state, laux::lua_traceback);
-            assert_eq!(ffi::lua_gettop(lua_state), 1);
+            ffi::lua_pushcfunction(lua_state.as_ptr(), not_null_wrapper!(laux::lua_traceback));
+            assert_eq!(ffi::lua_gettop(lua_state.as_ptr()), 1);
 
             if ffi::LUA_OK
-                != ffi::luaL_loadfile(lua_state, CString::new(bootstrap.as_str())?.as_ptr())
+                != ffi::luaL_loadfile(
+                    lua_state.as_ptr(),
+                    CString::new(bootstrap.as_str())?.as_ptr(),
+                )
             {
                 return Err(Error::Custom(format!(
                     "loadfile {}",
@@ -174,19 +177,21 @@ async fn main() -> Result<()> {
                 )));
             }
 
-            if ffi::LUA_OK != ffi::luaL_dostring(lua_state, CString::new(arg.as_str())?.as_ptr()) {
+            if ffi::LUA_OK
+                != ffi::luaL_dostring(lua_state.as_ptr(), CString::new(arg.as_str())?.as_ptr())
+            {
                 return Err(Error::Custom(
                     laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
                 ));
             }
 
-            if ffi::LUA_OK != ffi::lua_pcall(lua_state, 1, 1, 1) {
+            if ffi::LUA_OK != ffi::lua_pcall(lua_state.as_ptr(), 1, 1, 1) {
                 return Err(Error::Custom(
                     laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
                 ));
             }
 
-            if ffi::LUA_TTABLE != ffi::lua_type(lua_state, -1) {
+            if ffi::LUA_TTABLE != ffi::lua_type(lua_state.as_ptr(), -1) {
                 return Err(Error::Custom("init code must return a table".to_string()));
             }
 

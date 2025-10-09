@@ -1,4 +1,4 @@
-use lib_lua::{cstr, ffi};
+use lib_lua::{cstr, ffi, laux::LuaState};
 
 mod lua_buffer;
 mod lua_excel;
@@ -12,17 +12,33 @@ mod lua_mongodb;
 pub mod lua_json;
 pub mod lua_actor;
 
-macro_rules! lua_require {
-    ($state:expr, $name:expr, $fn:expr) => {
-        unsafe {
-            ffi::luaL_requiref($state, cstr!($name), $fn, 0);
-            ffi::lua_pop($state, 1);
+#[macro_export]
+macro_rules! not_null_wrapper {
+    ($fn:expr) => {
+        {
+            unsafe extern "C-unwind" fn func_wrapper(state: *mut ffi::lua_State) -> i32 {
+                #[allow(unused_unsafe)]
+                #[allow(clippy::macro_metavars_in_unsafe)]
+                unsafe { $fn(LuaState::new(state).unwrap()) }
+            }
+            func_wrapper
         }
     };
 }
 
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn luaopen_custom_libs(state: *mut ffi::lua_State) {
+#[macro_export]
+macro_rules! lua_require {
+    ($state:expr, $name:expr, $fn:expr) => {
+        #[allow(unused_unsafe)]
+        #[allow(clippy::macro_metavars_in_unsafe)]
+        unsafe {
+            ffi::luaL_requiref($state.as_ptr(), cstr!($name), not_null_wrapper!($fn), 0);
+            ffi::lua_pop($state.as_ptr(), 1);
+        }
+    };
+}
+
+pub fn luaopen_custom_libs(state: LuaState) {
     lua_require!(state, "http.core", lua_http::luaopen_http);
     lua_require!(state, "net.core", lua_socket::luaopen_socket);
     lua_require!(state, "excel", lua_excel::luaopen_excel);

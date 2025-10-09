@@ -6,9 +6,9 @@ use lib_core::{
 };
 use lib_lua::{
     self, cstr,
-    ffi::{self, luaL_Reg},
-    laux::{self, LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib,
+    ffi::{self},
+    laux::{self, LuaState, LuaTable, LuaValue},
+    lreg, lreg_null, luaL_newlib
 };
 use percent_encoding::percent_decode;
 use reqwest::ClientBuilder;
@@ -92,17 +92,17 @@ async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
         req.id,
         req.session,
         HttpResponse {
-            version: response.version(),
-            status_code: response.status().as_u16() as i32,
-            headers: response.headers().clone(),
-            body: response.bytes().await?,
+        version: response.version(),
+        status_code: response.status().as_u16() as i32,
+        headers: response.headers().clone(),
+        body: response.bytes().await?,
         },
     );
 
     Ok(())
 }
 
-fn extract_headers(state: *mut ffi::lua_State, index: i32) -> Result<HeaderMap, String> {
+fn extract_headers(state: LuaState, index: i32) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::with_capacity(8); // Pre-allocate reasonable size
 
     let table = LuaTable::from_stack(state, index);
@@ -136,7 +136,7 @@ fn extract_headers(state: *mut ffi::lua_State, index: i32) -> Result<HeaderMap, 
     Ok(headers)
 }
 
-extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
     laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
 
     let headers = match extract_headers(state, 1) {
@@ -171,10 +171,10 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
                 id,
                 session,
                 HttpResponse {
-                    version: Version::HTTP_11,
-                    status_code: -1,
-                    headers: HeaderMap::new(),
-                    body: err.to_string().into(),
+                version: Version::HTTP_11,
+                status_code: -1,
+                headers: HeaderMap::new(),
+                body: err.to_string().into(),
                 },
             );
         }
@@ -184,7 +184,7 @@ extern "C-unwind" fn lua_http_request(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn decode(state: LuaState) -> i32 {
     laux::luaL_checkstack(state, 4, std::ptr::null());
     let p_as_isize: isize = laux::lua_get(state, 1);
     let response = unsafe { Box::from_raw(p_as_isize as *mut HttpResponse) };
@@ -202,7 +202,7 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-extern "C-unwind" fn lua_http_form_urlencode(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_http_form_urlencode(state: LuaState) -> i32 {
     laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
 
     let mut result = String::with_capacity(64);
@@ -226,7 +226,7 @@ extern "C-unwind" fn lua_http_form_urlencode(state: *mut ffi::lua_State) -> c_in
     1
 }
 
-extern "C-unwind" fn lua_http_form_urldecode(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_http_form_urldecode(state: LuaState) -> i32 {
     let query_string = laux::lua_get::<&str>(state, 1);
 
     let decoded: Vec<(String, String)> = form_urlencoded::parse(query_string.as_bytes())
@@ -241,7 +241,7 @@ extern "C-unwind" fn lua_http_form_urldecode(state: *mut ffi::lua_State) -> c_in
     1
 }
 
-extern "C-unwind" fn lua_http_parse_response(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_http_parse_response(state: LuaState) -> c_int {
     let raw_response = laux::lua_get::<&[u8]>(state, 1);
 
     let mut lines = raw_response.split(|&x| x == b'\n');
@@ -300,7 +300,7 @@ extern "C-unwind" fn lua_http_parse_response(state: *mut ffi::lua_State) -> c_in
     1
 }
 
-extern "C-unwind" fn lua_http_parse_request(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_http_parse_request(state: LuaState) -> c_int {
     let raw_request = laux::lua_get::<&[u8]>(state, 1);
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -344,7 +344,7 @@ extern "C-unwind" fn lua_http_parse_request(state: *mut ffi::lua_State) -> c_int
     }
 }
 
-pub unsafe extern "C-unwind" fn luaopen_http(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_http(state: LuaState) -> c_int {
     let l = [
         lreg!("request", lua_http_request),
         lreg!("decode", decode),

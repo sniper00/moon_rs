@@ -32,10 +32,10 @@ lazy_static = "1.4.0"
 reqwest = { version = "0.12", features = ["rustls-tls","trust-dns"],default-features = false}
 serde = { version = "1.0", features = ["derive"]}
 serde_json = {version = "1.0"}
-colored = "2.0"
+colored = "3.0"
 chrono = { version = "0.4.19", features = ["serde"] }
 derive_more = {version = "2", features = ["from"]}
-calamine = "0.27"
+calamine = "^0.31"
 csv = "1.3.0"
 num_cpus = "1.16.0"
 

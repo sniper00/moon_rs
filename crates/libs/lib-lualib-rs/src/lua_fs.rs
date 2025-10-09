@@ -1,175 +1,130 @@
+use lib_lua::laux::{LuaState, LuaTable};
 use lib_lua::luaL_newlib;
-use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null};
+use lib_lua::{laux, ffi, cstr, lreg, lreg_null};
 use std::ffi::c_int;
 use std::{
     env, fs,
     path::{Path, PathBuf},
 };
 
-fn listdir(state: *mut ffi::lua_State, path: &Path, idx: &mut i32, ext: &str) {
+fn listdir(res: &LuaTable, path: &Path, idx: &mut usize, ext: Option<&str>) {
     if let Some(strpath) = path.to_str() {
-        if !ext.is_empty() {
+        if let Some(ext) = ext {
             if strpath.ends_with(ext) {
-                laux::lua_push(state, strpath);
+                laux::lua_push(res.lua_state(), strpath);
                 *idx += 1;
-                unsafe {
-                    ffi::lua_rawseti(state, -2, *idx as ffi::lua_Integer);
-                }
+                res.seti(*idx);
             }
         } else {
-            laux::lua_push(state, strpath);
+            laux::lua_push(res.lua_state(), strpath);
             *idx += 1;
-            unsafe {
-                ffi::lua_rawseti(state, -2, *idx as ffi::lua_Integer);
-            }
+            res.seti(*idx);
         }
     }
 }
 
-extern "C-unwind" fn lfs_listdir(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_listdir(state: LuaState) -> c_int {
     let path: &str = laux::lua_get(state, 1);
-    let ext;
-    unsafe {
-        if ffi::lua_isstring(state, 2) != 0 {
-            ext = laux::lua_get(state, 2);
-        } else {
-            ext = "";
-        }
-    }
-
+    let ext = laux::lua_opt::<&str>(state, 2);
+    
     match fs::read_dir(path) {
         Ok(dir) => {
-            unsafe {
-                ffi::lua_createtable(state, 16, 0);
-            }
+            let table = laux::LuaTable::new(state, 16, 0);
 
-            let mut idx = 0;
+            let mut idx: usize = 0;
             for entry in dir.flatten() {
                 if let Ok(path) = fs::canonicalize(entry.path()) {
-                    listdir(state, &path, &mut idx, ext);
+                    listdir(&table, &path, &mut idx, ext);
                 }
             }
             1
         }
-        Err(err) => unsafe {
-            ffi::lua_pushboolean(state, 0);
-            laux::lua_push(state, format!("listdir '{}' error: {}", path, err));
-            2
+        Err(err) => {
+            laux::lua_error(state, format!("listdir '{}' error: {}", path, err).as_str());
         },
     }
 }
 
-extern "C-unwind" fn lfs_mkdir(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_mkdir(state: LuaState) -> c_int {
     let path = laux::lua_get::<&str>(state, 1);
     if fs::create_dir_all(path).is_ok() {
-        unsafe {
-            ffi::lua_pushboolean(state, 1);
-            1
-        }
+        laux::lua_push(state, true);
     } else {
-        unsafe {
-            ffi::lua_pushboolean(state, 0);
-            laux::lua_push(state, format!("mkdir '{}' error", path));
-            2
-        }
+        laux::lua_error(state, format!("mkdir '{}' error", path).as_str());
     }
+    0
 }
 
-extern "C-unwind" fn lfs_exists(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_exists(state: LuaState) -> c_int {
     let path = laux::lua_get::<&str>(state, 1);
-    if fs::metadata(path).is_ok() {
-        unsafe {
-            ffi::lua_pushboolean(state, 1);
-            1
-        }
-    } else {
-        unsafe {
-            ffi::lua_pushboolean(state, 0);
-            1
-        }
-    }
+    laux::lua_push(state, fs::metadata(path).is_ok());
+    1
 }
 
-extern "C-unwind" fn lfs_isdir(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_isdir(state: LuaState) -> c_int {
     let path = laux::lua_get::<&str>(state, 1);
     if let Ok(meta) = fs::metadata(path) {
-        unsafe {
-            if meta.is_dir() {
-                ffi::lua_pushboolean(state, 1);
-            } else {
-                ffi::lua_pushboolean(state, 0);
-            }
-            1
-        }
+        laux::lua_push(state, meta.is_dir());
     } else {
-        unsafe {
-            ffi::lua_pushboolean(state, 0);
-            1
-        }
+        laux::lua_push(state, false);
     }
+    1
 }
 
-extern "C-unwind" fn lfs_split(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_split(state: LuaState) -> c_int {
     let path = laux::lua_get::<&str>(state, 1);
     let path = Path::new(path);
     if let Some(parent) = path.parent() {
         laux::lua_push(state, parent.as_os_str().to_string_lossy().as_ref());
     } else {
-        unsafe { ffi::lua_pushnil(state) }
+        laux::lua_pushnil(state);
     }
 
     if let Some(name) = path.file_name() {
         laux::lua_push(state, name.to_string_lossy().as_ref());
     } else {
-        unsafe { ffi::lua_pushnil(state) }
+        laux::lua_pushnil(state);
     }
 
     if let Some(ext) = path.extension() {
         laux::lua_push(state, ext.to_string_lossy().as_ref());
     } else {
-        unsafe { ffi::lua_pushnil(state) }
+        laux::lua_pushnil(state);
     }
 
     3
 }
 
-extern "C-unwind" fn lfs_ext(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_ext(state: LuaState) -> c_int {
     let path = laux::lua_get::<&str>(state, 1);
     let path = Path::new(path);
 
     if let Some(ext) = path.extension() {
         laux::lua_push(state, ext.to_string_lossy().as_ref());
     } else {
-        unsafe {
-            ffi::lua_pushnil(state);
-        }
+        laux::lua_pushnil(state);
     }
 
     1
 }
 
-extern "C-unwind" fn lfs_stem(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_stem(state: LuaState) -> c_int {
     let path = laux::lua_get::<&str>(state, 1);
     let path = Path::new(path);
 
     if let Some(name) = path.file_stem() {
         laux::lua_push(state, name.to_string_lossy().as_ref());
     } else {
-        unsafe {
-            ffi::lua_pushnil(state);
-        }
+        laux::lua_pushnil(state);
     }
 
     1
 }
 
-extern "C-unwind" fn lfs_join(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_join(state: LuaState) -> c_int {
     let mut path = PathBuf::new();
 
-    let top;
-    unsafe {
-        top = ffi::lua_gettop(state);
-    }
+    let top = laux::lua_top(state);
 
     for i in 1..=top {
         let s = laux::lua_get::<&str>(state, i);
@@ -181,59 +136,47 @@ extern "C-unwind" fn lfs_join(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-extern "C-unwind" fn lfs_pwd(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_pwd(state: LuaState) -> c_int {
     let current_dir = env::current_dir();
     if let Ok(dir) = current_dir {
         laux::lua_push(state, dir.to_string_lossy().as_ref());
     } else {
-        unsafe { ffi::lua_pushnil(state) }
+        laux::lua_pushnil(state);
     }
 
     1
 }
 
-extern "C-unwind" fn lfs_abspath(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_abspath(state: LuaState) -> c_int {
     let path = laux::lua_get::<&str>(state, 1);
     if let Ok(abs) = fs::canonicalize(path) {
         laux::lua_push(state, abs.to_string_lossy().as_ref());
     } else {
-        unsafe { ffi::lua_pushnil(state) }
+        laux::lua_pushnil(state);
     }
 
     1
 }
 
-extern "C-unwind" fn lfs_remove(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lfs_remove(state: LuaState) -> c_int {
     let path = laux::lua_get::<&str>(state, 1);
     let path = Path::new(path);
     if path.is_dir() {
         if fs::remove_dir_all(path).is_ok() {
-            unsafe {
-                ffi::lua_pushboolean(state, 1);
-                1
-            }
+            laux::lua_push(state, 1);
+            1
         } else {
-            unsafe {
-                ffi::lua_pushboolean(state, 0);
-                laux::lua_push(state, format!("remove '{:?}' error", path));
-                2
-            }
+            laux::lua_error(state, format!("remove '{:?}' error", path).as_str());
         }
     } else if fs::remove_file(path).is_ok() {
-        unsafe {
-            ffi::lua_pushboolean(state, 1);
-            1
-        }
+        laux::lua_push(state, 1);
+        1
     } else {
-        unsafe {
-            ffi::lua_pushboolean(state, 0);
-            laux::lua_push(state, format!("remove '{:?}' error", path));
-            2
-        }
+        laux::lua_error(state, format!("remove '{:?}' error", path).as_str());
     }
 }
 
-pub unsafe extern "C-unwind" fn luaopen_fs(state: *mut ffi::lua_State) -> c_int {
+pub unsafe extern "C-unwind" fn luaopen_fs(state: LuaState) -> c_int {
     let l = [
         lreg!("listdir", lfs_listdir),
         lreg!("mkdir", lfs_mkdir),

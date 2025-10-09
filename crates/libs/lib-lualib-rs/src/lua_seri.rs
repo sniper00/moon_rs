@@ -1,9 +1,9 @@
 use std::ffi::{c_int, c_void};
 
 use lib_lua::{
-    self, cstr,
-    ffi::{self, luaL_Reg, LUA_TLIGHTUSERDATA, LUA_TSTRING},
-    laux::{self},
+    cstr,
+    ffi::{self, LUA_TLIGHTUSERDATA, LUA_TSTRING},
+    laux::{self, LuaState},
     lreg, lreg_null, luaL_newlib,
 };
 
@@ -112,12 +112,12 @@ fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn write_table_array(
-    state: *mut ffi::lua_State,
+    state: LuaState,
     buf: &mut Vec<u8>,
     index: i32,
     depth: i32,
 ) -> Result<usize, String> {
-    let array_size = unsafe { ffi::lua_rawlen(state, index) };
+    let array_size = unsafe { ffi::lua_rawlen(state.as_ptr(), index) };
     if array_size >= MAX_COOKIE as usize - 1 {
         let n = combine_type!(TYPE_TABLE, MAX_COOKIE - 1);
         buf.push(n);
@@ -129,9 +129,9 @@ fn write_table_array(
 
     for i in 1..=array_size {
         unsafe {
-            ffi::lua_rawgeti(state, index, i as ffi::lua_Integer);
+            ffi::lua_rawgeti(state.as_ptr(), index, i as ffi::lua_Integer);
             pack_one(state, buf, -1, depth)?;
-            ffi::lua_pop(state, 1);
+            ffi::lua_pop(state.as_ptr(), 1);
         }
     }
 
@@ -139,25 +139,25 @@ fn write_table_array(
 }
 
 fn write_table_hash(
-    state: *mut ffi::lua_State,
+    state: LuaState,
     buf: &mut Vec<u8>,
     index: i32,
     depth: i32,
     array_size: usize,
 ) -> Result<(), String> {
     unsafe {
-        ffi::lua_pushnil(state);
-        while ffi::lua_next(state, index) != 0 {
-            if ffi::lua_type(state, -2) == ffi::LUA_TNUMBER && ffi::lua_isinteger(state, -2) != 0 {
-                let x = ffi::lua_tointeger(state, -2);
+        ffi::lua_pushnil(state.as_ptr());
+        while ffi::lua_next(state.as_ptr(), index) != 0 {
+            if ffi::lua_type(state.as_ptr(), -2) == ffi::LUA_TNUMBER && ffi::lua_isinteger(state.as_ptr(), -2) != 0 {
+                let x = ffi::lua_tointeger(state.as_ptr(), -2);
                 if x > 0 && x <= array_size as i64 {
-                    ffi::lua_pop(state, 1);
+                    ffi::lua_pop(state.as_ptr(), 1);
                     continue;
                 }
             }
             pack_one(state, buf, -2, depth)?;
             pack_one(state, buf, -1, depth)?;
-            ffi::lua_pop(state, 1);
+            ffi::lua_pop(state.as_ptr(), 1);
         }
     }
 
@@ -167,7 +167,7 @@ fn write_table_hash(
 }
 
 fn write_table_metapairs(
-    state: *mut ffi::lua_State,
+    state: LuaState,
     buf: &mut Vec<u8>,
     index: i32,
     depth: i32,
@@ -176,25 +176,25 @@ fn write_table_metapairs(
     buf.push(n);
 
     unsafe {
-        ffi::lua_pushvalue(state, index);
-        if ffi::lua_pcall(state, 1, 3, 0) != ffi::LUA_OK {
+        ffi::lua_pushvalue(state.as_ptr(), index);
+        if ffi::lua_pcall(state.as_ptr(), 1, 3, 0) != ffi::LUA_OK {
             return Ok(1);
         }
         loop {
-            ffi::lua_pushvalue(state, -2);
-            ffi::lua_pushvalue(state, -2);
-            ffi::lua_copy(state, -5, -3);
-            if ffi::lua_pcall(state, 2, 2, 0) != ffi::LUA_OK {
+            ffi::lua_pushvalue(state.as_ptr(), -2);
+            ffi::lua_pushvalue(state.as_ptr(), -2);
+            ffi::lua_copy(state.as_ptr(), -5, -3);
+            if ffi::lua_pcall(state.as_ptr(), 2, 2, 0) != ffi::LUA_OK {
                 return Ok(1);
             }
-            let type_ = ffi::lua_type(state, -2);
+            let type_ = ffi::lua_type(state.as_ptr(), -2);
             if type_ == ffi::LUA_TNIL {
-                ffi::lua_pop(state, 4);
+                ffi::lua_pop(state.as_ptr(), 4);
                 break;
             }
             pack_one(state, buf, -2, depth)?;
             pack_one(state, buf, -1, depth)?;
-            ffi::lua_pop(state, 1);
+            ffi::lua_pop(state.as_ptr(), 1);
         }
     }
 
@@ -204,22 +204,22 @@ fn write_table_metapairs(
 }
 
 fn write_table(
-    state: *mut ffi::lua_State,
+    state: LuaState,
     buf: &mut Vec<u8>,
     mut index: i32,
     depth: i32,
 ) -> Result<i32, String> {
     unsafe {
-        if ffi::lua_checkstack(state, ffi::LUA_MINSTACK) == 0 {
-            ffi::lua_pushstring(state, cstr!("out of memory"));
+        if ffi::lua_checkstack(state.as_ptr(), ffi::LUA_MINSTACK) == 0 {
+            ffi::lua_pushstring(state.as_ptr(), cstr!("out of memory"));
             return Ok(1);
         }
 
         if index < 0 {
-            index = ffi::lua_gettop(state) + index + 1;
+            index = ffi::lua_gettop(state.as_ptr()) + index + 1;
         };
 
-        if ffi::luaL_getmetafield(state, index, cstr!("__pairs")) != ffi::LUA_TNIL {
+        if ffi::luaL_getmetafield(state.as_ptr(), index, cstr!("__pairs")) != ffi::LUA_TNIL {
             write_table_metapairs(state, buf, index, depth)
         } else {
             let array_size = write_table_array(state, buf, index, depth)?;
@@ -230,7 +230,7 @@ fn write_table(
 }
 
 fn pack_one(
-    state: *mut ffi::lua_State,
+    state: LuaState,
     buf: &mut Vec<u8>,
     mut index: i32,
     depth: i32,
@@ -239,17 +239,17 @@ fn pack_one(
         if depth > MAX_DEPTH as i32 {
             return Err("serialize can't pack too depth table".to_string());
         }
-        let type_ = ffi::lua_type(state, index);
+        let type_ = ffi::lua_type(state.as_ptr(), index);
         match type_ {
             ffi::LUA_TNIL => {
                 write_nil(buf);
             }
             ffi::LUA_TNUMBER => {
-                if ffi::lua_isinteger(state, index) != 0 {
-                    let x = ffi::lua_tointeger(state, index);
+                if ffi::lua_isinteger(state.as_ptr(), index) != 0 {
+                    let x = ffi::lua_tointeger(state.as_ptr(), index);
                     write_integer(buf, x);
                 } else {
-                    let n = ffi::lua_tonumber(state, index);
+                    let n = ffi::lua_tonumber(state.as_ptr(), index);
                     if n.is_nan() {
                         return Err("serialize can't pack 'nan' number value".to_string());
                     }
@@ -257,19 +257,19 @@ fn pack_one(
                 }
             }
             ffi::LUA_TBOOLEAN => {
-                write_boolean(buf, ffi::lua_toboolean(state, index) != 0);
+                write_boolean(buf, ffi::lua_toboolean(state.as_ptr(), index) != 0);
             }
             ffi::LUA_TSTRING => {
                 let mut sz = 0;
-                let str = ffi::lua_tolstring(state, index, &mut sz);
+                let str = ffi::lua_tolstring(state.as_ptr(), index, &mut sz);
                 write_bytes(buf, std::slice::from_raw_parts(str as *const u8, sz));
             }
             ffi::LUA_TLIGHTUSERDATA => {
-                write_pointer(buf, ffi::lua_touserdata(state, index));
+                write_pointer(buf, ffi::lua_touserdata(state.as_ptr(), index));
             }
             ffi::LUA_TTABLE => {
                 if index < 0 {
-                    index = ffi::lua_gettop(state) + index + 1
+                    index = ffi::lua_gettop(state.as_ptr()) + index + 1
                 }
                 if write_table(state, buf, index, depth + 1)? != 0 {
                     return Err(laux::lua_opt::<String>(state, -1)
@@ -277,7 +277,7 @@ fn pack_one(
                 }
             }
             _ => {
-                let tname = std::ffi::CStr::from_ptr(ffi::lua_typename(state, type_))
+                let tname = std::ffi::CStr::from_ptr(ffi::lua_typename(state.as_ptr(), type_))
                     .to_str()
                     .unwrap_or_default();
                 return Err(format!("Unsupport type {} to serialize", tname));
@@ -288,7 +288,7 @@ fn pack_one(
     Ok(())
 }
 
-fn invalid_stream_line(state: *mut ffi::lua_State, rb: &mut ReadBlock, line: i32) {
+fn invalid_stream_line(state: LuaState, rb: &mut ReadBlock, line: i32) {
     let len = rb.len();
     laux::lua_error(
         state,
@@ -305,7 +305,7 @@ macro_rules! invalid_stream {
 struct ReadBlock<'a> {
     buf: &'a [u8],
     pos: usize,
-    state: *mut ffi::lua_State,
+    state: LuaState,
 }
 
 impl ReadBlock<'_> {
@@ -409,7 +409,7 @@ impl ReadBlock<'_> {
     }
 }
 
-fn get_integer(state: *mut ffi::lua_State, br: &mut ReadBlock, cookie: u8) -> i64 {
+fn get_integer(state: LuaState, br: &mut ReadBlock, cookie: u8) -> i64 {
     match cookie {
         TYPE_NUMBER_ZERO => 0,
         TYPE_NUMBER_BYTE => br.read_byte() as i64,
@@ -423,7 +423,7 @@ fn get_integer(state: *mut ffi::lua_State, br: &mut ReadBlock, cookie: u8) -> i6
     }
 }
 
-// fn get_pointer(state: *mut ffi::lua_State, buf: &[u8]) -> *mut std::ffi::c_void {
+// fn get_pointer(state: LuaState, buf: &[u8]) -> *mut std::ffi::c_void {
 //     let mut n = [0u8; std::mem::size_of::<usize>()];
 //     if buf.len() < std::mem::size_of::<usize>() {
 //         invalid_stream!(state, buf);
@@ -432,38 +432,38 @@ fn get_integer(state: *mut ffi::lua_State, br: &mut ReadBlock, cookie: u8) -> i6
 //     usize::from_le_bytes(n) as *mut std::ffi::c_void
 // }
 
-fn get_buffer(state: *mut ffi::lua_State, br: &mut ReadBlock, len: usize) {
+fn get_buffer(state: LuaState, br: &mut ReadBlock, len: usize) {
     unsafe {
-        ffi::lua_pushlstring(state, br.consume(len) as *const std::os::raw::c_char, len);
+        ffi::lua_pushlstring(state.as_ptr(), br.consume(len) as *const std::os::raw::c_char, len);
     }
 }
 
-fn unpack_one(state: *mut ffi::lua_State, br: &mut ReadBlock) {
+fn unpack_one(state: LuaState, br: &mut ReadBlock) {
     let type_ = br.read_byte();
     push_value(state, br, type_ & 0x7, type_ >> 3);
 }
 
-fn push_value(state: *mut ffi::lua_State, br: &mut ReadBlock, type_: u8, cookie: u8) {
+fn push_value(state: LuaState, br: &mut ReadBlock, type_: u8, cookie: u8) {
     match type_ {
         TYPE_NIL => unsafe {
-            ffi::lua_pushnil(state);
+            ffi::lua_pushnil(state.as_ptr());
         },
         TYPE_BOOLEAN => unsafe {
-            ffi::lua_pushboolean(state, if cookie != 0 { 1 } else { 0 });
+            ffi::lua_pushboolean(state.as_ptr(), if cookie != 0 { 1 } else { 0 });
         },
         TYPE_NUMBER => {
             if cookie == TYPE_NUMBER_REAL {
                 unsafe {
-                    ffi::lua_pushnumber(state, br.read_real());
+                    ffi::lua_pushnumber(state.as_ptr(), br.read_real());
                 }
             } else {
                 unsafe {
-                    ffi::lua_pushinteger(state, get_integer(state, br, cookie));
+                    ffi::lua_pushinteger(state.as_ptr(), get_integer(state, br, cookie));
                 }
             }
         }
         TYPE_USERDATA => unsafe {
-            ffi::lua_pushlightuserdata(state, br.read_pointer());
+            ffi::lua_pushlightuserdata(state.as_ptr(), br.read_pointer());
         },
         TYPE_SHORT_STRING => {
             get_buffer(state, br, cookie as usize);
@@ -489,7 +489,7 @@ fn push_value(state: *mut ffi::lua_State, br: &mut ReadBlock, type_: u8, cookie:
     }
 }
 
-fn unpack_table(state: *mut ffi::lua_State, br: &mut ReadBlock, mut array_size: usize) {
+fn unpack_table(state: LuaState, br: &mut ReadBlock, mut array_size: usize) {
     if array_size == MAX_COOKIE as usize - 1 {
         let type_ = br.read_byte();
         let cookie = type_ >> 3;
@@ -499,27 +499,27 @@ fn unpack_table(state: *mut ffi::lua_State, br: &mut ReadBlock, mut array_size: 
         array_size = get_integer(state, br, cookie) as usize;
     }
     unsafe {
-        ffi::luaL_checkstack(state, ffi::LUA_MINSTACK, std::ptr::null());
-        ffi::lua_createtable(state, array_size as i32, 0);
+        ffi::luaL_checkstack(state.as_ptr(), ffi::LUA_MINSTACK, std::ptr::null());
+        ffi::lua_createtable(state.as_ptr(), array_size as i32, 0);
         for i in 1..=array_size {
             unpack_one(state, br);
-            ffi::lua_rawseti(state, -2, i as ffi::lua_Integer);
+            ffi::lua_rawseti(state.as_ptr(), -2, i as ffi::lua_Integer);
         }
 
         loop {
             unpack_one(state, br);
-            if ffi::lua_isnil(state, -1) != 0 {
-                ffi::lua_pop(state, 1);
+            if ffi::lua_isnil(state.as_ptr(), -1) != 0 {
+                ffi::lua_pop(state.as_ptr(), 1);
                 return;
             }
             unpack_one(state, br);
-            ffi::lua_rawset(state, -3);
+            ffi::lua_rawset(state.as_ptr(), -3);
         }
     }
 }
 
-extern "C-unwind" fn pack(state: *mut ffi::lua_State) -> c_int {
-    let n = unsafe { ffi::lua_gettop(state) };
+extern "C-unwind" fn pack(state: LuaState) -> c_int {
+    let n = laux::lua_top(state);
     if n == 0 {
         return 0;
     }
@@ -539,15 +539,13 @@ extern "C-unwind" fn pack(state: *mut ffi::lua_State) -> c_int {
         laux::throw_error(state);
     }
 
-    unsafe {
-        ffi::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);
-    }
+    laux::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);
 
     1
 }
 
-extern "C-unwind" fn pack_string(state: *mut ffi::lua_State) -> c_int {
-    let n = unsafe { ffi::lua_gettop(state) };
+extern "C-unwind" fn pack_string(state: LuaState) -> c_int {
+    let n = laux::lua_top(state);
     if n == 0 {
         return 0;
     }
@@ -567,29 +565,24 @@ extern "C-unwind" fn pack_string(state: *mut ffi::lua_State) -> c_int {
         laux::throw_error(state);
     }
 
-    unsafe {
-        ffi::lua_pushlstring(
-            state,
-            buf.as_ptr() as *const std::os::raw::c_char,
-            buf.len(),
-        );
-    }
+    laux::lua_push(state, buf.as_slice());
+
     1
 }
 
-extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn unpack(state: LuaState) -> c_int {
     unsafe {
-        if ffi::lua_isnoneornil(state, 1) == 1 {
+        if ffi::lua_isnoneornil(state.as_ptr(), 1) == 1 {
             return 0;
         }
 
         let mut len = 0;
         let data;
-        if ffi::lua_type(state, 1) == LUA_TSTRING {
-            data = ffi::lua_tolstring(state, 1, &mut len) as *const u8;
+        if ffi::lua_type(state.as_ptr(), 1) == LUA_TSTRING {
+            data = ffi::lua_tolstring(state.as_ptr(), 1, &mut len) as *const u8;
         } else {
-            data = ffi::lua_touserdata(state, 1) as *const u8;
-            len = ffi::luaL_checkinteger(state, 2) as usize;
+            data = ffi::lua_touserdata(state.as_ptr(), 1) as *const u8;
+            len = ffi::luaL_checkinteger(state.as_ptr(), 2) as usize;
         }
 
         if len == 0 {
@@ -597,10 +590,10 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
         }
 
         if data.is_null() {
-            ffi::luaL_error(state, cstr!("deserialize null pointer"));
+            ffi::luaL_error(state.as_ptr(), cstr!("deserialize null pointer"));
         }
 
-        ffi::lua_settop(state, 1);
+        ffi::lua_settop(state.as_ptr(), 1);
 
         let br = &mut ReadBlock {
             buf: std::slice::from_raw_parts(data, len),
@@ -611,7 +604,7 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
         let mut i = 0;
         loop {
             if i % 8 == 7 {
-                ffi::luaL_checkstack(state, 8, std::ptr::null());
+                ffi::luaL_checkstack(state.as_ptr(), 8, std::ptr::null());
             }
             i += 1;
 
@@ -623,25 +616,25 @@ extern "C-unwind" fn unpack(state: *mut ffi::lua_State) -> c_int {
             }
         }
 
-        ffi::lua_gettop(state) - 1
+        ffi::lua_gettop(state.as_ptr()) - 1
     }
 }
 
-extern "C-unwind" fn peek_one(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn peek_one(state: LuaState) -> c_int {
     unsafe {
-        if ffi::lua_isnoneornil(state, 1) == 1 {
+        if ffi::lua_isnoneornil(state.as_ptr(), 1) == 1 {
             return 0;
         }
 
-        if ffi::lua_type(state, 1) != LUA_TLIGHTUSERDATA {
-            ffi::luaL_argerror(state, 1, cstr!("peek_one need lightuserdata"));
+        if ffi::lua_type(state.as_ptr(), 1) != LUA_TLIGHTUSERDATA {
+            ffi::luaL_argerror(state.as_ptr(), 1, cstr!("peek_one need lightuserdata"));
         }
 
         let seek = laux::lua_opt(state, 2).unwrap_or(false);
 
-        let buf = ffi::lua_touserdata(state, 1) as *mut Buffer;
+        let buf = ffi::lua_touserdata(state.as_ptr(), 1) as *mut Buffer;
         if buf.is_null() {
-            ffi::luaL_argerror(state, 1, cstr!("null buffer pointer"));
+            ffi::luaL_argerror(state.as_ptr(), 1, cstr!("null buffer pointer"));
         }
 
         if (*buf).is_empty() {
@@ -662,14 +655,14 @@ extern "C-unwind" fn peek_one(state: *mut ffi::lua_State) -> c_int {
             (*buf).consume(br.offset());
         }
 
-        ffi::lua_pushlightuserdata(state, br.as_ptr() as *mut c_void);
-        ffi::lua_pushinteger(state, br.len() as i64);
+        ffi::lua_pushlightuserdata(state.as_ptr(), br.as_ptr() as *mut c_void);
+        ffi::lua_pushinteger(state.as_ptr(), br.len() as i64);
 
         3
     }
 }
 
-pub unsafe extern "C-unwind" fn luaopen_seri(state: *mut ffi::lua_State) -> c_int {
+pub unsafe extern "C-unwind" fn luaopen_seri(state: LuaState) -> c_int {
     let l = [
         lreg!("pack", pack),
         lreg!("packstring", pack_string),

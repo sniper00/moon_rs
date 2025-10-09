@@ -4,9 +4,9 @@ use lazy_static::lazy_static;
 use lib_core::actor::LuaActor;
 use lib_core::context::{self, CONTEXT};
 use lib_lua::{
-    self, cstr, ffi,
-    laux::{self, LuaArgs, LuaStateRef, LuaTable, LuaValue},
-    lreg, lreg_null, luaL_Reg, luaL_newlib, push_lua_table,
+    cstr, ffi,
+    laux::{self, LuaArgs, LuaState, LuaTable, LuaValue},
+    lreg, lreg_null, luaL_newlib, push_lua_table,
 };
 use mongodb::{
     bson::{doc, oid, Bson, Document},
@@ -320,7 +320,7 @@ async fn database_handler(
     }
 }
 
-extern "C-unwind" fn connect(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let mut args = LuaArgs::new(1);
     let database_url: &str = laux::lua_get(state, args.iter_arg());
     let name: &str = laux::lua_get(state, args.iter_arg());
@@ -595,7 +595,7 @@ fn make_request(
     db_name: String,
     collection_name: String,
     op_name: &str,
-    state: LuaStateRef,
+    state: LuaState,
     args: &mut LuaArgs,
 ) -> Result<DatabaseRequest, String> {
     let request = match op_name {
@@ -712,7 +712,7 @@ fn make_request(
     Ok(request)
 }
 
-extern "C-unwind" fn operators(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn operators(state: LuaState) -> c_int {
     let mut args = LuaArgs::new(1);
 
     let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
@@ -764,7 +764,7 @@ extern "C-unwind" fn operators(state: *mut ffi::lua_State) -> c_int {
     }
 }
 
-extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn decode(state: LuaState) -> c_int {
     laux::luaL_checkstack(state, 6, std::ptr::null());
     let result = laux::lua_into_userdata::<DatabaseResponse>(state, 1);
     match *result {
@@ -801,7 +801,7 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
                     );
                     return 1;
                 }
-                unsafe { ffi::lua_rawset(state, -3) };
+                unsafe { ffi::lua_rawset(state.as_ptr(), -3) };
             }
             1
         }
@@ -834,7 +834,7 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
                     );
                     return 1;
                 }
-                unsafe { ffi::lua_rawset(state, -3) };
+                unsafe { ffi::lua_rawset(state.as_ptr(), -3) };
             }
 
             1
@@ -916,7 +916,7 @@ extern "C-unwind" fn decode(state: *mut ffi::lua_State) -> c_int {
     }
 }
 
-extern "C-unwind" fn find_connection(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
     let name = laux::lua_get::<&str>(state, 1);
     match DATABASE_CONNECTIONSS.get(name) {
         Some(pair) => {
@@ -968,7 +968,7 @@ fn table_to_bson(table: LuaTable) -> Result<Bson, String> {
     let len = table.array_len();
     if len > 0 {
         let mut arr = Vec::with_capacity(len);
-        for val in table.array_iter(len) {
+        for val in table.array_iter() {
             arr.push(lua_to_bson(val, false)?);
         }
         return Ok(Bson::Array(arr));
@@ -1000,7 +1000,7 @@ fn lua_to_bson(value: LuaValue, is_object_id: bool) -> Result<Bson, String> {
     }
 }
 
-fn bson_to_lua(state: *mut ffi::lua_State, value: &Bson) -> Result<(), String> {
+fn bson_to_lua(state: LuaState, value: &Bson) -> Result<(), String> {
     match value {
         Bson::Double(val) => laux::lua_push(state, *val),
         Bson::String(val) => laux::lua_push(state, val.as_str()),
@@ -1008,7 +1008,7 @@ fn bson_to_lua(state: *mut ffi::lua_State, value: &Bson) -> Result<(), String> {
             laux::LuaTable::new(state, bsons.len(), 0);
             for (i, bson) in bsons.iter().enumerate() {
                 bson_to_lua(state, bson)?;
-                unsafe { ffi::lua_rawseti(state, -2, (i + 1) as ffi::lua_Integer) };
+                unsafe { ffi::lua_rawseti(state.as_ptr(), -2, (i + 1) as ffi::lua_Integer) };
             }
         }
         Bson::Document(document) => {
@@ -1016,7 +1016,7 @@ fn bson_to_lua(state: *mut ffi::lua_State, value: &Bson) -> Result<(), String> {
             for (key, value) in document {
                 laux::lua_push(state, key.as_str());
                 bson_to_lua(state, value)?;
-                unsafe { ffi::lua_rawset(state, -3) };
+                unsafe { ffi::lua_rawset(state.as_ptr(), -3) };
             }
         }
         Bson::Boolean(val) => laux::lua_push(state, *val),
@@ -1034,7 +1034,7 @@ fn bson_to_lua(state: *mut ffi::lua_State, value: &Bson) -> Result<(), String> {
     Ok(())
 }
 
-extern "C-unwind" fn tt(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn tt(state: LuaState) -> c_int {
     let table = LuaTable::from_stack(state, 1);
     let doc = table_to_doc(table).unwrap();
     let bson = Bson::Document(doc);
@@ -1042,9 +1042,7 @@ extern "C-unwind" fn tt(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-#[unsafe(no_mangle)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C-unwind" fn luaopen_mongodb(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_mongodb(state: LuaState) -> c_int {
     let l = [
         lreg!("connect", connect),
         lreg!("find_connection", find_connection),

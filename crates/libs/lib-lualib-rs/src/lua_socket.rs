@@ -2,9 +2,8 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use lib_core::{buffer::Buffer, check_buffer, context::MessageData};
 use lib_lua::{
-    self, cstr,
-    ffi::{self, luaL_Reg},
-    laux::{self, LuaType},
+    cstr, ffi,
+    laux::{self, LuaState, LuaType},
     lreg, lreg_null, luaL_newlib,
 };
 use std::net::TcpStream;
@@ -330,7 +329,7 @@ fn listen(addr: &str) -> Result<i64> {
     Ok(fd)
 }
 
-extern "C-unwind" fn lua_socket_listen(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_socket_listen(state: LuaState) -> c_int {
     let addr: &str = laux::lua_get(state, 1);
     match listen(addr) {
         Ok(fd) => {
@@ -345,7 +344,7 @@ extern "C-unwind" fn lua_socket_listen(state: *mut ffi::lua_State) -> c_int {
     }
 }
 
-extern "C-unwind" fn lua_socket_accept(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_socket_accept(state: LuaState) -> c_int {
     let fd = laux::lua_get(state, 1);
     let actor = LuaActor::from_lua_state(state);
     let owner = actor.id;
@@ -369,7 +368,7 @@ extern "C-unwind" fn lua_socket_accept(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-extern "C-unwind" fn lua_socket_read(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
     let fd = laux::lua_get(state, 1);
 
     let actor = LuaActor::from_lua_state(state);
@@ -410,7 +409,7 @@ extern "C-unwind" fn lua_socket_read(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-extern "C-unwind" fn lua_socket_write(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_socket_write(state: LuaState) -> c_int {
     let actor = LuaActor::from_lua_state(state);
 
     let fd = laux::lua_get(state, 1);
@@ -439,7 +438,7 @@ extern "C-unwind" fn lua_socket_write(state: *mut ffi::lua_State) -> c_int {
     2
 }
 
-extern "C-unwind" fn lua_socket_connect(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_socket_connect(state: LuaState) -> c_int {
     let addr: &str = laux::lua_get(state, 1);
     let connect_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(5000);
 
@@ -473,7 +472,7 @@ extern "C-unwind" fn lua_socket_connect(state: *mut ffi::lua_State) -> c_int {
     1
 }
 
-extern "C-unwind" fn lua_socket_close(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_socket_close(state: LuaState) -> c_int {
     let fd = laux::lua_get(state, 1);
 
     if let Some(channel) = NET.get(&fd) {
@@ -490,7 +489,7 @@ extern "C-unwind" fn lua_socket_close(state: *mut ffi::lua_State) -> c_int {
     0
 }
 
-extern "C-unwind" fn lua_host(state: *mut ffi::lua_State) -> c_int {
+extern "C-unwind" fn lua_host(state: LuaState) -> c_int {
     if let Ok(addr) = laux::lua_opt(state, 1).unwrap_or("1.1.1.1:80").parse() {
         if let Ok(socket) = TcpStream::connect_timeout(&addr, Duration::from_millis(1000)) {
             if let Ok(local_addr) = socket.local_addr() {
@@ -502,7 +501,7 @@ extern "C-unwind" fn lua_host(state: *mut ffi::lua_State) -> c_int {
     0
 }
 
-pub extern "C-unwind" fn luaopen_socket(state: *mut ffi::lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_socket(state: LuaState) -> c_int {
     let l = [
         lreg!("listen", lua_socket_listen),
         lreg!("accept", lua_socket_accept),
