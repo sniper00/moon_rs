@@ -164,7 +164,7 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
         proxy: laux::opt_field(state, 1, "proxy").unwrap_or_default(),
     };
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         if let Err(err) = http_request(req).await {
             CONTEXT.send_value(
                 context::PTYPE_HTTP,

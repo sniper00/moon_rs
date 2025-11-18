@@ -272,7 +272,7 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
 
     let (reader, writer) = socket.into_split();
 
-    let mut read_task = tokio::spawn(async move {
+    let mut read_task = CONTEXT.io_runtime().spawn(async move {
         let mut rx = rx_reader;
         handle_read(reader, &mut rx).await;
         let mut left = Vec::with_capacity(10);
@@ -287,7 +287,7 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
         }
     });
 
-    let mut write_task = tokio::spawn(handle_write(writer, rx_writer));
+    let mut write_task = CONTEXT.io_runtime().spawn(handle_write(writer, rx_writer));
 
     if tokio::try_join!(&mut read_task, &mut write_task).is_err() {
         read_task.abort();
@@ -304,12 +304,12 @@ fn listen(addr: &str) -> Result<i64> {
     let fd = next_net_fd();
     NET.insert(fd, NetChannel(tx.clone(), tx));
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         while let Some(op) = rx.recv().await {
             match op {
                 NetOp::Accept(owner, session) => match listener.accept().await {
                     Ok((socket, _)) => {
-                        tokio::spawn(handle_client(socket, owner, session));
+                        CONTEXT.io_runtime().spawn(handle_client(socket, owner, session));
                     }
                     Err(err) => {
                         log::warn!("accept error: {}", err);
@@ -446,7 +446,7 @@ extern "C-unwind" fn lua_socket_connect(state: LuaState) -> c_int {
     let owner = actor.id;
     let session = actor.next_session();
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         match timeout(
             Duration::from_millis(connect_timeout),
             tokio::net::TcpStream::connect(addr),
@@ -454,7 +454,7 @@ extern "C-unwind" fn lua_socket_connect(state: LuaState) -> c_int {
         .await
         {
             Ok(Ok(socket)) => {
-                tokio::spawn(async move {
+                CONTEXT.io_runtime().spawn(async move {
                     handle_client(socket, owner, session).await;
                 });
             }

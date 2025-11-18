@@ -329,7 +329,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let owner = actor.id;
     let session = actor.next_session();
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         match DatabaseState::connect(context::PTYPE_MONGODB, database_url.to_string()).await {
             Ok(state) => {
                 let (tx, rx) = mpsc::unbounded_channel();

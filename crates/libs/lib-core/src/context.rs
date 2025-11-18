@@ -13,9 +13,10 @@ use std::{
 use tokio::{
     sync::{mpsc, Mutex},
     time::timeout,
+    runtime::Builder,
 };
 
-use crate::escape_print;
+use crate::{actor::ActorSender, escape_print};
 
 use super::{actor::LuaActor, buffer::Buffer, log::Logger};
 
@@ -39,10 +40,16 @@ pub const BOOTSTRAP_ACTOR_ADDR: i64 = 1;
 static GLOBAL_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
 lazy_static! {
-    pub static ref CONTEXT: LuaActorServer = {
+    pub static ref CONTEXT: Context = {
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
 
-        LuaActorServer {
+        let io_runtime = Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_time()
+            .enable_io()
+            .build();
+
+        Context {
             actor_uuid: AtomicI64::new(1),
             actor_counter: AtomicU32::new(0),
             exit_code: AtomicI32::new(i32::MAX),
@@ -55,6 +62,7 @@ lazy_static! {
             timer_rx: Mutex::new(timer_rx),
             now: Utc::now(),
             time_offset: AtomicU64::new(0),
+            io_runtime: io_runtime.expect("Init tokio runtime failed"),
         }
     };
     pub static ref LOGGER: Logger = Logger::new();
@@ -107,11 +115,11 @@ struct Monitor {
     to: i64,
 }
 
-pub struct LuaActorServer {
+pub struct Context {
     actor_uuid: AtomicI64,
     actor_counter: AtomicU32,
     exit_code: AtomicI32,
-    actors: DashMap<i64, mpsc::UnboundedSender<Message>>,
+    actors: DashMap<i64, ActorSender>,
     unique_actors: DashMap<String, i64>,
     clock: Instant,
     env: DashMap<String, Arc<String>>,
@@ -119,14 +127,15 @@ pub struct LuaActorServer {
     timer_tx: mpsc::UnboundedSender<Timer>,
     timer_rx: Mutex<mpsc::UnboundedReceiver<Timer>>,
     now: DateTime<Utc>,
-    time_offset: AtomicU64
+    time_offset: AtomicU64,
+    io_runtime: tokio::runtime::Runtime,
 }
 
-impl LuaActorServer {
+impl Context {
     pub fn add_actor(
         &self,
         actor: &mut LuaActor,
-        tx: mpsc::UnboundedSender<Message>,
+        tx: ActorSender,
     ) -> Result<(), String> {
         self.actor_counter.fetch_add(1, Ordering::AcqRel);
         self.actors.insert(actor.id, tx);
@@ -139,7 +148,7 @@ impl LuaActorServer {
         Ok(())
     }
 
-    pub fn remove(&self, id: i64) -> Option<(i64, mpsc::UnboundedSender<Message>)> {
+    pub fn remove(&self, id: i64) -> Option<(i64, ActorSender)> {
         self.actors.remove(&id)
     }
 
@@ -222,7 +231,7 @@ impl LuaActorServer {
         //log::info!("send message: from {:?} to {} ptype {} session {}", msg.from, msg.to, msg.ptype, msg.session);
         if let Some(addr) = self.actors.get(&msg.to) {
             if let Err(err) = addr.value().send(msg) {
-                return Some(err.0);
+                return Some(err);
             } else {
                 return None;
             }
@@ -311,6 +320,10 @@ impl LuaActorServer {
                 });
             }
         });
+    }
+
+    pub fn io_runtime(&self) -> &tokio::runtime::Runtime {
+        &self.io_runtime
     }
 }
 

@@ -1,8 +1,8 @@
 use crate::{lua_require, luaopen_custom_libs, not_null_wrapper};
 use lib_core::{
-    actor::LuaActor,
+    actor::{ActorReceiver, ActorSender, LuaActor, unbounded_channel},
     check_buffer,
-    context::{self, LuaActorParam, Message, MessageData, CONTEXT, LOGGER},
+    context::{self, CONTEXT, LOGGER, LuaActorParam, Message, MessageData},
     log::Logger,
 };
 use lib_lua::{
@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use std::{
     alloc::{self, Layout},
-    ffi::{c_char, c_int, c_void, CString},
+    ffi::{CString, c_char, c_int, c_void},
     ops::Deref,
     slice,
 };
@@ -126,62 +126,112 @@ extern "C-unwind" fn allocator(
     }
 }
 
-pub fn new_actor(params: LuaActorParam) {
-    tokio::spawn(async move {
-        match init(&params) {
-            Ok(mut actor) => {
-                log::info!(
-                    "{0:08X}| Actor id:{0:?} name:{1:?} started. ({2}:{3})",
-                    actor.id,
-                    actor.name,
-                    file!(),
-                    line!()
-                );
+async fn init_actor(params: &LuaActorParam, tx: ActorSender, mut rx: ActorReceiver) {
+    match init(&params, tx) {
+        Ok(mut actor) => {
+            log::info!(
+                "{0:08X}| Actor id:{0:?} name:{1:?} started. ({2}:{3})",
+                actor.id,
+                actor.name,
+                file!(),
+                line!()
+            );
 
-                if params.creator != 0 {
-                    CONTEXT.send(Message {
-                        ptype: context::PTYPE_INTEGER,
-                        from: actor.id,
-                        to: params.creator,
-                        session: params.session,
-                        data: MessageData::ISize(actor.id as isize),
-                    });
-                }
-
-                while let Some(m) = actor.rx.recv().await {
-                    CONTEXT.update_monitor(m.ptype, CONTEXT.clock(), m.from, actor.id);
-                    handle(&mut actor, m);
-                    CONTEXT.update_monitor(0, 0.0, 0, 0);
-                }
-
-                log::info!(
-                    "{0:08X}| Actor id:{0:?} name:{1:?} stoped. ({2}:{3})",
-                    actor.id,
-                    actor.name,
-                    file!(),
-                    line!()
-                );
+            if params.creator != 0 {
+                CONTEXT.send(Message {
+                    ptype: context::PTYPE_INTEGER,
+                    from: actor.id,
+                    to: params.creator,
+                    session: params.session,
+                    data: MessageData::ISize(actor.id as isize),
+                });
             }
-            Err(err) => {
-                if params.creator != 0 {
-                    CONTEXT.send(Message {
-                        ptype: context::PTYPE_INTEGER,
-                        from: params.id,
-                        to: params.creator,
-                        session: params.session,
-                        data: MessageData::ISize(0),
-                    });
+
+            fn handle_(actor: &mut LuaActor, m: &mut Message, rx: &mut ActorReceiver) -> bool {
+                if m.ptype != context::PTYPE_QUIT {
+                    CONTEXT.update_monitor(m.ptype, CONTEXT.clock(), m.from, actor.id);
+                    handle(actor, m);
+                    CONTEXT.update_monitor(0, 0.0, 0, 0);
+                    true
+                } else {
+                    if actor.id == context::BOOTSTRAP_ACTOR_ADDR {
+                        CONTEXT.shutdown(0);
+                    }
+                    actor.ok = false;
+
+                    let err = "actor quited";
+                    while let Some(m) = rx.try_recv() {
+                        CONTEXT.response_error(m.to, m.from, m.session, err.to_string());
+                    }
+
+                    log::info!(
+                        "{0:08X}| Actor id:{0:?} name:{1:?} stoped. ({2}:{3})",
+                        actor.id,
+                        actor.name,
+                        file!(),
+                        line!()
+                    );
+                    false
                 }
-                log::error!("Create actor failed: {}. ({}:{})", err, file!(), line!());
+            }
+
+            if params.unique {
+                tokio::task::spawn_blocking(move || {
+                    loop {
+                        let mut m = rx.recv();
+                        if !handle_(&mut actor, &mut m, &mut rx) {
+                            return;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                while let Some(mut m) = rx.async_recv().await {
+                    if !handle_(&mut actor, &mut m, &mut rx) {
+                        break;
+                    }
+                }
             }
         }
-        CONTEXT.remove_actor(params.id, params.unique);
+        Err(err) => {
+            if params.creator != 0 {
+                CONTEXT.send(Message {
+                    ptype: context::PTYPE_INTEGER,
+                    from: params.id,
+                    to: params.creator,
+                    session: params.session,
+                    data: MessageData::ISize(0),
+                });
+            }
+            log::error!("Create actor failed: {}. ({}:{})", err, file!(), line!());
+        }
+    }
+    CONTEXT.remove_actor(params.id, params.unique);
+}
+
+pub fn new_actor(params: LuaActorParam) {
+    let (tx, rx) = if params.unique {
+        let (tx, rx) = unbounded_channel();
+        (
+            ActorSender::ThreadSender(tx),
+            ActorReceiver::ThreadReceiver(rx),
+        )
+    } else {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            ActorSender::TokioSender(tx),
+            ActorReceiver::TokioReceiver(rx),
+        )
+    };
+
+    tokio::spawn(async move {
+        init_actor(&params, tx, rx).await;
     });
 }
 
-pub fn init(params: &LuaActorParam) -> Result<Box<LuaActor>, String> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let mut actor = Box::new(LuaActor::new(params, rx));
+pub fn init(params: &LuaActorParam, tx: ActorSender) -> Result<Box<LuaActor>, String> {
+    let mut actor = Box::new(LuaActor::new(params));
     CONTEXT.add_actor(&mut actor, tx)?;
 
     //log::info!("init actor id: {} name: {}", id, params.name);
@@ -226,28 +276,13 @@ pub fn init(params: &LuaActorParam) -> Result<Box<LuaActor>, String> {
     Ok(actor)
 }
 
-fn handle(actor: &mut LuaActor, mut m: Message) {
+fn handle(actor: &mut LuaActor, m: &mut Message) {
     if !actor.ok {
         return;
     }
 
     debug_assert!(!actor.callback_state.0.is_null(), "moon_rs not initialized");
     let callback_state = actor.callback_state.0;
-
-    if m.ptype == context::PTYPE_QUIT {
-        if actor.id == context::BOOTSTRAP_ACTOR_ADDR {
-            CONTEXT.shutdown(0);
-        }
-        actor.ok = false;
-
-        let err = "actor quited";
-
-        while let Ok(m) = actor.rx.try_recv() {
-            CONTEXT.response_error(m.to, m.from, m.session, err.to_string());
-        }
-        actor.rx.close();
-        return;
-    }
 
     unsafe {
         let trace = 1;
@@ -272,7 +307,7 @@ fn handle(actor: &mut LuaActor, mut m: Message) {
             }
         }
 
-        ffi::lua_pushlightuserdata(callback_state, &mut m as *mut Message as *mut c_void);
+        ffi::lua_pushlightuserdata(callback_state, m as *mut Message as *mut c_void);
 
         let r = ffi::lua_pcall(callback_state, 6, 0, trace);
         if r == ffi::LUA_OK {

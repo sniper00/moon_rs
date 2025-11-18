@@ -297,7 +297,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let session = actor.next_session();
     let protocol_type = context::PTYPE_SQLX;
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         match DatabasePool::connect(database_url, Duration::from_millis(connect_timeout)).await {
             Ok(pool) => {
                 let (tx, rx) = mpsc::channel(100);
