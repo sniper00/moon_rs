@@ -13,7 +13,6 @@ use lib_lua::{
 };
 use tokio::sync::mpsc;
 
-use crate::lua_utils;
 use std::{
     alloc::{self, Layout},
     ffi::{c_char, c_int, c_void, CString},
@@ -25,7 +24,7 @@ extern "C-unwind" fn lua_actor_protect_init(state: LuaState) -> c_int {
     unsafe {
         let param = ffi::lua_touserdata(state.as_ptr(), 1) as *mut LuaActorParam;
         if param.is_null() {
-            ffi::luaL_error(state.as_ptr(), cstr!("invalid param"));
+            laux::lua_error(state, "invalid param".to_string());
         }
 
         ffi::luaL_openlibs(state.as_ptr());
@@ -348,7 +347,7 @@ extern "C-unwind" fn lua_actor_query(state: LuaState) -> c_int {
 extern "C-unwind" fn lua_actor_send(state: LuaState) -> c_int {
     let ptype = laux::lua_get(state, 1);
 
-    if ptype <= 0 {
+    if ptype == 0 {
         laux::lua_arg_error(state, 1, cstr!("PTYPE must > 0"));
     }
 
@@ -636,7 +635,7 @@ extern "C-unwind" fn lua_message_decode(state: LuaState) -> c_int {
                 }
             }
             _ => {
-                laux::lua_error(state, format!("invalid format option '{0}'", c).as_str());
+                laux::lua_error(state, format!("invalid format option '{0}'", c));
             }
         }
     }
@@ -664,11 +663,6 @@ unsafe extern "C-unwind" fn luaopen_core(state: LuaState) -> c_int {
         lreg!("clock", clock),
         lreg!("tostring", tostring),
         lreg!("next_session", next_session),
-        lreg!("num_cpus", lua_utils::num_cpus),
-        lreg!("hash", lua_utils::hash),
-        lreg!("thread_sleep", lua_utils::thread_sleep),
-        lreg!("base64_encode", lua_utils::base64_encode),
-        lreg!("base64_decode", lua_utils::base64_decode),
         lreg_null!(),
     ];
 

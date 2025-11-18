@@ -1,7 +1,8 @@
-use base64::{engine, Engine};
+use base64::{Engine, engine};
 use lib_lua::{
-    self,
+    self, cstr, ffi,
     laux::{self, LuaState},
+    lreg, lreg_null, luaL_newlib,
 };
 use sha2::digest::DynDigest;
 use std::{ffi::c_int, time::Duration};
@@ -49,10 +50,7 @@ pub extern "C-unwind" fn hash(state: LuaState) -> c_int {
         return 1;
     }
 
-    laux::lua_error(
-        state,
-        format!("unsupported hasher {}", hasher_type).as_str(),
-    );
+    laux::lua_error(state, format!("unsupported hasher {}", hasher_type));
 }
 
 pub extern "C-unwind" fn thread_sleep(state: LuaState) -> c_int {
@@ -77,5 +75,19 @@ pub extern "C-unwind" fn base64_decode(state: LuaState) -> c_int {
         laux::throw_error(state);
     }
     laux::lua_push(state, data.unwrap().as_slice());
+    1
+}
+
+pub extern "C-unwind" fn luaopen_utils(state: LuaState) -> c_int {
+    let l = [
+        lreg!("num_cpus", num_cpus),
+        lreg!("hash", hash),
+        lreg!("thread_sleep", thread_sleep),
+        lreg!("base64_encode", base64_encode),
+        lreg!("base64_decode", base64_decode),
+        lreg_null!(),
+    ];
+
+    luaL_newlib!(state, l);
     1
 }

@@ -11,7 +11,7 @@ use lib_core::buffer::{self, Buffer};
 const MAX_DEPTH: i32 = 32;
 
 fn concat_table(writer: &mut Buffer, table: LuaTable, depth: i32) -> Result<(), String> {
-    laux::luaL_checkstack(table.lua_state(), ffi::LUA_MINSTACK, std::ptr::null());
+    laux::lua_checkstack(table.lua_state(), ffi::LUA_MINSTACK, std::ptr::null());
 
     for val in table.array_iter() {
         concat_one(writer, val, depth)?;
@@ -156,7 +156,7 @@ extern "C-unwind" fn unpack(state: LuaState) -> c_int {
                     laux::lua_push(state, buf.as_slice());
                 }
                 _ => {
-                    laux::lua_error(state, format!("invalid format option '{0}'", c).as_str());
+                    laux::lua_error(state, format!("invalid format option '{0}'", c));
                 }
             }
         }
@@ -219,7 +219,7 @@ extern "C-unwind" fn write_front(state: LuaState) -> c_int {
     for i in (2..=top).rev() {
         let s = laux::lua_get::<&[u8]>(state, i);
         if !buf.write_front(s) {
-            laux::lua_error(state, "no more front space");
+            laux::lua_error(state, "no more front space".to_string());
         }
     }
     0

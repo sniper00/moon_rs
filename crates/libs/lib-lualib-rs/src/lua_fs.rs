@@ -13,12 +13,12 @@ fn listdir(res: &LuaTable, path: &Path, idx: &mut usize, ext: Option<&str>) {
             if strpath.ends_with(ext) {
                 laux::lua_push(res.lua_state(), strpath);
                 *idx += 1;
-                res.seti(*idx);
+                res.rawseti(*idx);
             }
         } else {
             laux::lua_push(res.lua_state(), strpath);
             *idx += 1;
-            res.seti(*idx);
+            res.rawseti(*idx);
         }
     }
 }
@@ -40,7 +40,7 @@ extern "C-unwind" fn lfs_listdir(state: LuaState) -> c_int {
             1
         }
         Err(err) => {
-            laux::lua_error(state, format!("listdir '{}' error: {}", path, err).as_str());
+            laux::lua_error(state, format!("listdir '{}' error: {}", path, err));
         },
     }
 }
@@ -50,7 +50,7 @@ extern "C-unwind" fn lfs_mkdir(state: LuaState) -> c_int {
     if fs::create_dir_all(path).is_ok() {
         laux::lua_push(state, true);
     } else {
-        laux::lua_error(state, format!("mkdir '{}' error", path).as_str());
+        laux::lua_error(state, format!("mkdir '{}' error", path));
     }
     0
 }
@@ -166,13 +166,13 @@ extern "C-unwind" fn lfs_remove(state: LuaState) -> c_int {
             laux::lua_push(state, 1);
             1
         } else {
-            laux::lua_error(state, format!("remove '{:?}' error", path).as_str());
+            laux::lua_error(state, format!("remove '{:?}' error", path));
         }
     } else if fs::remove_file(path).is_ok() {
         laux::lua_push(state, 1);
         1
     } else {
-        laux::lua_error(state, format!("remove '{:?}' error", path).as_str());
+        laux::lua_error(state, format!("remove '{:?}' error", path));
     }
 }
 

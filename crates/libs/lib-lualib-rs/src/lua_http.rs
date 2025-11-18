@@ -185,18 +185,18 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
 }
 
 extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::luaL_checkstack(state, 4, std::ptr::null());
+    laux::lua_checkstack(state, 4, std::ptr::null());
     let p_as_isize: isize = laux::lua_get(state, 1);
     let response = unsafe { Box::from_raw(p_as_isize as *mut HttpResponse) };
 
     LuaTable::new(state, 0, 6)
-        .rawset("version", version_to_string(&response.version))
-        .rawset("status_code", response.status_code)
-        .rawset("body", response.body.as_ref())
+        .insert("version", version_to_string(&response.version))
+        .insert("status_code", response.status_code)
+        .insert("body", response.body.as_ref())
         .rawset_x("headers", || {
             let headers = LuaTable::new(state, 0, response.headers.len());
             for (key, value) in response.headers.iter() {
-                headers.rawset(key.as_str(), value.to_str().unwrap_or("").trim());
+                headers.insert(key.as_str(), value.to_str().unwrap_or("").trim());
             }
         });
     1
@@ -236,7 +236,7 @@ extern "C-unwind" fn lua_http_form_urldecode(state: LuaState) -> i32 {
     let table = LuaTable::new(state, 0, decoded.len());
 
     for (key, value) in decoded {
-        table.rawset(key, value);
+        table.insert(key, value);
     }
     1
 }
@@ -274,8 +274,8 @@ extern "C-unwind" fn lua_http_parse_response(state: LuaState) -> c_int {
     };
 
     let response = LuaTable::new(state, 0, 6);
-    response.rawset("version", version);
-    response.rawset(
+    response.insert("version", version);
+    response.insert(
         "status_code",
         i32::from_str(String::from_utf8_lossy(status_code).as_ref()).unwrap_or(200),
     );
@@ -293,7 +293,7 @@ extern "C-unwind" fn lua_http_parse_response(state: LuaState) -> c_int {
                 Some(part) => String::from_utf8_lossy(part),
                 None => continue,
             };
-            headers.rawset(key.to_lowercase(), value.trim());
+            headers.insert(key.to_lowercase(), value.trim());
         }
     });
 
@@ -320,13 +320,13 @@ extern "C-unwind" fn lua_http_parse_request(state: LuaState) -> c_int {
             };
 
             LuaTable::new(state, 0, 6)
-                .rawset("method", method)
-                .rawset("path", path)
-                .rawset("query_string", query_string)
+                .insert("method", method)
+                .insert("path", path)
+                .insert("query_string", query_string)
                 .rawset_x("headers", || {
                     let headers = LuaTable::new(state, 0, req.headers.len());
                     for header in req.headers.iter() {
-                        headers.rawset(header.name.to_lowercase(), header.value);
+                        headers.insert(header.name.to_lowercase(), header.value);
                     }
                 });
             1
