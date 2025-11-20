@@ -349,7 +349,7 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
             let mut buffer = Vec::new();
             if let Err(err) = encode_table(&mut buffer, &val, 0, false, &options) {
                 drop(buffer);
-                laux::lua_error(state, &err);
+                laux::lua_error(state, err);
             }
             if buffer[0] == b'{' || buffer[0] == b'[' {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buffer.as_slice()) {
@@ -444,7 +444,7 @@ extern "C-unwind" fn push_transaction_query(state: LuaState) -> c_int {
             }
             Err(err) => {
                 drop(params);
-                laux::lua_error(state, err.as_ref());
+                laux::lua_error(state, err);
             }
         }
     }
@@ -556,29 +556,29 @@ where
             match row.try_get_raw(*index) {
                 Ok(value) => match value.type_info().name() {
                     "NULL" => {
-                        row_table.rawset(*column_name, LuaNil {});
+                        row_table.insert(*column_name, LuaNil {});
                     }
                     "BOOL" | "BOOLEAN" => {
-                        row_table.rawset(
+                        row_table.insert(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(false),
                         );
                     }
                     "INT2" | "INT4" | "INT8" | "TINYINT" | "SMALLINT" | "INT" | "MEDIUMINT"
                     | "BIGINT" | "INTEGER" => {
-                        row_table.rawset(
+                        row_table.insert(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(0),
                         );
                     }
                     "FLOAT4" | "FLOAT8" | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL" => {
-                        row_table.rawset(
+                        row_table.insert(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(0.0),
                         );
                     }
                     "TEXT" => {
-                        row_table.rawset(
+                        row_table.insert(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(""),
                         );
@@ -586,7 +586,7 @@ where
                     _ => {
                         let column_value: &[u8] =
                             sqlx::decode::Decode::decode(value).unwrap_or(b"");
-                        row_table.rawset(*column_name, column_value);
+                        row_table.insert(*column_name, column_value);
                     }
                 },
                 Err(error) => {
@@ -600,7 +600,7 @@ where
             }
         }
         i += 1;
-        table.seti(i);
+        table.rawseti(i);
     }
     Ok(1)
 }
@@ -635,7 +635,7 @@ extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
 }
 
 extern "C-unwind" fn decode(state: LuaState) -> c_int {
-    laux::luaL_checkstack(state, 6, std::ptr::null());
+    laux::lua_checkstack(state, 6, std::ptr::null());
     let result = lua_into_userdata::<DatabaseResponse>(state, 1);
 
     match *result {
@@ -717,7 +717,7 @@ extern "C-unwind" fn decode(state: LuaState) -> c_int {
 extern "C-unwind" fn stats(state: LuaState) -> c_int {
     let table = LuaTable::new(state, 0, DATABASE_CONNECTIONSS.len());
     DATABASE_CONNECTIONSS.iter().for_each(|pair| {
-        table.rawset(
+        table.insert(
             pair.key().as_str(),
             pair.value()
                 .counter

@@ -383,7 +383,7 @@ extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
     } else {
         let delim = laux::lua_get::<&[u8]>(state, 2);
         if delim.is_empty() {
-            laux::lua_error(state, "socket_read error: delim is empty");
+            laux::lua_error(state, "socket_read error: delim is empty".to_string());
         }
 
         let max_size = laux::lua_opt(state, 3).unwrap_or(0xFFFFFFFF);

@@ -48,4 +48,5 @@ pub fn luaopen_custom_libs(state: LuaState) {
     lua_require!(state, "seri", lua_seri::luaopen_seri);
     lua_require!(state, "sqlx.core", lua_sqlx::luaopen_sqlx);
     lua_require!(state, "mongodb.core", lua_mongodb::luaopen_mongodb);
+    lua_require!(state, "utils", lua_utils::luaopen_utils);
 }
