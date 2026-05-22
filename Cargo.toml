@@ -18,7 +18,7 @@ members = [
 [workspace.dependencies]
 actor = { path = "crates/libs/actor"}
 lualib = { path = "crates/libs/lualib"}
-luars = { path = "/Users/bruce/GitProjects/lua-rs/crates/luars", features = ["serde", "shared-proto"] }
+luars = { git = "https://github.com/CppCXY/lua-rs.git", features = ["serde", "shared-proto"] }
 
 mimalloc = "0.1.39"
 tokio = { version = "1", features = ["full"] }
