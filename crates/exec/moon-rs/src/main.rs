@@ -1,16 +1,12 @@
-use lib_core::{
+use actor::{
     context::{self, LuaActorParam, CONTEXT, LOGGER},
-    error::{Error, Result},
+    error::{MoonError, Result},
 };
-use lib_lua::{
-    self, cstr, ffi,
-    laux::{self, LuaState},
-};
-use lib_lualib_rs::{lua_actor, not_null_wrapper};
+use lualib::lua_actor;
+use luars::{Lua, LuaApi, LuaValue, SafeOption, Stdlib, Table};
 use mimalloc::MiMalloc;
 use std::{
     env,
-    ffi::CString,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -19,11 +15,62 @@ use std::{
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// Marker string searched in the bootstrap script to enable two-phase init.
+///
+/// When the bootstrap `.lua` file contains `_G["__init__"]` anywhere in its
+/// source, the runtime executes the script in a **temporary, isolated VM**
+/// before starting the actor system. Inside that VM the global `__init__` is
+/// set to `true` so the script can branch on it:
+///
+/// ```lua
+/// if _G["__init__"] then
+///     return { logfile = "server.log", loglevel = "info", enable_stdout = false }
+/// end
+/// -- normal actor code …
+/// ```
+///
+/// The returned table may contain:
+/// - `logfile`       – path to the log file
+/// - `loglevel`      – log level string (e.g. `"info"`, `"debug"`)
+/// - `enable_stdout` – whether to mirror logs to stdout (default `true`)
+/// - `path`          – extra `package.path` entries for Lua `require`
+const INIT_MARKER: &str = r#"_G["__init__"]"#;
+
 fn print_usage() {
     println!("Usage:");
     println!("    moon_rs script.lua [args]\n");
     println!("Examples:");
     println!("    moon_rs main.lua hello\n");
+}
+
+#[cfg(target_os = "windows")]
+type Dword = u32;
+
+#[cfg(target_os = "windows")]
+type ConsoleHandlerRoutine = extern "system" fn(Dword) -> i32;
+
+#[cfg(target_os = "windows")]
+fn set_console_title(title: *const i8) {
+    unsafe extern "system" {
+        fn SetConsoleTitleA(title: *const i8) -> i32;
+    }
+
+    if title.is_null() {
+        return;
+    }
+
+    unsafe {
+        SetConsoleTitleA(title);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_console_ctrl_handler(handler: ConsoleHandlerRoutine) -> i32 {
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: ConsoleHandlerRoutine, add: i32) -> i32;
+    }
+
+    unsafe { SetConsoleCtrlHandler(handler, 1) }
 }
 
 fn setup_signal() {
@@ -61,11 +108,11 @@ fn setup_signal() {
 
     #[cfg(target_os = "windows")]
     {
-        extern "system" fn console_ctrl_handler(ctrl_type: lib_common::DWORD) -> i32 {
-            const CTRL_C_EVENT: lib_common::DWORD = 0;
-            const CTRL_CLOSE_EVENT: lib_common::DWORD = 2;
-            const CTRL_LOGOFF_EVENT: lib_common::DWORD = 5;
-            const CTRL_SHUTDOWN_EVENT: lib_common::DWORD = 6;
+        extern "system" fn console_ctrl_handler(ctrl_type: Dword) -> i32 {
+            const CTRL_C_EVENT: Dword = 0;
+            const CTRL_CLOSE_EVENT: Dword = 2;
+            const CTRL_LOGOFF_EVENT: Dword = 5;
+            const CTRL_SHUTDOWN_EVENT: Dword = 6;
 
             match ctrl_type {
                 CTRL_C_EVENT => {
@@ -88,7 +135,7 @@ fn setup_signal() {
             }
         }
 
-        lib_common::set_concole_ctrl_handler(console_ctrl_handler);
+        set_console_ctrl_handler(console_ctrl_handler);
         let args: Vec<String> = env::args().collect();
         let mut title = String::new();
         for (i, arg) in args.iter().enumerate() {
@@ -102,17 +149,13 @@ fn setup_signal() {
         }
 
         let cstr = std::ffi::CString::new(title).expect("CString::new failed");
-        lib_common::set_console_title(cstr.as_ptr());
+        set_console_title(cstr.as_ptr());
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     setup_signal();
-
-    unsafe {
-        ffi::luaL_initcodecache();
-    }
 
     let mut enable_stdout = true;
     let mut loglevel = String::new();
@@ -122,14 +165,14 @@ async fn main() -> Result<()> {
     let mut argn = 1;
     if args.len() <= argn {
         print_usage();
-        return Err(Error::Custom("invalid arguments".to_string()));
+        return Err(MoonError::Custom("invalid arguments".to_string()));
     }
 
     let mut bootstrap = args[argn].clone();
     let path = Path::new(&bootstrap);
     if !path.is_file() {
         print_usage();
-        return Err(Error::Custom(format!(
+        return Err(MoonError::Custom(format!(
             "bootstrap file not found: {}",
             bootstrap
         )));
@@ -137,7 +180,7 @@ async fn main() -> Result<()> {
 
     if path.extension().and_then(std::ffi::OsStr::to_str) != Some("lua") {
         print_usage();
-        return Err(Error::Custom(format!(
+        return Err(MoonError::Custom(format!(
             "bootstrap is not a lua file: {}",
             bootstrap
         )));
@@ -153,67 +196,42 @@ async fn main() -> Result<()> {
     arg.push('}');
 
     let contents = fs::read_to_string(&bootstrap)?;
-    if contents.starts_with("---__init__---") {
-        //has init options
-        unsafe {
-            let lua = LuaState::new(ffi::luaL_newstate());
-            let lua_state = lua.unwrap();
-            ffi::luaL_openlibs(lua_state.as_ptr());
-            ffi::lua_pushboolean(lua_state.as_ptr(), 1);
-            ffi::lua_setglobal(lua_state.as_ptr(), cstr!("__init__"));
+    let mut lua_search_path = String::new();
 
-            ffi::lua_pushcfunction(lua_state.as_ptr(), not_null_wrapper!(laux::lua_traceback));
-            assert_eq!(ffi::lua_gettop(lua_state.as_ptr()), 1);
+    if contents.contains(INIT_MARKER) {
+        let mut vm = Lua::new(SafeOption::default());
+        vm.open_stdlib(Stdlib::All)
+            .map_err(|e| MoonError::Custom(format!("open stdlib: {}", e)))?;
 
-            if ffi::LUA_OK
-                != ffi::luaL_loadfile(
-                    lua_state.as_ptr(),
-                    CString::new(bootstrap.as_str())?.as_ptr(),
-                )
-            {
-                return Err(Error::Custom(format!(
-                    "loadfile {}",
-                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string())
-                )));
-            }
+        let state = vm.global_state_mut();
 
-            if ffi::LUA_OK
-                != ffi::luaL_dostring(lua_state.as_ptr(), CString::new(arg.as_str())?.as_ptr())
-            {
-                return Err(Error::Custom(
-                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
-                ));
-            }
+        state
+            .set_global("__init__", LuaValue::boolean(true))
+            .map_err(|e| MoonError::Custom(format!("{}", e)))?;
 
-            if ffi::LUA_OK != ffi::lua_pcall(lua_state.as_ptr(), 1, 1, 1) {
-                return Err(Error::Custom(
-                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
-                ));
-            }
+        let _arg_results = vm
+            .eval::<LuaValue>(&arg)
+            .map_err(|e| MoonError::Custom(format!("execute args: {}", e)))?;
 
-            if ffi::LUA_TTABLE != ffi::lua_type(lua_state.as_ptr(), -1) {
-                return Err(Error::Custom("init code must return a table".to_string()));
-            }
+        let result = vm
+            .load(&contents).set_name(&bootstrap).call::<_, Table>(_arg_results)
+            .map_err(|e| MoonError::Custom(format!("dofile: {}", e)))?;
 
-            logfile = laux::opt_field(lua_state, -1, "logfile");
-            enable_stdout = laux::opt_field(lua_state, -1, "enable_stdout").unwrap_or(true);
-            loglevel = laux::opt_field(lua_state, -1, "loglevel").unwrap_or_default();
-            let mut path: String = laux::opt_field(lua_state, -1, "path").unwrap_or_default();
-            if !path.is_empty() {
-                path = format!("package.path='{};'..package.path;", path);
-                CONTEXT.set_env("PATH", path.as_ref());
-            }
-        }
+        logfile = Some(result.get::<String>("logfile").unwrap_or_default());
+        enable_stdout = result.get::<bool>("enable_stdout").unwrap_or(true);
+        loglevel = result.get::<String>("loglevel").unwrap_or_default();
+        lua_search_path = result.get::<String>("path").unwrap_or_default();
     }
 
-    if CONTEXT.get_env("PATH").is_none() {
+    if !lua_search_path.contains("lualib/?.lua") {
         let mut search_path = env::current_dir()?.canonicalize()?;
         if !search_path.join("lualib").is_dir() {
-            search_path = env::current_exe()?.canonicalize()?.join("lualib");
+            search_path = env::current_exe()?.canonicalize()?
+                .parent().unwrap_or(Path::new(".")).to_path_buf();
         }
 
-        if !search_path.is_dir() {
-            return Err(Error::Custom(format!(
+        if !search_path.join("lualib").is_dir() {
+            return Err(MoonError::Custom(format!(
                 "lualib dir not found: {}",
                 search_path.to_str().unwrap_or("")
             )));
@@ -224,14 +242,18 @@ async fn main() -> Result<()> {
         }
 
         let strpath = search_path.to_string_lossy().replace('\\', "/");
-        //Lualib directories are added to the lua search path
-        let package_path = format!("package.path='{}/lualib/?.lua;'..package.path;", strpath);
-
-        CONTEXT.set_env("PATH", package_path.as_ref());
+        if !lua_search_path.is_empty() && !lua_search_path.ends_with(';') {
+            lua_search_path.push(';');
+        }
+        lua_search_path.push_str(&format!("{}/lualib/?.lua;", strpath));
     }
 
+    CONTEXT.set_env(
+        "PATH",
+        &format!("package.path='{};'..package.path;", lua_search_path),
+    );
+
     let cwd = path.parent().unwrap_or(Path::new("./"));
-    //Change the working directory to the directory where the opened file is located.
     env::set_current_dir(cwd)?;
 
     bootstrap = path
@@ -244,7 +266,7 @@ async fn main() -> Result<()> {
     CONTEXT.set_env("ARG", &arg);
 
     if let Err(err) = LOGGER.setup_logger(enable_stdout, logfile, loglevel) {
-        return Err(Error::Custom(err.to_string()));
+        return Err(MoonError::Custom(err.to_string()));
     }
 
     let package_path = CONTEXT.get_env("PATH").unwrap_or_default();

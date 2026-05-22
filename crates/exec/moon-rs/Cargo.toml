@@ -6,10 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-lib-core = { workspace = true }
-lib-lualib-rs = { workspace = true }
-lib-lua ={ workspace = true }
-lib-common = { workspace = true }
+actor = { workspace = true }
+lualib = { workspace = true }
+luars = { workspace = true }
 mimalloc = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
