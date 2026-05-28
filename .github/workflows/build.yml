@@ -28,10 +28,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
           profile: minimal
@@ -63,7 +63,7 @@ jobs:
             tar -czf "${{ matrix.archive-name }}" README.md moon_rs lualib assets
           fi
       - name: Upload archive
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.archive-name }}
           path: archive/${{ matrix.archive-name }}
