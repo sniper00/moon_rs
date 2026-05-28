@@ -12,7 +12,8 @@ if conf and conf.slave then
     end
 else
     moon.async(function()
-        while true do
+        local count = 0
+        while count < 100000 do
             moon.new_service( {
                 name = "create_service",
                 source = "benchmark_create_service.lua",
@@ -20,6 +21,7 @@ else
                 slave = true,
                 auto_quit = true
             })
+            count = count + 1
         end
     end)
 end

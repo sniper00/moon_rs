@@ -1,11 +1,11 @@
 use crate::lua_json::{JsonOptions, encode_table};
 use crate::{
     lua_check_str,
-    lua_check_typed_lightuserdata_mut,
-    lua_check_typed_lightuserdata_ref,
+    lua_check_userdata,
+    lua_check_userdata_mut,
+    lua_newuserdata,
     lua_take_typed_lightuserdata,
     lua_opt_integer,
-    lua_push_error,
     push_error_table,
     push_message_table,
 };
@@ -14,17 +14,14 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use phf::phf_map;
 use actor::context::{self, CONTEXT};
-use luars::{LuaResult, LuaState, LuaValue};
+use luars::{CFunction, LuaResult, LuaState, LuaValue};
 use sqlx::{
-    self, Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite,
-    SqlitePool, TypeInfo,
+    self, Column, ColumnIndex, Database, MySqlPool, PgPool, Row, Sqlite,
+    SqlitePool, TypeInfo, ValueRef,
     migrate::MigrateDatabase,
-    mysql::MySqlRow,
-    postgres::{PgPoolOptions, PgRow},
-    sqlite::SqliteRow,
+    postgres::PgPoolOptions,
 };
 use std::{
-    ffi::c_void,
     sync::{Arc, atomic::AtomicI64},
     time::Duration,
 };
@@ -34,10 +31,152 @@ lazy_static! {
     static ref DATABASE_CONNECTIONS: DashMap<String, DatabaseConnection> = DashMap::new();
 }
 
+enum CellValue {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+struct QueryResult {
+    columns: Vec<String>,
+    rows: Vec<Vec<CellValue>>,
+}
+
 enum DatabasePool {
     MySql(MySqlPool),
     Postgres(PgPool),
     Sqlite(SqlitePool),
+}
+
+fn make_query<DB: sqlx::Database>(
+    sql: &str,
+    binds: &[QueryParams],
+) -> Result<sqlx::query::Query<'static, DB, <DB as sqlx::Database>::Arguments>, sqlx::Error>
+where
+    for<'a> bool: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+    for<'a> i64: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+    for<'a> f64: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+    for<'a> String: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+    for<'a> serde_json::Value: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+    for<'a> Vec<u8>: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+{
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()));
+    for bind in binds {
+        query = match bind {
+            QueryParams::Bool(value) => query.bind(*value),
+            QueryParams::Int(value) => query.bind(*value),
+            QueryParams::Float(value) => query.bind(*value),
+            QueryParams::Text(value) => query.bind(value),
+            QueryParams::Json(value) => query.bind(value),
+            QueryParams::Bytes(value) => query.bind(value),
+        };
+    }
+    Ok(query)
+}
+
+fn decode_rows<'a, DB>(rows: &'a [<DB as Database>::Row]) -> QueryResult
+where
+    DB: sqlx::Database,
+    usize: ColumnIndex<<DB as Database>::Row>,
+    bool: sqlx::Decode<'a, DB>,
+    i64: sqlx::Decode<'a, DB>,
+    f32: sqlx::Decode<'a, DB>,
+    f64: sqlx::Decode<'a, DB>,
+    &'a str: sqlx::Decode<'a, DB>,
+    &'a [u8]: sqlx::Decode<'a, DB>,
+    chrono::NaiveDate: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    chrono::NaiveTime: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    chrono::NaiveDateTime: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    chrono::DateTime<chrono::Utc>: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    uuid::Uuid: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    serde_json::Value: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+{
+    if rows.is_empty() {
+        return QueryResult { columns: Vec::new(), rows: Vec::new() };
+    }
+
+    let first = rows.first().unwrap();
+    let col_info: Vec<(usize, DbType)> = first
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, DbType::from_name(c.type_info().name())))
+        .collect();
+    let columns: Vec<String> = first.columns().iter().map(|c| c.name().to_string()).collect();
+
+    let decoded_rows = rows.iter().map(|row| {
+        col_info.iter().map(|(index, db_type)| {
+            match row.try_get_raw(*index) {
+                Ok(value) if value.is_null() => CellValue::Null,
+                Ok(value) => match db_type {
+                    DbType::Null => CellValue::Null,
+                    DbType::Bool => CellValue::Bool(
+                        sqlx::decode::Decode::decode(value).unwrap_or(false),
+                    ),
+                    DbType::Integer => CellValue::Integer(
+                        sqlx::decode::Decode::decode(value).unwrap_or(0),
+                    ),
+                    DbType::Float32 => {
+                        let v: f32 = sqlx::decode::Decode::decode(value).unwrap_or(0.0);
+                        CellValue::Float(v as f64)
+                    }
+                    DbType::Float64 => CellValue::Float(
+                        sqlx::decode::Decode::decode(value).unwrap_or(0.0),
+                    ),
+                    DbType::Text => {
+                        let v: &str = sqlx::decode::Decode::decode(value).unwrap_or("");
+                        CellValue::Text(v.to_string())
+                    }
+                    DbType::Json => {
+                        match <serde_json::Value as sqlx::Decode<DB>>::decode(value) {
+                            Ok(v) => CellValue::Text(v.to_string()),
+                            Err(_) => CellValue::Null,
+                        }
+                    }
+                    DbType::Date => {
+                        match <chrono::NaiveDate as sqlx::Decode<DB>>::decode(value) {
+                            Ok(v) => CellValue::Text(v.to_string()),
+                            Err(_) => CellValue::Null,
+                        }
+                    }
+                    DbType::Time => {
+                        match <chrono::NaiveTime as sqlx::Decode<DB>>::decode(value) {
+                            Ok(v) => CellValue::Text(v.to_string()),
+                            Err(_) => CellValue::Null,
+                        }
+                    }
+                    DbType::Timestamp => {
+                        match <chrono::NaiveDateTime as sqlx::Decode<DB>>::decode(value) {
+                            Ok(v) => CellValue::Text(v.to_string()),
+                            Err(_) => CellValue::Null,
+                        }
+                    }
+                    DbType::TimestampTz => {
+                        match <chrono::DateTime<chrono::Utc> as sqlx::Decode<DB>>::decode(value) {
+                            Ok(v) => CellValue::Text(v.to_string()),
+                            Err(_) => CellValue::Null,
+                        }
+                    }
+                    DbType::Uuid => {
+                        match <uuid::Uuid as sqlx::Decode<DB>>::decode(value) {
+                            Ok(v) => CellValue::Text(v.to_string()),
+                            Err(_) => CellValue::Null,
+                        }
+                    }
+                    DbType::Unknown => {
+                        let v: &[u8] = sqlx::decode::Decode::decode(value).unwrap_or(b"");
+                        CellValue::Bytes(v.to_vec())
+                    }
+                },
+                Err(_) => CellValue::Null,
+            }
+        }).collect()
+    }).collect();
+
+    QueryResult { columns, rows: decoded_rows }
 }
 
 impl DatabasePool {
@@ -84,49 +223,18 @@ impl DatabasePool {
         }
     }
 
-    fn make_query<'a, DB: sqlx::Database>(
-        sql: &'a str,
-        binds: &'a [QueryParams],
-    ) -> Result<sqlx::query::Query<'a, DB, <DB as sqlx::Database>::Arguments<'a>>, sqlx::Error>
-    where
-        bool: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        i64: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        f64: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        &'a str: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        serde_json::Value: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        &'a Vec<u8>: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-    {
-        let mut query = sqlx::query(sql);
-        for bind in binds {
-            query = match bind {
-                QueryParams::Bool(value) => query.bind(*value),
-                QueryParams::Int(value) => query.bind(*value),
-                QueryParams::Float(value) => query.bind(*value),
-                QueryParams::Text(value) => query.bind(value.as_str()),
-                QueryParams::Json(value) => query.bind(value),
-                QueryParams::Bytes(value) => query.bind(value),
-            };
-        }
-        Ok(query)
-    }
-
     async fn query(&self, request: &DatabaseQuery) -> Result<DatabaseResponse, sqlx::Error> {
+        macro_rules! do_query {
+            ($pool:expr, $db:ty) => {{
+                let query = make_query(&request.sql, &request.binds)?;
+                let rows = query.fetch_all($pool).await?;
+                Ok(DatabaseResponse::Rows(decode_rows::<$db>(&rows)))
+            }};
+        }
         match self {
-            DatabasePool::MySql(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResponse::MysqlRows(rows))
-            }
-            DatabasePool::Postgres(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResponse::PgRows(rows))
-            }
-            DatabasePool::Sqlite(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResponse::SqliteRows(rows))
-            }
+            DatabasePool::MySql(pool) => do_query!(pool, sqlx::MySql),
+            DatabasePool::Postgres(pool) => do_query!(pool, sqlx::Postgres),
+            DatabasePool::Sqlite(pool) => do_query!(pool, sqlx::Sqlite),
         }
     }
 
@@ -134,34 +242,21 @@ impl DatabasePool {
         &self,
         requests: &[DatabaseQuery],
     ) -> Result<DatabaseResponse, sqlx::Error> {
+        macro_rules! do_transaction {
+            ($pool:expr) => {{
+                let mut tx = $pool.begin().await?;
+                for request in requests {
+                    let query = make_query(&request.sql, &request.binds)?;
+                    query.execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+                Ok(DatabaseResponse::Transaction)
+            }};
+        }
         match self {
-            DatabasePool::MySql(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
-                }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
-            }
-            DatabasePool::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
-                }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
-            }
-            DatabasePool::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
-                }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
-            }
+            DatabasePool::MySql(pool) => do_transaction!(pool),
+            DatabasePool::Postgres(pool) => do_transaction!(pool),
+            DatabasePool::Sqlite(pool) => do_transaction!(pool),
         }
     }
 }
@@ -180,9 +275,7 @@ struct DatabaseConnection {
 
 enum DatabaseResponse {
     Connect,
-    PgRows(Vec<PgRow>),
-    MysqlRows(Vec<MySqlRow>),
-    SqliteRows(Vec<SqliteRow>),
+    Rows(QueryResult),
     Error(sqlx::Error),
     Timeout(String),
     Transaction,
@@ -351,19 +444,18 @@ fn get_query_param(state: &mut LuaState, i: usize) -> Result<QueryParams, String
     } else if let Some(n) = val.as_number() {
         Ok(QueryParams::Float(n))
     } else if let Some(s) = val.as_str() {
-        let s = s.to_string();
         if s.starts_with('{') || s.starts_with('[') {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&s) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
                 Ok(QueryParams::Json(value))
             } else {
-                Ok(QueryParams::Text(s))
+                Ok(QueryParams::Text(s.to_string()))
             }
         } else {
-            Ok(QueryParams::Text(s))
+            Ok(QueryParams::Text(s.to_string()))
         }
-    } else if val.is_table() {
+    } else if let Some(t) = val.as_table() {
         let mut buffer = Vec::new();
-        encode_table(&mut buffer, state, &val.as_table().unwrap(), 0, false, &options)?;
+        encode_table(&mut buffer, state, &t, 0, false, &options)?;
         if !buffer.is_empty() && (buffer[0] == b'{' || buffer[0] == b'[') {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buffer.as_slice()) {
                 Ok(QueryParams::Json(value))
@@ -381,7 +473,7 @@ fn get_query_param(state: &mut LuaState, i: usize) -> Result<QueryParams, String
 fn query(state: &mut LuaState) -> LuaResult<usize> {
     let mut arg_idx = 1;
 
-    let conn = lua_check_typed_lightuserdata_ref::<DatabaseConnection>(state, arg_idx)?;
+    let conn = lua_check_userdata::<DatabaseConnection>(state, arg_idx)?;
     arg_idx += 1;
 
     let session: i64 = lua_opt_integer(state, arg_idx).unwrap_or(0);
@@ -421,7 +513,7 @@ fn query(state: &mut LuaState) -> LuaResult<usize> {
 }
 
 fn push_transaction_query(state: &mut LuaState) -> LuaResult<usize> {
-    let queries = lua_check_typed_lightuserdata_mut::<TransactionQueries>(state, 1)?;
+    let queries = lua_check_userdata_mut::<TransactionQueries>(state, 1)?;
 
     let sql = lua_check_str(state, 2)?.to_string();
 
@@ -443,22 +535,25 @@ fn push_transaction_query(state: &mut LuaState) -> LuaResult<usize> {
 }
 
 fn make_transaction(state: &mut LuaState) -> LuaResult<usize> {
-    let tq = Box::new(TransactionQueries { queries: Vec::new() });
-    let ptr = Box::into_raw(tq);
-    state.push_value(LuaValue::lightuserdata(ptr as *mut c_void))?;
+    static METHODS: &[(&str, CFunction)] = &[
+        ("push", push_transaction_query),
+    ];
+
+    let ud = lua_newuserdata(state, TransactionQueries { queries: Vec::new() }, "sqlx_transaction", METHODS)?;
+    state.push_value(ud)?;
     Ok(1)
 }
 
 fn transaction(state: &mut LuaState) -> LuaResult<usize> {
     let mut arg_idx = 1;
 
-    let conn = lua_check_typed_lightuserdata_ref::<DatabaseConnection>(state, arg_idx)?;
+    let conn = lua_check_userdata::<DatabaseConnection>(state, arg_idx)?;
     arg_idx += 1;
 
     let session: i64 = lua_opt_integer(state, arg_idx).unwrap_or(0);
     arg_idx += 1;
 
-    let queries = lua_check_typed_lightuserdata_mut::<TransactionQueries>(state, arg_idx)?;
+    let queries = lua_check_userdata_mut::<TransactionQueries>(state, arg_idx)?;
 
     let actor = ActorRef::from_state(state);
     let owner = actor.id();
@@ -479,7 +574,7 @@ fn transaction(state: &mut LuaState) -> LuaResult<usize> {
 }
 
 fn close(state: &mut LuaState) -> LuaResult<usize> {
-    let conn = lua_check_typed_lightuserdata_ref::<DatabaseConnection>(state, 1)?;
+    let conn = lua_check_userdata::<DatabaseConnection>(state, 1)?;
 
     match conn.tx.try_send(DatabaseRequest::Close()) {
         Ok(_) => {
@@ -495,15 +590,20 @@ enum DbType {
     Null,
     Bool,
     Integer,
-    Float,
+    Float32,
+    Float64,
     Text,
+    Json,
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Uuid,
     Unknown,
 }
 
 static DB_TYPE_MAP: phf::Map<&'static str, DbType> = phf_map! {
-    // Null
     "NULL" => DbType::Null,
-    // Bool
     "BOOL" => DbType::Bool,
     "BOOLEAN" => DbType::Bool,
     // Integer
@@ -517,95 +617,56 @@ static DB_TYPE_MAP: phf::Map<&'static str, DbType> = phf_map! {
     "BIGINT" => DbType::Integer,
     "INTEGER" => DbType::Integer,
     // Float
-    "FLOAT4" => DbType::Float,
-    "FLOAT8" => DbType::Float,
-    "NUMERIC" => DbType::Float,
-    "FLOAT" => DbType::Float,
-    "DOUBLE" => DbType::Float,
-    "REAL" => DbType::Float,
+    "FLOAT4" => DbType::Float32,
+    "REAL" => DbType::Float32,
+    "FLOAT8" => DbType::Float64,
+    "NUMERIC" => DbType::Float64,
+    "FLOAT" => DbType::Float64,
+    "DOUBLE" => DbType::Float64,
     // Text
     "TEXT" => DbType::Text,
+    "VARCHAR" => DbType::Text,
+    "CHAR" => DbType::Text,
+    "BPCHAR" => DbType::Text,
+    "NAME" => DbType::Text,
+    // JSON
+    "JSON" => DbType::Json,
+    "JSONB" => DbType::Json,
+    // Date/Time
+    "DATE" => DbType::Date,
+    "TIME" => DbType::Time,
+    "TIMETZ" => DbType::Time,
+    "TIMESTAMP" => DbType::Timestamp,
+    "DATETIME" => DbType::Timestamp,
+    "TIMESTAMPTZ" => DbType::TimestampTz,
+    // UUID
+    "UUID" => DbType::Uuid,
 };
 
 impl DbType {
-    #[inline]
     fn from_name(name: &str) -> Self {
         DB_TYPE_MAP.get(name).copied().unwrap_or(Self::Unknown)
     }
 }
 
-fn process_rows<'a, DB>(
-    state: &mut LuaState,
-    rows: &'a [<DB as Database>::Row],
-) -> LuaResult<usize>
-where
-    DB: sqlx::Database,
-    usize: ColumnIndex<<DB as Database>::Row>,
-    bool: sqlx::Decode<'a, DB>,
-    i64: sqlx::Decode<'a, DB>,
-    f64: sqlx::Decode<'a, DB>,
-    &'a str: sqlx::Decode<'a, DB>,
-    &'a [u8]: sqlx::Decode<'a, DB>,
-{
-    let table = state.create_table(rows.len(), 0)?;
-    if rows.is_empty() {
-        state.push_value(table)?;
-        return Ok(1);
-    }
+fn push_query_result(state: &mut LuaState, result: QueryResult) -> LuaResult<usize> {
+    let table = state.create_table(result.rows.len(), 0)?;
+    let col_keys: Vec<LuaValue> = result.columns.iter()
+        .map(|name| state.create_string(name))
+        .collect::<Result<_, _>>()?;
 
-    let column_info: Vec<(usize, String, DbType)> = rows
-        .first()
-        .unwrap()
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            (
-                index,
-                column.name().to_string(),
-                DbType::from_name(column.type_info().name()),
-            )
-        })
-        .collect();
-
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in result.rows.into_iter().enumerate() {
         let row_table = state.create_table(0, row.len())?;
-        for (index, column_name, db_type) in column_info.iter() {
-            let k = state.create_string(column_name)?;
-            match row.try_get_raw(*index) {
-                Ok(value) => match db_type {
-                    DbType::Null => {
-                        state.raw_set(&row_table, k, LuaValue::nil());
-                    }
-                    DbType::Bool => {
-                        let v: bool = sqlx::decode::Decode::decode(value).unwrap_or(false);
-                        state.raw_set(&row_table, k, LuaValue::boolean(v));
-                    }
-                    DbType::Integer => {
-                        let v: i64 = sqlx::decode::Decode::decode(value).unwrap_or(0);
-                        state.raw_set(&row_table, k, LuaValue::integer(v));
-                    }
-                    DbType::Float => {
-                        let v: f64 = sqlx::decode::Decode::decode(value).unwrap_or(0.0);
-                        state.raw_set(&row_table, k, LuaValue::float(v));
-                    }
-                    DbType::Text => {
-                        let v: &str = sqlx::decode::Decode::decode(value).unwrap_or("");
-                        let sv = state.create_string(v)?;
-                        state.raw_set(&row_table, k, sv);
-                    }
-                    DbType::Unknown => {
-                        let column_value: &[u8] =
-                            sqlx::decode::Decode::decode(value).unwrap_or(b"");
-                        let sv =
-                            state.create_string(&String::from_utf8_lossy(column_value))?;
-                        state.raw_set(&row_table, k, sv);
-                    }
-                },
-                Err(error) => {
-                    return lua_push_error(state, &format!("sqlx: decode error on column '{}': {}", column_name, error));
-                }
-            }
+        for (col_idx, cell) in row.into_iter().enumerate() {
+            let v = match cell {
+                CellValue::Null => continue,
+                CellValue::Bool(v) => LuaValue::boolean(v),
+                CellValue::Integer(v) => LuaValue::integer(v),
+                CellValue::Float(v) => LuaValue::float(v),
+                CellValue::Text(v) => state.create_string(&v)?,
+                CellValue::Bytes(v) => state.create_bytes(&v)?,
+            };
+            state.raw_set(&row_table, col_keys[col_idx], v);
         }
         state.raw_seti(&table, (i + 1) as i64, row_table);
     }
@@ -617,9 +678,14 @@ fn find_connection(state: &mut LuaState) -> LuaResult<usize> {
     let name = lua_check_str(state, 1)?;
     match DATABASE_CONNECTIONS.get(name) {
         Some(pair) => {
-            let conn = Box::new(pair.value().clone());
-            let ptr = Box::into_raw(conn);
-            state.push_value(LuaValue::lightuserdata(ptr as *mut c_void))?;
+            static METHODS: &[(&str, CFunction)] = &[
+                ("query", query),
+                ("transaction", transaction),
+                ("close", close),
+            ];
+
+            let ud = lua_newuserdata(state, pair.value().clone(), "sqlx_connection", METHODS)?;
+            state.push_value(ud)?;
         }
         None => {
             state.push_value(LuaValue::nil())?;
@@ -632,9 +698,7 @@ fn decode(state: &mut LuaState) -> LuaResult<usize> {
     let result = lua_take_typed_lightuserdata::<DatabaseResponse>(state, 1)?;
 
     match *result {
-        DatabaseResponse::PgRows(rows) => process_rows::<Postgres>(state, &rows),
-        DatabaseResponse::MysqlRows(rows) => process_rows::<MySql>(state, &rows),
-        DatabaseResponse::SqliteRows(rows) => process_rows::<Sqlite>(state, &rows),
+        DatabaseResponse::Rows(qr) => push_query_result(state, qr),
         DatabaseResponse::Transaction => push_message_table(state, "message", "ok"),
         DatabaseResponse::Connect => push_message_table(state, "message", "success"),
         DatabaseResponse::Error(err) => match err.as_database_error() {

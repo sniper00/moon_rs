@@ -1,24 +1,33 @@
-use luars::{LuaResult, LuaState, LuaValue};
-use std::ffi::c_void;
+use luars::{LuaRawTable, LuaResult, LuaState, LuaTable, LuaValue};
+use std::{ffi::c_void, sync::Arc};
 
 use actor::buffer::{self, Buffer};
 
-use crate::{lua_check_typed_lightuserdata_mut, lua_take_typed_lightuserdata, lua_opt_integer};
+use crate::{lua_check_typed_lightuserdata_mut, lua_check_userdata_mut, lua_opt_integer, lua_take_typed_lightuserdata};
 
 const MAX_DEPTH: i32 = 32;
 
-fn concat_table(state: &mut LuaState, writer: &mut Buffer, table: &LuaValue, depth: i32) -> Result<(), String> {
-    let t = table.as_table().ok_or("expected table")?;
-    let len = t.len();
+fn concat_table(
+    state: &mut LuaState,
+    writer: &mut Buffer,
+    table: &LuaRawTable,
+    depth: i32,
+) -> Result<(), String> {
+    let len = table.len();
     for i in 1..=len as i64 {
-        if let Some(val) = t.raw_geti(i) {
-            concat_one(state, writer, &val, depth)?;
+        if let Some(val) = table.raw_geti(i) {
+            concat_one(state, writer, val, depth)?;
         }
     }
     Ok(())
 }
 
-fn concat_one(state: &mut LuaState, writer: &mut Buffer, val: &LuaValue, depth: i32) -> Result<(), String> {
+fn concat_one(
+    state: &mut LuaState,
+    writer: &mut Buffer,
+    val: LuaValue,
+    depth: i32,
+) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Err("buffer.concat too depth table".into());
     }
@@ -36,8 +45,8 @@ fn concat_one(state: &mut LuaState, writer: &mut Buffer, val: &LuaValue, depth: 
         writer.write_slice(s.as_bytes());
     } else if let Some(s) = val.as_bytes() {
         writer.write_slice(s);
-    } else if val.is_table() {
-        concat_table(state, writer, val, depth + 1)?;
+    } else if let Some(t) = val.as_table() {
+        concat_table(state, writer, &t, depth + 1)?;
     } else {
         return Err(format!("buffer.concat unsupport type :{}", val.type_name()));
     }
@@ -51,14 +60,17 @@ fn concat(state: &mut LuaState) -> LuaResult<usize> {
         return Ok(0);
     }
 
-    let args: Vec<LuaValue> = (1..=n).filter_map(|i| state.get_arg(i)).collect();
-
+    let arg_count = state.arg_count();
     let mut buf = Box::new(Buffer::new());
-    for val in &args {
-        if let Err(err) = concat_one(state, buf.as_mut(), val, 0) {
-            return Err(state.error(err));
+    buf.commit(16);
+    for i in 1..=arg_count {
+        if let Some(val) = state.get_arg(i) {
+            if let Err(err) = concat_one(state, buf.as_mut(), val, 0) {
+                return Err(state.error(err));
+            }
         }
     }
+    buf.seek(16);
 
     state.push_value(LuaValue::lightuserdata(Box::into_raw(buf) as *mut c_void))?;
     Ok(1)
@@ -70,12 +82,13 @@ fn concat_string(state: &mut LuaState) -> LuaResult<usize> {
         return Ok(0);
     }
 
-    let args: Vec<LuaValue> = (1..=n).filter_map(|i| state.get_arg(i)).collect();
-
     let mut buf = Buffer::new();
-    for val in &args {
-        if let Err(err) = concat_one(state, &mut buf, val, 0) {
-            return Err(state.error(err));
+    let arg_count = state.arg_count();
+    for i in 1..=arg_count {
+        if let Some(val) = state.get_arg(i) {
+            if let Err(err) = concat_one(state, &mut buf, val, 0) {
+                return Err(state.error(err));
+            }
         }
     }
 
@@ -85,7 +98,19 @@ fn concat_string(state: &mut LuaState) -> LuaResult<usize> {
 }
 
 fn get_mut_buffer(state: &mut LuaState) -> LuaResult<&'static mut Buffer> {
-    lua_check_typed_lightuserdata_mut::<Buffer>(state, 1)
+    let val = state.get_arg(1).ok_or_else(|| {
+        state.error("bad argument #1 (buffer expected, got none)".to_string())
+    })?;
+    if val.is_lightuserdata() {
+        lua_check_typed_lightuserdata_mut::<Buffer>(state, 1)
+    } else if val.is_userdata() {
+        lua_check_userdata_mut::<Buffer>(state, 1)
+    } else {
+        Err(state.error(format!(
+            "bad argument #1 (buffer lightuserdata or userdata expected, got {})",
+            val.type_name()
+        )))
+    }
 }
 
 fn unpack(state: &mut LuaState) -> LuaResult<usize> {
@@ -285,6 +310,27 @@ fn clear(state: &mut LuaState) -> LuaResult<usize> {
     Ok(0)
 }
 
+fn into_arc_buffer(state: &mut LuaState) -> LuaResult<usize> {
+    let val = state.get_arg(1).ok_or_else(|| {
+        state.error("bad argument #1 (buffer lightuserdata expected, got none)".to_string())
+    })?;
+    if !val.is_lightuserdata() {
+        return Err(state.error(format!(
+            "bad argument #1 (buffer lightuserdata expected, got {})",
+            val.type_name()
+        )));
+    }
+
+    let data =  unsafe {
+        let ptr = val.as_lightuserdata().unwrap();
+        Arc::<Buffer>::from(Box::from_raw(ptr as *mut Buffer))
+    };
+
+    let ud = crate::lua_newuserdata(state, data, "shared_buffer", &[])?;
+    state.push_value(ud)?;
+    Ok(1)
+}
+
 pub fn register_buffer() -> luars::LibraryModule {
     luars::lua_module!("buffer", {
         "new" => buffer_new,
@@ -300,5 +346,6 @@ pub fn register_buffer() -> luars::LibraryModule {
         "prepare" => prepare,
         "size" => size,
         "clear" => clear,
+        "into_arc_buffer" => into_arc_buffer,
     })
 }

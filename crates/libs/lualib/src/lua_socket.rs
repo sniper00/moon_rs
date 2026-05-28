@@ -1,10 +1,10 @@
+use actor::{buffer::Buffer, context::MessageBody};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use actor::{buffer::Buffer, context::MessageBody};
 use luars::{LuaResult, LuaState, LuaValue};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
-use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::io::AsyncReadExt;
 
 use tokio::{
@@ -17,47 +17,39 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use actor::{
-    context::{self, CONTEXT, Message},
+use actor::context::{self, CONTEXT, Message};
+
+use crate::lua_actor::ActorRef;
+use crate::{
+    lua_check_arc_buffer, lua_check_integer, lua_check_str, lua_opt_boolean, lua_opt_integer, lua_opt_str, lua_push_error
 };
 
-use crate::{lua_check_integer, lua_check_str, lua_opt_boolean, lua_check_buffer, lua_opt_integer, lua_opt_str, lua_push_error};
-use crate::lua_actor::ActorRef;
+use crate::next_net_fd;
 
 lazy_static! {
     static ref NET: DashMap<i64, NetChannel> = DashMap::new();
-    static ref NET_UUID: AtomicI64 = AtomicI64::new(1);
 }
 
 #[derive(Debug)]
 pub enum NetOp {
-    Accept(i64, i64),                         //owner,session
-    ReadUntil(i64, i64, usize, Vec<u8>, u64), //owner,session,max_size
-    ReadBytes(i64, i64, usize, u64),          //owner,session,size
-    Write(i64, Box<Buffer>, bool),            //owner,data
+    Accept(i64, i64),                           //owner,session
+    ReadUntil(i64, i64, usize, Box<[u8]>, u64), //owner,session,max_size
+    ReadBytes(i64, i64, usize, u64),            //owner,session,size
+    Write(i64, Arc<Buffer>, bool),              //owner,data
     Close(),
 }
 
 pub struct NetChannel(pub mpsc::Sender<NetOp>, pub mpsc::Sender<NetOp>);
-
-fn next_net_fd() -> i64 {
-    let fd = NET_UUID.fetch_add(1, Ordering::AcqRel);
-    if fd == i64::MAX {
-        panic!("net fd overflow");
-    }
-    fd
-}
 
 async fn read_until(
     reader: &mut BufReader<OwnedReadHalf>,
     owner: i64,
     session: i64,
     max_size: usize,
-    delim: Vec<u8>,
+    delim: &[u8],
     read_timeout: u64,
 ) -> bool {
     let mut with_delim = false;
-    let mut delim = delim.as_slice();
     if delim.is_empty() || (delim[0] == b'^' && delim.len() < 2) {
         CONTEXT.response_error(
             0,
@@ -68,10 +60,12 @@ async fn read_until(
         return false;
     }
 
-    if delim[0] == b'^' {
-        delim = &delim[1..];
+    let delim = if delim[0] == b'^' {
         with_delim = true;
-    }
+        &delim[1..]
+    } else {
+        delim
+    };
 
     let mut buffer = Box::new(Buffer::with_capacity(std::cmp::min(max_size, 512)));
     loop {
@@ -104,7 +98,12 @@ async fn read_until(
             }
             Ok(_) => {
                 if buffer.len() >= max_size {
-                    CONTEXT.response_error(0, owner, -session, "socket: read size limit exceeded".to_string());
+                    CONTEXT.response_error(
+                        0,
+                        owner,
+                        -session,
+                        "socket: read size limit exceeded".to_string(),
+                    );
                     return false;
                 }
                 if buffer.as_vec().ends_with(delim.as_ref()) {
@@ -202,7 +201,16 @@ async fn handle_read(reader: OwnedReadHalf, rx: &mut mpsc::Receiver<NetOp>) {
     while let Some(op) = rx.recv().await {
         match op {
             NetOp::ReadUntil(owner, session, max_size, delim, read_timeout) => {
-                if !read_until(&mut reader, owner, session, max_size, delim, read_timeout).await {
+                if !read_until(
+                    &mut reader,
+                    owner,
+                    session,
+                    max_size,
+                    delim.as_ref(),
+                    read_timeout,
+                )
+                .await
+                {
                     return;
                 }
             }
@@ -254,6 +262,7 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
         })
         .is_some()
     {
+        NET.remove(&fd);
         return;
     }
 
@@ -264,25 +273,40 @@ async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) 
     let mut read_task = tokio::spawn(async move {
         let mut rx = rx_reader;
         handle_read(reader, &mut rx).await;
-        let mut left = Vec::with_capacity(10);
-        rx.recv_many(&mut left, 10).await;
-        for op in left {
-            match op {
-                NetOp::ReadUntil(owner, session, ..) | NetOp::ReadBytes(owner, session, ..) => {
-                    CONTEXT.response_error(0, owner, -session, "closed".to_string());
-                }
-                _ => {}
-            }
-        }
+        rx
     });
 
     let mut write_task = tokio::spawn(handle_write(writer, rx_writer));
 
-    if tokio::try_join!(&mut read_task, &mut write_task).is_err() {
-        read_task.abort();
-        write_task.abort();
-    };
-    NET.remove(&fd);
+    tokio::select! {
+        res = &mut read_task => {
+            NET.remove(&fd);
+            if let Ok(mut rx) = res {
+                while let Ok(op) = rx.try_recv() {
+                    match op {
+                        NetOp::ReadUntil(owner, session, ..) | NetOp::ReadBytes(owner, session, ..) => {
+                            CONTEXT.response_error(0, owner, -session, "closed".to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            write_task.abort();
+        }
+        _ = &mut write_task => {
+            NET.remove(&fd);
+            if let Ok(mut rx) = read_task.await {
+                while let Ok(op) = rx.try_recv() {
+                    match op {
+                        NetOp::ReadUntil(owner, session, ..) | NetOp::ReadBytes(owner, session, ..) => {
+                            CONTEXT.response_error(0, owner, -session, "closed".to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn listen(addr: &str) -> Result<i64> {
@@ -366,7 +390,7 @@ fn lua_socket_read(state: &mut LuaState) -> LuaResult<usize> {
         NetOp::ReadBytes(owner, session, max_size, read_timeout)
     } else {
         let delim = arg2
-            .and_then(|v| v.as_bytes().map(|b| b.to_vec()))
+            .and_then(|v| v.as_bytes().map(|b| Box::<[u8]>::from(b)))
             .unwrap_or_default();
         if delim.is_empty() {
             return Err(state.error("socket: read delimiter is empty".to_string()));
@@ -395,18 +419,18 @@ fn lua_socket_write(state: &mut LuaState) -> LuaResult<usize> {
     let owner_id = actor.id();
 
     let fd: i64 = lua_check_integer(state, 1)?;
-    let data = lua_check_buffer(state, 2)?; 
+    let data = lua_check_arc_buffer(state, 2)?;
     let close = lua_opt_boolean(state, 3).unwrap_or(false);
 
-    if data.is_none() {
-        return Err(state.error("bad argument #2 (string expected, got nil)".to_string()));
+    if data.is_empty() {
+        return Err(state.error("socket: write data is empty".to_string()));
     }
 
     if let Some(channel) = NET.get(&fd) {
         match channel
             .value()
             .1
-            .try_send(NetOp::Write(owner_id, data.unwrap(), close))
+            .try_send(NetOp::Write(owner_id, data, close))
         {
             Ok(_) => {
                 state.push_value(LuaValue::boolean(true))?;
@@ -442,10 +466,20 @@ fn lua_socket_connect(state: &mut LuaState) -> LuaResult<usize> {
                 });
             }
             Ok(Err(err)) => {
-                CONTEXT.response_error(0, owner, -session, format!("socket: connect failed: {}", err));
+                CONTEXT.response_error(
+                    0,
+                    owner,
+                    -session,
+                    format!("socket: connect failed: {}", err),
+                );
             }
             Err(err) => {
-                CONTEXT.response_error(0, owner, -session, format!("socket: connect timeout: {}", err));
+                CONTEXT.response_error(
+                    0,
+                    owner,
+                    -session,
+                    format!("socket: connect timeout: {}", err),
+                );
             }
         }
     });

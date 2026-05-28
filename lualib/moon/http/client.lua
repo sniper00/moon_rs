@@ -1,6 +1,6 @@
 local moon = require "moon"
 local json = require "json"
-local core = require "http.core"
+local core = require "httpc.core"
 
 moon.register_protocol {
     name = "http",

@@ -1,8 +1,8 @@
-use luars::{LuaApi, LuaResult, LuaState, LuaTable, LuaValue, LuaValueKind, Table};
+use luars::{LuaApi, LuaRawTable, LuaResult, LuaState, LuaTable, LuaValue, LuaValueKind};
 use serde_json::Value;
-use std::{cell::RefCell, ffi::c_void, fs::File, io::Read};
+use std::{ffi::c_void, fs::File, io::Read};
 
-use actor::buffer::Buffer;
+use actor::buffer::{BUFFER_HEAD_RESERVE, Buffer};
 
 use crate::{
     lua_array_size, lua_check_bytes, lua_check_integer, lua_check_str, lua_check_value,
@@ -59,66 +59,75 @@ impl Default for JsonOptions {
     }
 }
 
-thread_local! {
-    static JSON_OPTIONS: RefCell<JsonOptions> = const { RefCell::new(JsonOptions {
+const JSON_CONFIG_REGISTRY_KEY: &str = "__json_config";
+
+fn get_or_create_json_config(vm: &mut luars::GlobalState) -> LuaResult<LuaValue> {
+    if let Some(config) = vm.registry_get(JSON_CONFIG_REGISTRY_KEY)? {
+        return Ok(config);
+    }
+    let config = vm.create_any(JsonOptions {
         empty_as_array: true,
         enable_number_key: true,
         enable_sparse_array: false,
         has_metatfield: true,
         concat_buffer_size: DEFAULT_CONCAT_BUFFER_SIZE,
-    }) };
+    })?;
+    vm.registry_set(JSON_CONFIG_REGISTRY_KEY, config)?;
+    Ok(config)
 }
 
-fn with_options<F, R>(f: F) -> R
-where
-    F: FnOnce(&JsonOptions) -> R,
-{
-    JSON_OPTIONS.with(|opts| f(&opts.borrow()))
+fn fetch_json_config(state: &LuaState) -> LuaValue {
+    if let Some(frame_idx) = state.call_depth().checked_sub(1)
+        && let Some(func_val) = state.get_frame_func(frame_idx)
+        && let Some(cclosure) = func_val.as_cclosure()
+        && let Some(upvalue) = cclosure.upvalues().first()
+    {
+        return *upvalue;
+    }
+    LuaValue::nil()
 }
 
-fn with_options_mut<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut JsonOptions) -> R,
-{
-    JSON_OPTIONS.with(|opts| f(&mut opts.borrow_mut()))
+fn get_options(config: &LuaValue) -> &JsonOptions {
+    config
+        .as_userdata_mut()
+        .expect("json: config upvalue is not userdata")
+        .downcast_ref::<JsonOptions>()
+        .expect("json: config upvalue is not JsonOptions")
+}
+
+fn get_options_mut(config: &LuaValue) -> &mut JsonOptions {
+    config
+        .as_userdata_mut()
+        .expect("json: config upvalue is not userdata")
+        .downcast_mut::<JsonOptions>()
+        .expect("json: config upvalue is not JsonOptions")
 }
 
 fn set_options(state: &mut LuaState) -> LuaResult<usize> {
     let key = lua_check_str(state, 1)?;
-
     let new_val_arg = lua_opt_boolean(state, 2);
+    let config = fetch_json_config(state);
+    let opts = get_options_mut(&config);
 
     match key {
         "encode_empty_as_array" => {
-            let old = with_options_mut(|opts| {
-                let old = opts.empty_as_array;
-                opts.empty_as_array = new_val_arg.unwrap_or(true);
-                old
-            });
+            let old = opts.empty_as_array;
+            opts.empty_as_array = new_val_arg.unwrap_or(true);
             state.push_value(LuaValue::boolean(old))?;
         }
         "enable_number_key" => {
-            let old = with_options_mut(|opts| {
-                let old = opts.enable_number_key;
-                opts.enable_number_key = new_val_arg.unwrap_or(true);
-                old
-            });
+            let old = opts.enable_number_key;
+            opts.enable_number_key = new_val_arg.unwrap_or(true);
             state.push_value(LuaValue::boolean(old))?;
         }
         "enable_sparse_array" => {
-            let old = with_options_mut(|opts| {
-                let old = opts.enable_sparse_array;
-                opts.enable_sparse_array = new_val_arg.unwrap_or(false);
-                old
-            });
+            let old = opts.enable_sparse_array;
+            opts.enable_sparse_array = new_val_arg.unwrap_or(false);
             state.push_value(LuaValue::boolean(old))?;
         }
         "has_metatfield" => {
-            let old = with_options_mut(|opts| {
-                let old = opts.has_metatfield;
-                opts.has_metatfield = new_val_arg.unwrap_or(true);
-                old
-            });
+            let old = opts.has_metatfield;
+            opts.has_metatfield = new_val_arg.unwrap_or(true);
             state.push_value(LuaValue::boolean(old))?;
         }
         "concat_buffer_size" => {
@@ -129,11 +138,8 @@ fn set_options(state: &mut LuaState) -> LuaResult<usize> {
                     MIN_CONCAT_BUFFER_SIZE
                 )));
             }
-            let old = with_options_mut(|opts| {
-                let old = opts.concat_buffer_size;
-                opts.concat_buffer_size = new_size;
-                old
-            });
+            let old = opts.concat_buffer_size;
+            opts.concat_buffer_size = new_size;
             state.push_value(LuaValue::integer(old as i64))?;
         }
         _ => {
@@ -188,7 +194,7 @@ pub fn encode_one(
             writer.push(b'\"');
         }
         LuaValueKind::Table => {
-            encode_table(writer, state, val.as_table().unwrap(), depth, fmt, options)?;
+            encode_table(writer, state, &val.as_table().unwrap(), depth, fmt, options)?;
         }
         LuaValueKind::Nil => {
             writer.extend_from_slice(JSON_NULL.as_bytes());
@@ -231,7 +237,7 @@ fn format_space(writer: &mut Vec<u8>, fmt: bool, n: i32) {
 fn encode_array(
     writer: &mut Vec<u8>,
     state: &mut LuaState,
-    table: &LuaTable,
+    table: &LuaRawTable,
     size: usize,
     depth: i32,
     fmt: bool,
@@ -264,7 +270,7 @@ fn encode_array(
 fn encode_object(
     writer: &mut Vec<u8>,
     state: &mut LuaState,
-    table: &LuaTable,
+    table: &LuaRawTable,
     depth: i32,
     fmt: bool,
     options: &JsonOptions,
@@ -322,7 +328,11 @@ fn encode_object(
     Ok(())
 }
 
-fn table_has_meta_key(state: &mut LuaState, table: &LuaTable, meta_key: &str) -> LuaResult<bool> {
+fn table_has_meta_key(
+    state: &mut LuaState,
+    table: &LuaRawTable,
+    meta_key: &str,
+) -> LuaResult<bool> {
     if let Some(mt) = table.get_metatable() {
         let mt = mt.as_table().unwrap();
         if let Some(_) = mt.raw_get(&state.create_string(meta_key)?) {
@@ -335,7 +345,7 @@ fn table_has_meta_key(state: &mut LuaState, table: &LuaTable, meta_key: &str) ->
 pub fn encode_table(
     writer: &mut Vec<u8>,
     state: &mut LuaState,
-    table: &LuaTable,
+    table: &LuaRawTable,
     depth: i32,
     fmt: bool,
     options: &JsonOptions,
@@ -383,16 +393,11 @@ fn pretty_encode(state: &mut LuaState) -> LuaResult<usize> {
 }
 
 fn encode_value(state: &mut LuaState, val: LuaValue, fmt: bool) -> LuaResult<usize> {
-    let result = with_options(|options| {
-        let mut writer = Vec::with_capacity(options.concat_buffer_size);
-        match encode_one(&mut writer, state, &val, 0, fmt, options) {
-            Ok(_) => Ok(writer),
-            Err(err) => Err(err),
-        }
-    });
-
-    match result {
-        Ok(writer) => {
+    let config = fetch_json_config(state);
+    let options = get_options(&config);
+    let mut writer = Vec::with_capacity(options.concat_buffer_size);
+    match encode_one(&mut writer, state, &val, 0, fmt, options) {
+        Ok(_) => {
             let val = state.create_bytes(&writer)?;
             state.push_value(val)?;
             Ok(1)
@@ -404,9 +409,9 @@ fn encode_value(state: &mut LuaState, val: LuaValue, fmt: bool) -> LuaResult<usi
 fn decode_one(state: &mut LuaState, val: &Value, options: &JsonOptions) -> LuaResult<LuaValue> {
     match val {
         Value::Object(map) => {
-            let table = state.create_table(0, map.len())?;
+            let table = state.create_table_with_capacity(0, map.len())?;
             if options.has_metatfield {
-                set_json_metatable(state, table, JSON_OBJECT_META)?;
+                set_json_metatable(state, &table, JSON_OBJECT_META)?;
             }
             for (k, v) in map {
                 if !k.is_empty() {
@@ -421,21 +426,25 @@ fn decode_one(state: &mut LuaState, val: &Value, options: &JsonOptions) -> LuaRe
                         state.create_string(k.as_str())?
                     };
                     let child = decode_one(state, v, options)?;
-                    state.raw_set(&table, key, child);
+                    table.raw_set(key, child)?;
                 }
             }
-            Ok(table)
+            Ok(unsafe {
+                table.to_value()
+            })
         }
         Value::Array(arr) => {
-            let table = state.create_table(arr.len(), 0)?;
+            let table = state.create_table_with_capacity(arr.len(), 0)?;
             if options.has_metatfield {
-                set_json_metatable(state, table, JSON_ARRAY_META)?;
+                set_json_metatable(state, &table, JSON_ARRAY_META)?;
             }
             for (i, v) in arr.iter().enumerate() {
                 let child = decode_one(state, v, options)?;
-                state.raw_seti(&table, (i + 1) as i64, child);
+                table.raw_seti((i + 1) as i64, child)?;
             }
-            Ok(table)
+            Ok(unsafe {
+                table.to_value()
+            })
         }
         Value::Bool(b) => Ok(LuaValue::boolean(*b)),
         Value::Number(n) => {
@@ -483,7 +492,9 @@ fn decode(state: &mut LuaState) -> LuaResult<usize> {
 
     match result {
         Ok(val) => {
-            let lua_val = with_options(|opts| decode_one(state, &val, opts))?;
+            let config = fetch_json_config(state);
+            let opts = get_options(&config);
+            let lua_val = decode_one(state, &val, opts)?;
             state.push_value(lua_val)?;
             Ok(1)
         }
@@ -496,14 +507,12 @@ fn json_concat(state: &mut LuaState) -> LuaResult<usize> {
 
     if arg1.is_string() {
         let slc = arg1.as_bytes().unwrap_or_default().to_vec();
-        let mut buf = Box::new(Buffer::with_capacity(slc.len()));
+        let mut buf = Box::new(Buffer::with_capacity(slc.len() + BUFFER_HEAD_RESERVE));
+        buf.commit(BUFFER_HEAD_RESERVE);
         buf.write_slice(&slc);
+        buf.seek(BUFFER_HEAD_RESERVE as isize);
         state.push_value(LuaValue::lightuserdata(Box::into_raw(buf) as *mut c_void))?;
         return Ok(1);
-    }
-
-    if !arg1.is_table() {
-        return Err(state.error("bad argument #1 (table expected)".to_string()));
     }
 
     let t = arg1
@@ -512,7 +521,7 @@ fn json_concat(state: &mut LuaState) -> LuaResult<usize> {
     let arr_len = t.len();
 
     let mut writer = Box::new(Buffer::new());
-
+    writer.commit(BUFFER_HEAD_RESERVE);
     for i in 1..=arr_len as i64 {
         let val = t.raw_geti(i).unwrap_or(LuaValue::nil());
         match val.kind() {
@@ -533,10 +542,16 @@ fn json_concat(state: &mut LuaState) -> LuaResult<usize> {
                 }
             }
             LuaValueKind::Table => {
-                let result = with_options(|options| {
-                    encode_table(writer.as_mut_vec(), state, &val.as_table().unwrap(), 0, false, options)
-                });
-                if let Err(err) = result {
+                let config = fetch_json_config(state);
+                let options = get_options(&config);
+                if let Err(err) = encode_table(
+                    writer.as_mut_vec(),
+                    state,
+                    &val.as_table().unwrap(),
+                    0,
+                    false,
+                    options,
+                ) {
                     return Err(state.error(err));
                 }
             }
@@ -550,6 +565,7 @@ fn json_concat(state: &mut LuaState) -> LuaResult<usize> {
         }
     }
 
+    writer.seek(BUFFER_HEAD_RESERVE as isize);
     state.push_value(LuaValue::lightuserdata(Box::into_raw(writer) as *mut c_void))?;
     Ok(1)
 }
@@ -652,20 +668,23 @@ fn concat_resp(state: &mut LuaState) -> LuaResult<usize> {
         return Ok(0);
     }
 
-    let args: Vec<LuaValue> = (1..=n).filter_map(|i| state.get_arg(i)).collect();
-
     let mut writer = Box::new(Buffer::new());
+    writer.commit(BUFFER_HEAD_RESERVE);
     let mut hash: u64 = 1;
 
-    let arg2_is_table = args.get(1).is_some_and(|v| v.is_table());
+    let arg1 = state.get_arg(1);
+    let arg2 = state.get_arg(2);
+    let arg3 = state.get_arg(3);
+
+    let arg2_is_table = arg2.as_ref().is_some_and(|v| v.is_table());
     if !arg2_is_table
-        && let Some(key) = args.first().and_then(|v| v.as_str())
+        && let Some(key) = arg1.as_ref().and_then(|v| v.as_str())
         && !key.is_empty()
     {
         let hash_part = if n > 2 && (key.starts_with('h') || key.starts_with('H')) {
-            args.get(2).and_then(|v| v.as_str())
+            arg3.as_ref().and_then(|v| v.as_str())
         } else if n > 1 {
-            args.get(1).and_then(|v| v.as_str())
+            arg2.as_ref().and_then(|v| v.as_str())
         } else {
             None
         };
@@ -678,91 +697,85 @@ fn concat_resp(state: &mut LuaState) -> LuaResult<usize> {
     writer.write(b'*');
     writer.write_chars(n);
 
-    let encode_result = with_options(|options| {
-        let mut err = None;
-        for val in &args {
-            if let Err(e) = concat_resp_one(state, &mut writer, val, options) {
-                err = Some(e);
-                break;
+    let config = fetch_json_config(state);
+    let options = get_options(&config);
+    for i in 1..=n {
+        if let Some(val) = state.get_arg(i) {
+            if let Err(e) = concat_resp_one(state, &mut writer, &val, options) {
+                return Err(state.error(e));
             }
         }
-        err
-    });
-
-    if let Some(err) = encode_result {
-        return Err(state.error(err));
     }
 
     writer.write_slice(b"\r\n");
 
+    writer.seek(BUFFER_HEAD_RESERVE as isize);
     state.push_value(LuaValue::lightuserdata(Box::into_raw(writer) as *mut c_void))?;
-    state.push_value(LuaValue::integer((hash as i64).abs()))?;
+    state.push_value(LuaValue::integer((hash as i64) & i64::MAX))?;
 
     Ok(2)
 }
 
-pub fn register_json() -> luars::LibraryModule {
-    luars::lua_module!("json", {
-        "decode" => decode,
-        "encode" => encode,
-        "pretty_encode" => pretty_encode,
-        "concat" => json_concat,
-        "concat_resp" => concat_resp,
-        "options" => set_options,
-        "object" => json_object,
-        "array" => json_array,
-    })
-    .with_value("null", |_vm| {
-        Ok(LuaValue::lightuserdata(std::ptr::null_mut()))
-    })
-}
-
 fn json_object(state: &mut LuaState) -> LuaResult<usize> {
-    json_typed_table(state, JSON_OBJECT_META, 0, 16)
+    json_typed_table(state, JSON_OBJECT_META, false)
 }
 
 fn json_array(state: &mut LuaState) -> LuaResult<usize> {
-    json_typed_table(state, JSON_ARRAY_META, 16, 0)
+    json_typed_table(state, JSON_ARRAY_META, true)
 }
 
 fn json_typed_table(
     state: &mut LuaState,
     meta_key: &str,
-    arr_hint: usize,
-    hash_hint: usize,
+    is_array: bool,
 ) -> LuaResult<usize> {
-    let table = if let Some(arg) = state.get_arg(1) {
-        if arg.is_integer() {
-            let n = arg.as_integer().unwrap_or(16) as usize;
-            if arr_hint > 0 {
-                state.create_table(n, 1)?
+    let table = if let Some(arg) = state.get_arg_as::<LuaTable>(1)? {
+        arg
+    } else {
+        let arg = state.get_arg(1).ok_or_else(|| {
+            state.error("bad argument #1 (table or integer expected)".to_string())
+        })?;
+        if arg.is_number() {
+            let n = arg.as_number().unwrap_or(16.0) as usize;
+            if is_array {
+                state.create_table_with_capacity(n, 0)?
             } else {
-                state.create_table(0, n)?
+                state.create_table_with_capacity(0, n)?
             }
-        } else if arg.is_table() {
-            arg
         } else {
             return Err(state.error("bad argument #1 (table or integer expected)".to_string()));
         }
-    } else {
-        state.create_table(arr_hint, hash_hint)?
     };
-
-    set_json_metatable(state, table, meta_key)?;
-    state.push_value(table)?;
+    set_json_metatable(state, &table, meta_key)?;
+    state.push_value(unsafe { table.to_value() })?;
     Ok(1)
 }
 
-fn set_json_metatable(state: &mut LuaState, table: LuaValue, meta_key: &str) -> LuaResult<()> {
-    if let Some(meta_value) = state.registry_get::<Table>(meta_key)? {
-        state.set_metatable(table, Some(&meta_value))?;
+fn set_json_metatable(state: &mut LuaState, table: &LuaTable, meta_key: &str) -> LuaResult<()> {
+    if let Some(meta_value) = state.registry_get::<LuaTable>(meta_key)? {
+        table.set_metatable(Some(&meta_value))?;
     } else {
         let mt = state.create_table(0, 0)?;
         let key = state.create_string(meta_key)?;
         state.raw_set(&mt, key, LuaValue::boolean(true));
         state.registry_set(meta_key, mt)?;
-        let mt = state.registry_get::<Table>(meta_key)?.unwrap();
-        state.set_metatable(table, Some(&mt))?;
+        let mt = state.registry_get::<LuaTable>(meta_key)?.unwrap();
+        table.set_metatable(Some(&mt))?;
     }
     Ok(())
+}
+
+pub fn register_json() -> luars::LibraryModule {
+    luars::lua_module!("json", {
+        "encode" => encode,
+        "pretty_encode" => pretty_encode,
+        "decode" => decode,
+        "concat" => json_concat,
+        "concat_resp" => concat_resp,
+        "options" => set_options,
+        "object" => json_object,
+        "array" => json_array,
+        value "null" => |_vm| Ok(LuaValue::lightuserdata(std::ptr::null_mut())),
+    })
+    .with_upvalue(get_or_create_json_config)
 }

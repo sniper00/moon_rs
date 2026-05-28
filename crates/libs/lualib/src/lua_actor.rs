@@ -8,7 +8,7 @@ use actor::{
     context::{self, CONTEXT, LOGGER, LuaActorParam, Message, MessageBody},
     log::Logger,
 };
-use luars::{CFunction, Function, Lua, LuaApi, LuaResult, LuaState, LuaValue};
+use luars::{CFunction, LuaFunction, Lua, LuaApi, LuaResult, LuaState, LuaValue};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use tokio::sync::mpsc;
@@ -44,7 +44,7 @@ impl ActorRef {
     }
 
     #[inline]
-    pub fn set_callback(self, f: Option<Function>) {
+    pub fn set_callback(self, f: Option<LuaFunction>) {
         // Safety: single-threaded access guaranteed by actor model
         unsafe { (*self.0.as_ptr()).callback_fn = f }
     }
@@ -317,7 +317,7 @@ fn lua_actor_send(state: &mut LuaState) -> LuaResult<usize> {
         from,
         to,
         session: -session,
-        data: data.map_or(MessageBody::None, MessageBody::Buffer),
+        data: MessageBody::Buffer(data),
     }) {
         CONTEXT.response_error(
             m.to,
@@ -386,7 +386,7 @@ fn lua_new_actor(state: &mut LuaState) -> LuaResult<usize> {
 }
 
 fn lua_actor_callback(state: &mut LuaState) -> LuaResult<usize> {
-    let callback_fn = state.get_arg_as::<Function>(1)?;
+    let callback_fn = state.get_arg_as::<LuaFunction>(1)?;
     if callback_fn.is_none() {
         return Err(state.error("bad argument #1 (function expected)".to_string()));
     }

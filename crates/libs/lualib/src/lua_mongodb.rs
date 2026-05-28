@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use futures::stream::TryStreamExt;
 use lazy_static::lazy_static;
 use actor::context::{self, CONTEXT};
-use luars::{LuaResult, LuaState, LuaValue};
+use luars::{CFunction, LuaRawTable, LuaResult, LuaState, LuaTable, LuaValue};
 use mongodb::{
     bson::{doc, oid, Bson, Document},
     error::Error,
@@ -10,7 +10,6 @@ use mongodb::{
     results, Client, Collection, IndexModel,
 };
 use std::{
-    ffi::c_void,
     str::FromStr,
     sync::{atomic::AtomicI64, Arc},
     time::Duration,
@@ -18,12 +17,7 @@ use std::{
 use tokio::sync::mpsc;
 
 use crate::{
-    lua_check_str,
-    lua_check_typed_lightuserdata_ref,
-    lua_take_typed_lightuserdata,
-    lua_opt_integer,
-    push_error_table,
-    push_message_table,
+    lua_check_str, lua_check_userdata, lua_newuserdata, lua_opt_integer, lua_take_typed_lightuserdata, push_error_table, push_message_table
 };
 use crate::lua_actor::ActorRef;
 
@@ -250,10 +244,9 @@ fn connect(state: &mut LuaState) -> LuaResult<usize> {
 
 fn extract_find_options(
     state: &mut LuaState,
-    options: &LuaValue,
+    options: &LuaRawTable,
 ) -> Result<FindOptions, String> {
-    let lua_table = options.as_table().ok_or("expected table for find options")?;
-    let entries = lua_table.iter_all();
+    let entries = options.iter_all();
     let mut find_options = FindOptions::default();
 
     for (key, value) in entries.iter() {
@@ -270,15 +263,15 @@ fn extract_find_options(
                     }
                 }
                 "sort" => {
-                    if value.is_table() {
-                        find_options.sort = Some(table_to_doc(state, value)?);
+                    if let Some(t) = value.as_table() {
+                        find_options.sort = Some(table_to_doc(state, &t)?);
                     } else {
                         return Err("Invalid sort value type".to_string());
                     }
                 }
                 "projection" => {
-                    if value.is_table() {
-                        find_options.projection = Some(table_to_doc(state, value)?);
+                    if let Some(t) = value.as_table() {
+                        find_options.projection = Some(table_to_doc(state, &t)?);
                     } else {
                         return Err("Invalid projection value type".to_string());
                     }
@@ -339,12 +332,9 @@ fn extract_find_options(
 }
 
 fn extract_create_index_options(
-    options: &LuaValue,
+    options: &LuaRawTable,
 ) -> Result<CreateIndexOptions, String> {
-    let lua_table = options
-        .as_table()
-        .ok_or("expected table for create index options")?;
-    let entries = lua_table.iter_all();
+    let entries = options.iter_all();
     let mut create_index_options = CreateIndexOptions::default();
 
     for (key, value) in entries.iter() {
@@ -366,12 +356,9 @@ fn extract_create_index_options(
 
 fn extract_index_options(
     state: &mut LuaState,
-    options: &LuaValue,
+    options: &LuaRawTable,
 ) -> Result<IndexOptions, String> {
-    let lua_table = options
-        .as_table()
-        .ok_or("expected table for index options")?;
-    let entries = lua_table.iter_all();
+    let entries = options.iter_all();
     let mut index_options = IndexOptions::default();
 
     for (key, value) in entries.iter() {
@@ -398,23 +385,23 @@ fn extract_index_options(
                     }
                 }
                 "storage_engine" => {
-                    if value.is_table() {
-                        index_options.storage_engine = Some(table_to_doc(state, value)?);
+                    if let Some(t) = value.as_table() {
+                        index_options.storage_engine = Some(table_to_doc(state, &t)?);
                     } else {
                         return Err("Invalid storage_engine value type".to_string());
                     }
                 }
                 "partial_filter_expression" => {
-                    if value.is_table() {
+                    if let Some(t) = value.as_table() {
                         index_options.partial_filter_expression =
-                            Some(table_to_doc(state, value)?);
+                            Some(table_to_doc(state, &t)?);
                     } else {
                         return Err("Invalid partial_filter_expression value type".to_string());
                     }
                 }
                 "wildcard_projection" => {
-                    if value.is_table() {
-                        index_options.wildcard_projection = Some(table_to_doc(state, value)?);
+                    if let Some(t) = value.as_table() {
+                        index_options.wildcard_projection = Some(table_to_doc(state, &t)?);
                     } else {
                         return Err("Invalid wildcard_projection value type".to_string());
                     }
@@ -435,8 +422,8 @@ fn extract_index_options(
                     }
                 }
                 "weights" => {
-                    if value.is_table() {
-                        index_options.weights = Some(table_to_doc(state, value)?);
+                    if let Some(t) = value.as_table() {
+                        index_options.weights = Some(table_to_doc(state, &t)?);
                     } else {
                         return Err("Invalid weights value type".to_string());
                     }
@@ -471,16 +458,12 @@ fn extract_index_options(
 }
 
 fn lua_to_doc(state: &mut LuaState, value: &LuaValue) -> Result<Document, String> {
-    if value.is_table() {
-        table_to_doc(state, value)
-    } else {
-        Err("Invalid type: expected table".to_string())
-    }
+    let t = value.as_table().ok_or("Invalid type: expected table")?;
+    table_to_doc(state, &t)
 }
 
-fn table_to_doc(state: &mut LuaState, table: &LuaValue) -> Result<Document, String> {
-    let lua_table = table.as_table().ok_or("expected table")?;
-    let entries = lua_table.iter_all();
+fn table_to_doc(state: &mut LuaState, table: &LuaRawTable) -> Result<Document, String> {
+    let entries = table.iter_all();
     let mut doc = Document::new();
 
     for (key, value) in entries.iter() {
@@ -501,13 +484,12 @@ fn table_to_doc(state: &mut LuaState, table: &LuaValue) -> Result<Document, Stri
     Ok(doc)
 }
 
-fn table_to_bson(state: &mut LuaState, table: &LuaValue) -> Result<Bson, String> {
-    let lua_table = table.as_table().ok_or("expected table")?;
-    let len = lua_table.len();
+fn table_to_bson(state: &mut LuaState, table: &LuaRawTable) -> Result<Bson, String> {
+    let len = table.len();
     if len > 0 {
         let mut arr = Vec::with_capacity(len);
         for i in 1..=len {
-            if let Some(val) = lua_table.raw_geti(i as i64) {
+            if let Some(val) = table.raw_geti(i as i64) {
                 arr.push(lua_to_bson(state, &val, false)?);
             }
         }
@@ -535,8 +517,8 @@ fn lua_to_bson(state: &mut LuaState, value: &LuaValue, is_object_id: bool) -> Re
         } else {
             Ok(Bson::String(s.to_string()))
         }
-    } else if value.is_table() {
-        table_to_bson(state, value)
+    } else if let Some(t) = value.as_table() {
+        table_to_bson(state, &t)
     } else {
         Err("Invalid type for BSON conversion".to_string())
     }
@@ -630,7 +612,8 @@ fn make_request(
         "insert_one" => {
             let table_val = state.get_arg(*arg_idx).ok_or("expected table for insert_one")?;
             *arg_idx += 1;
-            DbOpKind::InsertOne(table_to_doc(state, &table_val)?)
+            let t = table_val.as_table().ok_or("expected table for insert_one")?;
+            DbOpKind::InsertOne(table_to_doc(state, &t)?)
         }
         "insert_many" => {
             let table_val = state.get_arg(*arg_idx).ok_or("expected table for insert_many")?;
@@ -648,20 +631,24 @@ fn make_request(
         "delete_one" => {
             let table_val = state.get_arg(*arg_idx).ok_or("expected table for delete_one")?;
             *arg_idx += 1;
-            DbOpKind::DeleteOne(table_to_doc(state, &table_val)?)
+            let t = table_val.as_table().ok_or("expected table for delete_one")?;
+            DbOpKind::DeleteOne(table_to_doc(state, &t)?)
         }
         "delete_many" => {
             let table_val = state.get_arg(*arg_idx).ok_or("expected table for delete_many")?;
             *arg_idx += 1;
-            DbOpKind::DeleteMany(table_to_doc(state, &table_val)?)
+            let t = table_val.as_table().ok_or("expected table for delete_many")?;
+            DbOpKind::DeleteMany(table_to_doc(state, &t)?)
         }
         "update_one" | "update_many" => {
             let filter_val = state.get_arg(*arg_idx).ok_or(format!("expected filter table for {}", op_name))?;
             *arg_idx += 1;
             let update_val = state.get_arg(*arg_idx).ok_or(format!("expected update table for {}", op_name))?;
             *arg_idx += 1;
-            let filter = table_to_doc(state, &filter_val)?;
-            let update = table_to_doc(state, &update_val)?;
+            let ft = filter_val.as_table().ok_or(format!("expected filter table for {}", op_name))?;
+            let ut = update_val.as_table().ok_or(format!("expected update table for {}", op_name))?;
+            let filter = table_to_doc(state, &ft)?;
+            let update = table_to_doc(state, &ut)?;
             if op_name == "update_one" {
                 DbOpKind::UpdateOne(filter, update)
             } else {
@@ -671,17 +658,19 @@ fn make_request(
         "find_one" => {
             let table_val = state.get_arg(*arg_idx).ok_or("expected table for find_one")?;
             *arg_idx += 1;
-            DbOpKind::FindOne(table_to_doc(state, &table_val)?)
+            let t = table_val.as_table().ok_or("expected table for find_one")?;
+            DbOpKind::FindOne(table_to_doc(state, &t)?)
         }
         "find" => {
             let filter_val = state.get_arg(*arg_idx).ok_or("expected filter table for find")?;
             *arg_idx += 1;
-            let filter = table_to_doc(state, &filter_val)?;
+            let ft = filter_val.as_table().ok_or("expected filter table for find")?;
+            let filter = table_to_doc(state, &ft)?;
 
             let options_val = state.get_arg(*arg_idx).unwrap_or(LuaValue::nil());
             *arg_idx += 1;
-            let find_options = if options_val.is_table() {
-                Some(extract_find_options(state, &options_val)?)
+            let find_options = if let Some(opts) = options_val.as_table() {
+                Some(extract_find_options(state, &opts)?)
             } else {
                 None
             };
@@ -692,35 +681,40 @@ fn make_request(
             *arg_idx += 1;
             let replacement_val = state.get_arg(*arg_idx).ok_or("expected replacement table for replace_one")?;
             *arg_idx += 1;
-            DbOpKind::ReplaceOne(table_to_doc(state, &filter_val)?, table_to_doc(state, &replacement_val)?)
+            let ft = filter_val.as_table().ok_or("expected filter table for replace_one")?;
+            let rt = replacement_val.as_table().ok_or("expected replacement table for replace_one")?;
+            DbOpKind::ReplaceOne(table_to_doc(state, &ft)?, table_to_doc(state, &rt)?)
         }
         "count" => {
             let table_val = state.get_arg(*arg_idx).ok_or("expected table for count")?;
             *arg_idx += 1;
-            DbOpKind::Count(table_to_doc(state, &table_val)?)
+            let t = table_val.as_table().ok_or("expected table for count")?;
+            DbOpKind::Count(table_to_doc(state, &t)?)
         }
         "exists" => {
             let table_val = state.get_arg(*arg_idx).ok_or("expected table for exists")?;
             *arg_idx += 1;
-            DbOpKind::Exists(table_to_doc(state, &table_val)?)
+            let t = table_val.as_table().ok_or("expected table for exists")?;
+            DbOpKind::Exists(table_to_doc(state, &t)?)
         }
         "create_index" => {
             let keys_val = state.get_arg(*arg_idx).ok_or("expected keys table for create_index")?;
             *arg_idx += 1;
-            let keys = table_to_doc(state, &keys_val)?;
+            let kt = keys_val.as_table().ok_or("expected keys table for create_index")?;
+            let keys = table_to_doc(state, &kt)?;
 
             let idx_opts_val = state.get_arg(*arg_idx).unwrap_or(LuaValue::nil());
             *arg_idx += 1;
-            let index_options = if idx_opts_val.is_table() {
-                Some(extract_index_options(state, &idx_opts_val)?)
+            let index_options = if let Some(opts) = idx_opts_val.as_table() {
+                Some(extract_index_options(state, &opts)?)
             } else {
                 None
             };
 
             let create_opts_val = state.get_arg(*arg_idx).unwrap_or(LuaValue::nil());
             *arg_idx += 1;
-            let create_options = if create_opts_val.is_table() {
-                Some(extract_create_index_options(&create_opts_val)?)
+            let create_options = if let Some(opts) = create_opts_val.as_table() {
+                Some(extract_create_index_options(&opts)?)
             } else {
                 None
             };
@@ -737,7 +731,7 @@ fn make_request(
 fn operators(state: &mut LuaState) -> LuaResult<usize> {
     let mut arg_idx = 1;
 
-    let conn = lua_check_typed_lightuserdata_ref::<DatabaseConnection>(state, arg_idx)?;
+    let conn = lua_check_userdata::<DatabaseConnection>(state, arg_idx)?;
     arg_idx += 1;
 
     let session: i64 = lua_opt_integer(state, arg_idx).unwrap_or(0);
@@ -866,9 +860,13 @@ fn find_connection(state: &mut LuaState) -> LuaResult<usize> {
     let name = lua_check_str(state, 1)?;
     match DATABASE_CONNECTIONS.get(name) {
         Some(pair) => {
-            let conn = Box::new(pair.value().clone());
-            let ptr = Box::into_raw(conn);
-            state.push_value(LuaValue::lightuserdata(ptr as *mut c_void))?;
+            // 创建 userdata 并推入栈
+            static METHODS: &[(&str, CFunction)] = &[
+                ("operators", operators),
+            ];
+
+            let ud = lua_newuserdata(state, pair.value().clone(), "mongodb_connection", METHODS)?;
+            state.push_value(ud)?;
         }
         None => {
             state.push_value(LuaValue::nil())?;

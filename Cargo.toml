@@ -18,7 +18,7 @@ members = [
 [workspace.dependencies]
 actor = { path = "crates/libs/actor"}
 lualib = { path = "crates/libs/lualib"}
-luars = { git = "https://github.com/CppCXY/lua-rs.git", features = ["serde", "shared-proto"] }
+luars = { path = "../lua-rs/crates/luars", features = ["shared-proto"] }
 
 mimalloc = "0.1.39"
 tokio = { version = "1", features = ["full"] }
@@ -47,10 +47,17 @@ percent-encoding = "2.3.1"
 form_urlencoded = "1.2.1"
 url = "2.5.0"
 
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "mysql"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "sqlite", "mysql", "chrono", "uuid"] }
+uuid = "1"
 mongodb = "3.2"
 futures = "0.3"
-phf = { version = "0.11", features = ["macros"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+http-body-util = "0.1"
+tokio-util = { version = "0.7" }
+phf = { version = "0.13", features = ["macros"] }
 
 [profile.release]
 # strip = true

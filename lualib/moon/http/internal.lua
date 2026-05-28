@@ -1,7 +1,7 @@
 local json = require("json")
 local buffer = require("buffer")
 local socket = require("moon.socket")
-local c = require("http.core")
+local c = require("httpc.core")
 
 
 local table = table

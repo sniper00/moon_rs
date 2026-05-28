@@ -1,15 +1,31 @@
+use std::{any::Any, sync::Arc};
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use actor::buffer::Buffer;
-use luars::{Lua, LuaResult, LuaState, LuaTable, LuaValue};
+use luars::{CFunction, Lua, LuaRawTable, LuaResult, LuaState, LuaTable, LuaUserdata, LuaValue, LuaValueKind, UdValue, UserDataTrait};
+
+static NET_FD_COUNTER: AtomicI64 = AtomicI64::new(1);
+
+pub fn next_net_fd() -> i64 {
+    let fd = NET_FD_COUNTER.fetch_add(1, Ordering::AcqRel);
+    if fd == i64::MAX {
+        panic!("net fd overflow");
+    }
+    fd
+}
 
 mod lua_buffer;
 mod lua_excel;
 mod lua_fs;
-mod lua_http;
+mod lua_httpc;
 mod lua_seri;
 mod lua_socket;
+mod lua_thrift;
 mod lua_utils;
 mod lua_sqlx;
 mod lua_mongodb;
+mod lua_websocket;
+mod lua_httpd;
 pub mod lua_json;
 pub mod lua_actor;
 
@@ -183,22 +199,52 @@ pub fn lua_opt_integer<T: TryFrom<i64>>(state: &mut LuaState, index: usize) -> O
 /// Extract a buffer argument: accepts a Lua string (copied into `Buffer`),
 /// a lightuserdata pointer (takes ownership), or nil (returns `None`).
 #[inline]
-pub fn lua_check_buffer(state: &mut LuaState, index: usize) -> LuaResult<Option<Box<Buffer>>> {
+pub fn lua_check_buffer(state: &mut LuaState, index: usize) -> LuaResult<Box<Buffer>> {
     if let Some(value) = state.get_arg(index) {
         if value.is_string() {
-            Ok(Some(Box::new(Buffer::from(value.as_bytes().unwrap()))))
+            Ok(Box::new(Buffer::from(value.as_bytes().unwrap())))
         } else if value.is_lightuserdata() {
             match value.as_lightuserdata() {
-                Some(ptr) if !ptr.is_null() => Ok(Some(unsafe { Box::from_raw(ptr as *mut Buffer) })),
-                _ => Ok(None),
+                Some(ptr) if !ptr.is_null() => Ok(unsafe { Box::from_raw(ptr as *mut Buffer) }),
+                _ => Ok(Box::default()),
             }
         } else if value.is_nil() {
-            Ok(None)
+            Ok(Box::default())
         } else {
             Err(state.error(format!("bad argument #{} (buffer expected, got {})", index, value.type_name())))
         }
     } else {
         Err(state.error(format!("bad argument #{} (buffer expected, got none)", index)))
+    }
+}
+
+pub fn lua_check_arc_buffer(state: &mut LuaState, index: usize) -> LuaResult<Arc<Buffer>> {
+    if let Some(value) = state.get_arg(index) {
+        match value.kind() {
+            LuaValueKind::Userdata => {
+                let data = if value.is_userdata() {
+                    lua_check_userdata::<Arc<Buffer>>(state, index)?.clone()
+                }else {
+                    let ptr = value.as_lightuserdata().unwrap();
+                    if ptr.is_null() {
+                        return Err(state.error(format!("bad argument #{} (non-null lightuserdata expected)", index)));
+                    }
+                    unsafe { Arc::from(Box::from_raw(ptr as *mut Buffer)) }
+                };
+                Ok(data)
+            }
+            LuaValueKind::String => {
+                Ok(Arc::new(Buffer::from(value.as_bytes().unwrap())))
+            }
+            LuaValueKind::Nil => {
+                Ok(Arc::default())
+            }
+            _ => {
+                Err(state.error(format!("bad argument #{} (nil, buffer lightuserdata, or string expected, got {})", index, value.type_name())))
+            }
+        }
+    } else {
+        Err(state.error(format!("bad argument #{} (nil, buffer lightuserdata, or string expected, got none)", index)))
     }
 }
 
@@ -216,9 +262,89 @@ pub fn lua_opt_str(state: &mut LuaState, index: usize) -> Option<&'static str> {
     })
 }
 
+struct MethodedUserData<T: 'static> {
+    value: T,
+    type_name: &'static str,
+    methods: &'static [(&'static str, CFunction)],
+}
+
+impl<T: 'static> UserDataTrait for MethodedUserData<T> {
+    fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    fn get_field(&self, key: &str) -> Option<UdValue> {
+        self.methods
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, f)| UdValue::Function(*f))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.value
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.value
+    }
+}
+
+/// Create a full userdata with a method table and push it onto the Lua stack.
+///
+/// The returned `LuaValue` is a GC-managed userdata. Methods are accessible via
+/// the `:` call syntax in Lua (e.g. `ud:method(...)`). Inside a method CFunction,
+/// use [`lua_check_userdata`] to extract the typed inner value from arg 1.
+pub fn lua_newuserdata<T: 'static>(
+    state: &mut LuaState,
+    val: T,
+    type_name: &'static str,
+    methods: &'static [(&'static str, CFunction)],
+) -> LuaResult<LuaValue> {
+    let ud = LuaUserdata::new(MethodedUserData {
+        value: val,
+        type_name,
+        methods,
+    });
+    state.create_userdata(ud)
+}
+
+/// Extract a full userdata argument at stack `index` and downcast to `&T`.
+///
+/// # Safety
+/// The returned reference is valid as long as the userdata is not garbage-collected.
+pub fn lua_check_userdata<T: 'static>(state: &mut LuaState, index: usize) -> LuaResult<&'static T> {
+    let val = state
+        .get_arg(index)
+        .ok_or_else(|| state.error(format!("bad argument #{} (userdata expected, got none)", index)))?;
+    let ud = val
+        .as_userdata_mut()
+        .ok_or_else(|| state.error(format!("bad argument #{} (userdata expected, got {})", index, val.type_name())))?;
+    let ptr = ud.downcast_ref::<T>()
+        .ok_or_else(|| state.error(format!("bad argument #{} (wrong userdata type)", index)))?
+        as *const T;
+    Ok(unsafe { &*ptr })
+}
+
+/// Extract a full userdata argument at stack `index` and downcast to `&mut T`.
+///
+/// # Safety
+/// The returned reference is valid as long as the userdata is not garbage-collected.
+pub fn lua_check_userdata_mut<T: 'static>(state: &mut LuaState, index: usize) -> LuaResult<&'static mut T> {
+    let val = state
+        .get_arg(index)
+        .ok_or_else(|| state.error(format!("bad argument #{} (userdata expected, got none)", index)))?;
+    let ud = val
+        .as_userdata_mut()
+        .ok_or_else(|| state.error(format!("bad argument #{} (userdata expected, got {})", index, val.type_name())))?;
+    let ptr = ud.downcast_mut::<T>()
+        .ok_or_else(|| state.error(format!("bad argument #{} (wrong userdata type)", index)))?
+        as *mut T;
+    Ok(unsafe { &mut *ptr })
+}
+
 /// Determine if a Lua table is a pure array (keys 1..n with no gaps or hash part).
 /// Returns the array length, or 0 if the table has any non-sequential keys.
-pub fn lua_array_size(t: &LuaTable) -> usize {
+pub fn lua_array_size(t: &LuaRawTable) -> usize {
     let first = match t.next(&LuaValue::nil()) {
         Ok(Some((k, _))) => k,
         _ => return 0,
@@ -317,7 +443,7 @@ pub fn push_message_table(state: &mut LuaState, key: &str, val: &str) -> LuaResu
 /// Register all application-specific Lua libraries (http, socket, json, etc.)
 /// into the given Lua VM.
 pub fn luaopen_custom_libs(lua: &mut Lua) -> luars::LuaResult<()> {
-    lua.install_library(lua_http::register_http())?;
+    lua.install_library(lua_httpc::register_httpc())?;
     lua.install_library(lua_socket::register_socket())?;
     lua.install_library(lua_excel::register_excel())?;
     lua.install_library(lua_fs::register_fs())?;
@@ -326,6 +452,9 @@ pub fn luaopen_custom_libs(lua: &mut Lua) -> luars::LuaResult<()> {
     lua.install_library(lua_seri::register_seri())?;
     lua.install_library(lua_sqlx::register_sqlx())?;
     lua.install_library(lua_mongodb::register_mongodb())?;
+    lua.install_library(lua_websocket::register_websocket())?;
+    lua.install_library(lua_httpd::register_httpd())?;
+    lua.install_library(lua_thrift::register_thrift())?;
     lua.install_library(lua_utils::register_utils())?;
 
     Ok(())

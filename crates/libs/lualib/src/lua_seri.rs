@@ -1,8 +1,8 @@
 use std::ffi::c_void;
 
-use luars::{LuaResult, LuaState, LuaValue};
+use luars::{LuaRawTable, LuaResult, LuaState, LuaTable, LuaValue};
 
-use actor::buffer::Buffer;
+use actor::buffer::{BUFFER_HEAD_RESERVE, Buffer};
 
 use crate::{
     lua_check_lightuserdata_bytes,
@@ -135,14 +135,11 @@ fn pack_one(state: &mut LuaState, val: LuaValue, buf: &mut Vec<u8>, depth: i32) 
 }
 
 fn write_table(state: &mut LuaState, table: LuaValue, buf: &mut Vec<u8>, depth: i32) -> Result<(), String> {
-    let has_metapairs = if let Some(t) = table.as_table() {
-        if t.has_metatable() {
-            let mt = t.get_metatable().unwrap();
-            let pairs_key = state.create_string("__pairs").map_err(|_| "oom".to_string())?;
-            state.raw_get(&mt, &pairs_key).is_some()
-        } else {
-            false
-        }
+    let t = table.as_table().ok_or("expected table")?;
+    let has_metapairs = if t.has_metatable() {
+        let mt = t.get_metatable().unwrap();
+        let pairs_key = state.create_string("__pairs").map_err(|_| "oom".to_string())?;
+        state.raw_get(&mt, &pairs_key).is_some()
     } else {
         false
     };
@@ -150,20 +147,19 @@ fn write_table(state: &mut LuaState, table: LuaValue, buf: &mut Vec<u8>, depth: 
     if has_metapairs {
         write_table_metapairs(state, table, buf, depth)?;
     } else {
-        let array_size = write_table_array(state, &table, buf, depth)?;
-        write_table_hash(state, &table, buf, depth, array_size)?;
+        let array_size = write_table_array(state, &t, buf, depth)?;
+        write_table_hash(state, &t, buf, depth, array_size)?;
     }
     Ok(())
 }
 
 fn write_table_array(
     state: &mut LuaState,
-    table: &LuaValue,
+    table: &LuaRawTable,
     buf: &mut Vec<u8>,
     depth: i32,
 ) -> Result<usize, String> {
-    let t = table.as_table().ok_or("expected table")?;
-    let array_size = t.len();
+    let array_size = table.len();
 
     if array_size >= MAX_COOKIE as usize - 1 {
         let n = combine_type!(TYPE_TABLE, MAX_COOKIE - 1);
@@ -175,7 +171,7 @@ fn write_table_array(
     }
 
     for i in 1..=array_size as i64 {
-        let val = t.raw_geti(i).unwrap_or(LuaValue::nil());
+        let val = table.raw_geti(i).unwrap_or(LuaValue::nil());
         pack_one(state, val, buf, depth)?;
     }
 
@@ -184,15 +180,12 @@ fn write_table_array(
 
 fn write_table_hash(
     state: &mut LuaState,
-    table: &LuaValue,
+    table: &LuaRawTable,
     buf: &mut Vec<u8>,
     depth: i32,
     array_size: usize,
 ) -> Result<(), String> {
-    let pairs: Vec<(LuaValue, LuaValue)> = table
-        .as_table()
-        .map(|t| t.iter_all())
-        .unwrap_or_default();
+    let pairs: Vec<(LuaValue, LuaValue)> = table.iter_all();
 
     for (k, v) in pairs {
         if let Some(key) = k.as_integer()
@@ -220,9 +213,9 @@ fn write_table_metapairs(
         .create_string("__pairs")
         .map_err(|_| "seri: failed to create __pairs key".to_string())?;
 
-    let metatable = table
-        .as_table()
-        .and_then(|t| t.get_metatable())
+    let t = table.as_table().ok_or("expected table")?;
+    let metatable = t
+        .get_metatable()
         .ok_or_else(|| "no metatable".to_string())?;
 
     let pairs_fn = state
@@ -471,17 +464,17 @@ fn pack(state: &mut LuaState) -> LuaResult<usize> {
         return Ok(0);
     }
 
-    let args: Vec<LuaValue> = (1..=n)
-        .map(|i| state.get_arg(i).unwrap_or(LuaValue::nil()))
-        .collect();
-
+    let arg_count = state.arg_count();
     let mut buf = Box::new(Buffer::new());
-    for val in args {
-        if let Err(err) = pack_one(state, val, buf.as_mut_vec(), 0) {
-            return Err(state.error(err));
+    buf.commit(BUFFER_HEAD_RESERVE);
+    for i in 1..=arg_count {
+        if let Some(val) = state.get_arg(i) {
+            if let Err(err) = pack_one(state, val, buf.as_mut_vec(), 0) {
+                return Err(state.error(err));
+            }
         }
     }
-
+    buf.seek(BUFFER_HEAD_RESERVE as isize);
     state.push_value(LuaValue::lightuserdata(Box::into_raw(buf) as *mut c_void))?;
     Ok(1)
 }
@@ -492,12 +485,9 @@ fn pack_string(state: &mut LuaState) -> LuaResult<usize> {
         return Ok(0);
     }
 
-    let args: Vec<LuaValue> = (1..=n)
-        .map(|i| state.get_arg(i).unwrap_or(LuaValue::nil()))
-        .collect();
-
     let mut buf = Box::new(Buffer::new());
-    for val in args {
+    for i in 1..=n {
+        let val = state.get_arg(i).unwrap_or(LuaValue::nil());
         if let Err(err) = pack_one(state, val, buf.as_mut_vec(), 0) {
             return Err(state.error(err));
         }

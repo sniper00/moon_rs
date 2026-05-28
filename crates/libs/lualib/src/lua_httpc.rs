@@ -107,13 +107,13 @@ fn extract_headers(state: &mut LuaState, table: &LuaValue) -> Result<HeaderMap, 
         .create_string("headers")
         .map_err(|e| format!("{}", e))?;
     let header_table = match state.raw_get(table, &key) {
-        Some(ht) if ht.is_table() => ht,
+        Some(ht) => ht,
         _ => return Ok(headers),
     };
-
-    let lua_table = header_table
-        .as_table()
-        .ok_or("headers field is not a table")?;
+    let lua_table = match header_table.as_table() {
+        Some(t) => t,
+        None => return Ok(headers),
+    };
     let mut current_key = LuaValue::nil();
     loop {
         match lua_table.next(&current_key) {
@@ -216,12 +216,10 @@ fn decode(state: &mut LuaState) -> LuaResult<usize> {
 }
 
 fn lua_http_form_urlencode(state: &mut LuaState) -> LuaResult<usize> {
-    let table = state
+    let arg1 = state
         .get_arg(1)
-        .filter(|v| v.is_table())
         .ok_or_else(|| state.error("bad argument #1 (table expected)".to_string()))?;
-
-    let lua_table = table
+    let lua_table = arg1
         .as_table()
         .ok_or_else(|| state.error("bad argument #1 (table expected)".to_string()))?;
 
@@ -377,8 +375,8 @@ fn lua_http_parse_request(state: &mut LuaState) -> LuaResult<usize> {
     }
 }
 
-pub fn register_http() -> luars::LibraryModule {
-    luars::lua_module!("http.core", {
+pub fn register_httpc() -> luars::LibraryModule {
+    luars::lua_module!("httpc.core", {
         "request" => lua_http_request,
         "decode" => decode,
         "form_urlencode" => lua_http_form_urlencode,

@@ -3,7 +3,7 @@ use actor::{
     error::{MoonError, Result},
 };
 use lualib::lua_actor;
-use luars::{Lua, LuaApi, LuaValue, SafeOption, Stdlib, Table};
+use luars::{Lua, LuaApi, LuaValue, SafeOption, Stdlib, LuaTable};
 use mimalloc::MiMalloc;
 use std::{
     env,
@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
             .map_err(|e| MoonError::Custom(format!("execute args: {}", e)))?;
 
         let result = vm
-            .load(&contents).set_name(&bootstrap).call::<_, Table>(_arg_results)
+            .load(&contents).set_name(&bootstrap).call::<_, LuaTable>(_arg_results)
             .map_err(|e| MoonError::Custom(format!("dofile: {}", e)))?;
 
         logfile = Some(result.get::<String>("logfile").unwrap_or_default());

@@ -47,6 +47,8 @@ moon.PTYPE_HTTP = 13
 -- moon.PTYPE_QUIT = 14
 moon.PTYPE_SQLX = 15
 moon.PTYPE_MONGODB = 16
+moon.PTYPE_WEBSOCKET = 17
+moon.PTYPE_HTTP_SRV = 18
 
 --moon.codecache = require("codecache")
 
@@ -284,7 +286,7 @@ end
 --- Suspends the current coroutine.
 --- @param session? integer @ An optional session ID used to map the coroutine for wakeup.
 --- @param receiver? integer @ An optional receiver's service ID.
---- @return ... @ Returns the unpacked message if the coroutine is resumed by a message. If the coroutine is resumed by `moon.wakeup`, it returns the additional parameters passed by `moon.wakeup`. If the coroutine is broken, it returns `false` and "BREAK".
+--- @return any... @ Returns the unpacked message if the coroutine is resumed by a message. If the coroutine is resumed by `moon.wakeup`, it returns the additional parameters passed by `moon.wakeup`. If the coroutine is broken, it returns `false` and "BREAK".
 function moon.wait(session, receiver)
     -- print("moon.wait", session, receiver)
     if session then

@@ -1,5 +1,3 @@
-error("DO NOT REQUIRE THIS FILE")
-
 ---@meta
 
 --- lightuserdata, cpp type `buffer*`
@@ -117,6 +115,10 @@ function core.base64_encode(data) end
 ---@param base64str string
 ---@return string
 function core.base64_decode(base64str) end
+
+--- get next session id
+---@return integer
+function core.next_session() end
 
 
 return core

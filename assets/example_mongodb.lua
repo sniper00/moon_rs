@@ -3,7 +3,7 @@ local moon = require "moon"
 local mongodb = require "moon.db.mongodb"
 
 moon.async(function()
-    local db = mongodb.connect("mongodb://127.0.0.1:27017/?serverSelectionTimeoutMS=2000", "gamedb1")
+    local db = mongodb.connect("mongodb://root:123456@127.0.0.1:27017/admin?retryWrites=false", "gamedb1")
     if db.kind then
         print("connect failed", db.message)
         return
@@ -11,30 +11,28 @@ moon.async(function()
 
     local coll = db:collection("mydatabase", "mycollection")
 
-    local res = coll:insert_one({
-        cc      = 300,
-        gpsname = "gps1",
-        track   = {
-            segments = {
-                [1] = {
-                    HR        = 73,
-                    location  = {
-                        [1] = 47.763,
-                        [2] = 13.4034,
-                    },
-                    starttime = "2018-10-14 10:05:14",
+    local res = coll:insert_one({        cc      = 300,
+    gpsname = "gps1",
+    track   = {
+        segments = {
+            [1] = {
+                HR        = 73,
+                location  = {
+                    [1] = 47.763,
+                    [2] = 13.4034,
                 },
-                [2] = {
-                    HR        = 130,
-                    location  = {
-                        [1] = 47.706,
-                        [2] = 13.2635,
-                    },
-                    starttime = "2018-10-14 10:39:21",
+                starttime = "2018-10-14 10:05:14",
+            },
+            [2] = {
+                HR        = 130,
+                location  = {
+                    [1] = 47.706,
+                    [2] = 13.2635,
                 },
+                starttime = "2018-10-14 10:39:21",
             },
         },
-    })
+    },})
 
     print_r(res)
 

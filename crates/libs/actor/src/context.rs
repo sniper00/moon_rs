@@ -33,6 +33,8 @@ pub const PTYPE_HTTP: u8 = 13;
 pub const PTYPE_QUIT: u8 = 14;
 pub const PTYPE_SQLX: u8 = 15;
 pub const PTYPE_MONGODB: u8 = 16;
+pub const PTYPE_WEBSOCKET: u8 = 17;
+pub const PTYPE_HTTP_SRV: u8 = 18;
 
 pub const BOOTSTRAP_ACTOR_ADDR: i64 = 1;
 

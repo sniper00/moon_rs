@@ -19,15 +19,15 @@ local function operators(self, ...)
 end
 
 ---@class Collection
----@field find_one fun(query:table, opts?:table):table
----@field find fun(query:table, opts?:table):table
----@field insert_one fun(doc:table):table
----@field insert_many fun(docs:table):table
----@field update_one fun(filter:table, update?:table):table
----@field update_many fun(filter:table, update?:table):table
----@field delete_one fun(filter:table):table
----@field delete_many fun(filter:table):table
----@field count fun(filter:table):table
+---@field find_one fun(self: Collection, query:table, opts?:table):table
+---@field find fun(self: Collection, query:table, opts?:table):table
+---@field insert_one fun(self, doc:table):table
+---@field insert_many fun(self: Collection, docs:table):table
+---@field update_one fun(self: Collection, filter:table, update?:table):table
+---@field update_many fun(self: Collection, filter:table, update?:table):table
+---@field delete_one fun(self: Collection, filter:table):table
+---@field delete_many fun(self: Collection, filter:table):table
+---@field count fun(self: Collection, filter:table):table
 
 ---@class MongoDB
 local M = {}
@@ -65,8 +65,8 @@ end
 
 ---@async
 ---@nodiscard
----@param sql string
----@vararg any
+---@param db_name string
+---@param col_name string
 ---@return Collection
 function M:collection(db_name, col_name)
     return setmetatable({

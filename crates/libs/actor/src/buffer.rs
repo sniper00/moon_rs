@@ -8,6 +8,7 @@ pub struct Buffer {
 }
 
 pub const DEFAULT_RESERVE: usize = 128;
+pub const BUFFER_HEAD_RESERVE: usize = 16;
 
 #[allow(dead_code)]
 impl Buffer {
@@ -289,6 +290,47 @@ impl Buffer {
 
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.as_slice()) }
+    }
+
+    /// Shift `count` bytes within the underlying storage from absolute offset `src`
+    /// to absolute offset `dst`. Handles overlapping regions via `memmove`.
+    /// Both `src..src+count` must be within the written data, and
+    /// `dst..dst+count` must be within buffer capacity.
+    pub fn shift_data(&mut self, src: usize, count: usize, dst: usize) {
+        assert!(
+            src + count <= self.data.len(),
+            "shift_data: src({}) + count({}) > data.len({})",
+            src, count, self.data.len()
+        );
+        assert!(
+            dst + count <= self.data.capacity(),
+            "shift_data: dst({}) + count({}) > capacity({})",
+            dst, count, self.data.capacity()
+        );
+        if src == dst || count == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = self.data.as_mut_ptr();
+            std::ptr::copy(ptr.add(src), ptr.add(dst), count);
+        }
+    }
+
+    /// Returns the current write position (absolute offset into the underlying Vec).
+    pub fn write_pos(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns the read position (absolute offset into the underlying Vec).
+    pub fn read_pos(&self) -> usize {
+        self.rpos
+    }
+
+    /// Get a mutable reference to the underlying data at an absolute offset.
+    /// Panics if `offset + len` exceeds the written data length.
+    pub fn data_mut_at(&mut self, offset: usize, len: usize) -> &mut [u8] {
+        assert!(offset + len <= self.data.len());
+        &mut self.data[offset..offset + len]
     }
 }
 
@@ -648,5 +690,44 @@ mod tests {
     fn test_display() {
         let buffer = Buffer::from("hello");
         assert_eq!(format!("{}", buffer), "hello");
+    }
+
+    #[test]
+    fn test_shift_data_forward() {
+        let mut buffer = Buffer::from_slice(b"Hello World!");
+        buffer.shift_data(6, 5, 0); // Shift "World" to the beginning
+        assert_eq!(&buffer.data[..5], b"World");
+        // Original data at 6..11 is now also at 0..5
+    }
+
+    #[test]
+    fn test_shift_data_backward() {
+        let mut buffer = Buffer::from_slice(b"Hello World!");
+        buffer.shift_data(0, 5, 7); // Shift "Hello" to position 7
+        assert_eq!(&buffer.data[7..12], b"Hello");
+    }
+
+    #[test]
+    fn test_shift_data_same_position() {
+        let mut buffer = Buffer::from_slice(b"Hello");
+        buffer.shift_data(0, 5, 0); // No-op
+        assert_eq!(&buffer.data, b"Hello");
+    }
+
+    #[test]
+    fn test_write_pos_and_read_pos() {
+        let mut buffer = Buffer::from_slice(b"Hello");
+        assert_eq!(buffer.write_pos(), 5);
+        assert_eq!(buffer.read_pos(), 0);
+        buffer.consume(2);
+        assert_eq!(buffer.write_pos(), 5);
+        assert_eq!(buffer.read_pos(), 2);
+    }
+
+    #[test]
+    fn test_data_mut_at() {
+        let mut buffer = Buffer::from_slice(b"Hello World");
+        buffer.data_mut_at(6, 5).copy_from_slice(b"Rust!");
+        assert_eq!(&buffer.data, b"Hello Rust!");
     }
 }

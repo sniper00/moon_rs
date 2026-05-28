@@ -1,5 +1,5 @@
 use crate::context::LuaActorParam;
-use luars::{Function, GlobalState, Lua, LuaApi, SafeOption, Stdlib};
+use luars::{LuaFunction, GlobalState, Lua, LuaApi, SafeOption, Stdlib};
 
 use super::context::Message;
 use tokio::sync::mpsc;
@@ -15,7 +15,7 @@ pub struct LuaActor {
     uuid: i64,
     pub name: String,
     pub rx: mpsc::UnboundedReceiver<Message>,
-    pub callback_fn: Option<Function>,
+    pub callback_fn: Option<LuaFunction>,
     pub lua: Lua,
     pub mem_limit: isize,
     pub mem_warning: isize,

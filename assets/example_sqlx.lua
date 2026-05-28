@@ -44,7 +44,7 @@ moon.async(function()
     ]]
 
 
-    local db = sqlx.connect("postgres://bruce:123456@localhost/postgres", "test")
+    local db = sqlx.connect("postgres://postgres:123456@localhost/postgres", "test")
     print(db)
     if db.kind then
         print("connect failed", db.message)
