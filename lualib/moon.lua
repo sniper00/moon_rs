@@ -28,7 +28,7 @@ local _timeout = core.timeout
 local _newservice = core.new_service
 local _decode = core.decode
 
----@class moon : core
+---@class moon : runtime
 local moon = core
 
 moon.PTYPE_SYSTEM = 1
@@ -43,10 +43,12 @@ moon.PTYPE_SOCKET_UDP = 9
 -- moon.PTYPE_SOCKET_WS = 10
 -- moon.PTYPE_SOCKET_MOON = 11
 moon.PTYPE_INTEGER = 12
-moon.PTYPE_HTTP = 13
+moon.PTYPE_HTTPC = 13
 -- moon.PTYPE_QUIT = 14
 moon.PTYPE_SQLX = 15
 moon.PTYPE_MONGODB = 16
+moon.PTYPE_WEBSOCKET = 17
+moon.PTYPE_HTTPD = 18
 
 --moon.codecache = require("codecache")
 

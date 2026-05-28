@@ -1,10 +1,10 @@
 local moon = require "moon"
 local json = require "json"
-local core = require "http.core"
+local core = require "httpc.core"
 
 moon.register_protocol {
     name = "http",
-    PTYPE = moon.PTYPE_HTTP,
+    PTYPE = moon.PTYPE_HTTPC,
     pack = function(...) return ... end,
     unpack =  function (val)
         return core.decode(val)
@@ -19,7 +19,7 @@ end
 
 ---@class HttpRequestOptions
 ---@field headers? table<string,string>
----@field timeout? integer
+---@field timeout? integer Timeout in milliseconds. Default 5000ms
 ---@field proxy? string
 
 local client = {}

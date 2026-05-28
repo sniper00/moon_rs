@@ -31,11 +31,15 @@ else
         counter = counter + 1
         if counter >= nsender then
             print( nsender ,"call" ,nsender, "per", onecount, "total",  nsender*onecount, "cost", endtime - stime)
+            moon.sleep(3000)
+            moon.exit(0)
         end
     end)
 
     moon.async(function()
         local sender_addrs = {}
+
+        local bt = moon.clock()
         for i=1,nsender do
             local receiver = moon.new_service({
                 name="test",
@@ -55,7 +59,7 @@ else
             sender_addrs[#sender_addrs+1] = addr
         end
 
-        moon.warn("call start")
+        moon.warn("call start, create services cost", moon.clock() - bt)
         stime = moon.clock()
         for k,v in ipairs(sender_addrs) do
             moon.send("lua", v, "start")

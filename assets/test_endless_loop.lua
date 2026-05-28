@@ -1,4 +1,5 @@
 local moon = require("moon")
+local utils = require("utils")
 
 local arg = ...
 
@@ -7,7 +8,7 @@ if arg and arg.runner then
         moon.sleep(0)
         local i = 0
         while i<5 do
-            moon.thread_sleep(6000)
+            utils.thread_sleep(6000)
             moon.sleep(0)
             i=i+1
         end

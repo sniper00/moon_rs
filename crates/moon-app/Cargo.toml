@@ -1,0 +1,17 @@
+[package]
+name = "moon-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "moon_rs"
+path = "src/main.rs"
+
+[dependencies]
+moon-runtime = { workspace = true }
+moon-modules = { workspace = true }
+moon-lua = { workspace = true }
+mimalloc = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+

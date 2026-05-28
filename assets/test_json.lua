@@ -1,44 +1,23 @@
 local moon = require("moon")
 local json = require("json")
 
-do
-    local t = { nil, nil, nil, 100 }
-    assert(string.sub(json.encode(t), 1, 1) == "{")
-    local t2 = json.decode(json.encode(t))
-    assert(not t2[1])
-    assert(not t2[2])
-    assert(not t2[3])
-    assert(t2[4] == 100)
-
-    local old_options = json.options('enable_sparse_array', true)
-    local t = { nil, nil, nil, 100 }
-    assert(string.sub(json.encode(t), 1, 1) == "[")
-    assert(#json.decode(json.encode(t)) == 4)
-    local t2 = json.decode(json.encode(t))
-    assert(t2[1] == json.null)
-    assert(t2[2] == json.null)
-    assert(t2[3] == json.null)
-    assert(t2[4] == 100)
-
-    json.options('enable_sparse_array', old_options)
-end
 
 do
     local t = {}
     local str = json.encode(t)
-    assert(string.sub(str, 1, 1) == "[")
+    assert(string.sub(str,1,1)=="[")
 
     local old_options = json.options('encode_empty_as_array', false)
     str = json.encode(t)
-    assert(string.sub(str, 1, 1) == "{")
+    assert(string.sub(str,1,1)=="{")
     json.options('encode_empty_as_array', old_options)
 end
 
 do
     local double = 2 ^ 53
     print(json.encode(double))
-    assert(json.encode(double) == "9007199254740992")
-    assert(json.decode(json.encode(double)) == double)
+    assert(json.encode(double)=="9007199254740992")
+    assert(json.decode(json.encode(double))==double)
 end
 
 do
@@ -49,145 +28,140 @@ do
     t1[1] = "a"
     local str = json.encode(t1) --["a","b","c","d"]
     print(str)
-    assert(string.sub(str, 1, 1) == "[")
+    assert(string.sub(str,1,1)=="[")
     local t2 = json.decode(str)
-    assert(#t2 == 4)
-    assert(t2[1] == "a")
-    assert(t2[2] == "b")
-    assert(t2[3] == "c")
-    assert(t2[4] == "d")
+    assert(#t2==4)
+    assert(t2[1]=="a")
+    assert(t2[2]=="b")
+    assert(t2[3]=="c")
+    assert(t2[4]=="d")
 end
 
 do
-    local t1 = { [4] = "d", [2] = "b", [3] = "c", [1] = "a" }
+    local t1 = {[4] = "d", [2]="b", [3]="c", [1]="a"}
     local str = json.encode(t1) --["a","b","c","d"]
     print(str)
-    assert(string.sub(str, 1, 1) == "[")
+    assert(string.sub(str,1,1)=="[")
     local t2 = json.decode(str)
-    assert(#t2 == 4)
-    assert(t2[1] == "a")
-    assert(t2[2] == "b")
-    assert(t2[3] == "c")
-    assert(t2[4] == "d")
+    assert(#t2==4)
+    assert(t2[1]=="a")
+    assert(t2[2]=="b")
+    assert(t2[3]=="c")
+    assert(t2[4]=="d")
 end
 
 do
     local t1 = {}
-    table.insert(t1, "a")
-    table.insert(t1, "b")
-    table.insert(t1, "c")
-    table.insert(t1, "d")
+    table.insert(t1,"a")
+    table.insert(t1,"b")
+    table.insert(t1,"c")
+    table.insert(t1,"d")
     local str = json.encode(t1) --["a","b","c","d"]
     print(str)
-    assert(string.sub(str, 1, 1) == "[")
+    assert(string.sub(str,1,1)=="[")
     local t2 = json.decode(str)
-    assert(#t2 == 4)
-    assert(t2[1] == "a")
-    assert(t2[2] == "b")
-    assert(t2[3] == "c")
-    assert(t2[4] == "d")
+    assert(#t2==4)
+    assert(t2[1]=="a")
+    assert(t2[2]=="b")
+    assert(t2[3]=="c")
+    assert(t2[4]=="d")
 end
 
 do
-    local t1 = { "a", "b", "c", "d" }
+    local t1 = {"a","b","c","d"}
     local str = json.encode(t1) --["a","b","c","d"]
     print(str)
-    assert(string.sub(str, 1, 1) == "[")
+    assert(string.sub(str,1,1)=="[")
     local t2 = json.decode(str)
-    assert(#t2 == 4)
-    assert(t2[1] == "a")
-    assert(t2[2] == "b")
-    assert(t2[3] == "c")
-    assert(t2[4] == "d")
+    assert(#t2==4)
+    assert(t2[1]=="a")
+    assert(t2[2]=="b")
+    assert(t2[3]=="c")
+    assert(t2[4]=="d")
 end
 
 do
-    local t1 = {
-        "a",
-        "b",
-        [5] = "c",
-        "d",
-        e = {
-            w = 1,
-            x = 2
-        }
-    }
+    local t1 = {"a","b",[5]="c","d", e={
+        w = 1,
+        x = 2
+    }}
     local str = json.encode(t1) --{"1":"a","2":"b","3":"d","5":"c"}
     print(str)
-    assert(string.sub(str, 1, 1) == "{")
+    assert(string.sub(str,1,1)=="{")
     local t2 = json.decode(str)
-    assert(t2[1] == "a")
-    assert(t2[2] == "b")
-    assert(t2[5] == "c")
-    assert(t2[3] == "d")
+    assert(t2[1]=="a")
+    assert(t2[2]=="b")
+    assert(t2[5]=="c")
+    assert(t2[3]=="d")
 end
 
 do
-    local t1 = { [1] = "a", [2] = "b", [100] = "c", }
+    local t1 = {[1] = "a", [2] = "b",[100] = "c",}
     local str = json.encode(t1) --{"1":"a","2":"b","100":"c"}
     print(str)
-    assert(string.sub(str, 1, 1) == "{")
+    assert(string.sub(str,1,1)=="{")
     local t2 = json.decode(str)
-    assert(t2[1] == "a")
-    assert(t2[2] == "b")
-    assert(t2[100] == "c")
+    assert(t2[1]=="a")
+    assert(t2[2]=="b")
+    assert(t2[100]=="c")
 end
 
 do
-    local t1 = { ["a"] = 1, ["b"] = 2, ["c"] = 3 }
+    local t1 = {["a"]=1,["b"]=2,["c"] =3}
     local str = json.encode(t1) -- {"b":2,"c":3,"a":1}
     print(str)
-    assert(string.sub(str, 1, 1) == "{")
+    assert(string.sub(str,1,1)=="{")
     local t2 = json.decode(str)
-    assert(t2["a"] == 1)
-    assert(t2["b"] == 2)
-    assert(t2["c"] == 3)
+    assert(t2["a"]==1)
+    assert(t2["b"]==2)
+    assert(t2["c"]==3)
 end
 
 do
-    local t1 = { [100] = "a", [200] = "b", [300] = "c", }
+    local t1 = {[100] = "a", [200] = "b",[300] = "c",}
     local str = json.encode(t1) -- {"300":"c","100":"a","200":"b"}
     print(str)
-    assert(string.sub(str, 1, 1) == "{")
+    assert(string.sub(str,1,1)=="{")
     local t2 = json.decode(str)
-    assert(t2[100] == "a")
-    assert(t2[200] == "b")
-    assert(t2[300] == "c")
+    assert(t2[100]=="a")
+    assert(t2[200]=="b")
+    assert(t2[300]=="c")
 end
 
 do
-    local t1 = { ["1.0"] = 1, ["2.0"] = 2, ["3.0"] = 3 }
+    local t1 = {["1.0"]=1,["2.0"]=2,["3.0"] =3}
     local str = json.encode(t1) --  {"1.0":1,"3.0":3,"2.0":2}
     print(str)
-    assert(string.sub(str, 1, 1) == "{")
+    assert(string.sub(str,1,1)=="{")
     local t2 = json.decode(str)
-    assert(t2["1.0"] == 1)
-    assert(t2["2.0"] == 2)
-    assert(t2["3.0"] == 3)
+    assert(t2["1.0"]==1)
+    assert(t2["2.0"]==2)
+    assert(t2["3.0"]==3)
 end
 
 do
-    local t1 = { ["100abc"] = "hello" }
+    local t1 = {["100abc"]="hello"}
     local str = json.encode(t1) --  {"100abc":"hello"}
     print(str)
-    assert(string.sub(str, 1, 1) == "{")
+    assert(string.sub(str,1,1)=="{")
     local t2 = json.decode(str)
-    assert(t2["100abc"] == "hello")
+    assert(t2["100abc"]=="hello")
 end
 
 do
     ---issue case: try convert string key to integer
-    local t1 = { ["1"] = 1, ["2"] = 2, ["3"] = 3 }
+    local t1 = {["1"]=1,["2"]=2,["3"] =3}
     local str = json.encode(t1) -- {"1":1,"2":2,"3":3}
     print(str)
-    assert(string.sub(str, 1, 1) == "{", "adadadad")
+    assert(string.sub(str,1,1)=="{","adadadad")
     local t2 = json.decode(str)
-    assert(t2[1] == 1)
-    assert(t2[2] == 2)
-    assert(t2[3] == 3)
+    assert(t2[1]==1)
+    assert(t2[2]==2)
+    assert(t2[3]==3)
 
-    str = json.encode(t2) -- [1,2,3]
-    assert(string.sub(str, 1, 1) == "[")
+    assert(getmetatable(t2).__json_object)
+    str = json.encode(t2) -- {"1":1,"2":2,"3":3}
+    assert(string.sub(str,1,1)=="{")
 end
 
 do
@@ -195,7 +169,7 @@ do
         "insert into shop(id, details) values (",
         101,
         ",'",
-        { name = "hello", price = 120.3 },
+        {name="hello",price=120.3},
         "');"
     }
     --optimize lua GC: Auto encode table as json, an return ligthtuserdata, then use socket api send it.
@@ -207,11 +181,9 @@ do
 end
 
 do
-    local pointer = json.concat_resp("set", "hello", {
-        a = 1,
-        b = 2,
-        c = {
-            a = 1, b = 2
+    local pointer = json.concat_resp("set","hello", {
+        a=1,b=2,c={
+            a=1,b=2
         }
     })
     local buffer = require("buffer")
@@ -220,10 +192,8 @@ do
 end
 
 do
-    local ok, err = xpcall(json.encode, debug.traceback, {
-        a = function()
-        end
-    })
+    local ok, err = xpcall(json.encode, debug.traceback, { a = function()
+    end })
     assert(not ok, err)
 end
 
@@ -240,30 +210,71 @@ do
 end
 
 do
-    local t = { nil, nil, nil, 100 }
-    assert(string.sub(json.encode(t), 1, 1) == "{")
-    local t2 = json.decode(json.encode(t))
-    assert(not t2[1])
-    assert(not t2[2])
-    assert(not t2[3])
-    assert(t2[4] == 100)
-
     local old_options = json.options('enable_sparse_array', true)
-    local t = { nil, nil, nil, 100 }
-    assert(string.sub(json.encode(t), 1, 1) == "[")
-    assert(#json.decode(json.encode(t)) == 4)
-    local t2 = json.decode(json.encode(t))
+    assert(type(old_options) == "boolean")
+    local t2 = json.decode("[null,null,null,100]")
+    assert(#t2 == 4)
     assert(t2[1] == json.null)
     assert(t2[2] == json.null)
     assert(t2[3] == json.null)
     assert(t2[4] == 100)
-
     json.options('enable_sparse_array', old_options)
 end
 
 do
-    local str = io.readfile([[twitter.json]])
-    local t = json.decode(str)
-    io.writefile("twitter-out.json", json.encode(t, true))
+    assert(json.encode(json.null) == "null")
+    assert(json.decode("null") == json.null)
+    print(json.decode(""))
+    assert(json.decode("") == nil)
+
+    local ok = pcall(json.decode, "{")
+    assert(not ok)
 end
 
+do
+    local arr = json.decode("[1,2,3]")
+    assert(getmetatable(arr).__json_array)
+
+    local obj = json.decode('{"a":1}')
+    assert(getmetatable(obj).__json_object)
+
+    local old_options = json.options('has_metatfield', false)
+    arr = json.decode("[1,2,3]")
+    obj = json.decode('{"a":1}')
+    assert(getmetatable(arr) == nil)
+    assert(getmetatable(obj) == nil)
+    json.options('has_metatfield', old_options)
+end
+
+do
+    local forced_object = json.object({1, 2, 3})
+    local encoded = json.encode(forced_object)
+    assert(string.sub(encoded, 1, 1) == "{")
+
+    local forced_array = json.array({ foo = "bar" })
+    encoded = json.encode(forced_array)
+    assert(encoded == "[]")
+end
+
+do
+    local old_options = json.options('enable_number_key', false)
+    local t = json.decode('{"1":1,"2":2}')
+    assert(t[1] == nil)
+    assert(t["1"] == 1)
+    assert(t["2"] == 2)
+    json.options('enable_number_key', old_options)
+end
+
+do
+    local old_size = json.options('concat_buffer_size', 128)
+    assert(old_size ~= nil)
+    local ok = pcall(json.options, 'concat_buffer_size', 15)
+    assert(not ok)
+
+    ok = pcall(json.options, 'not_exists', true)
+    assert(not ok)
+
+    json.options('concat_buffer_size', old_size)
+end
+
+moon.quit()

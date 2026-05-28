@@ -1,0 +1,71 @@
+[package]
+name = "moon-modules"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+doctest = false
+
+[features]
+default = ["excel", "httpc", "httpd", "sqlx", "mongodb", "websocket"]
+excel = ["dep:calamine", "dep:csv"]
+httpc = ["dep:reqwest", "dep:httparse", "dep:percent-encoding", "dep:form_urlencoded", "dep:url"]
+httpd = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-util", "dep:futures-util", "dep:httpdate"]
+sqlx = ["dep:sqlx", "dep:chrono", "dep:phf", "dep:uuid"]
+mongodb = ["dep:mongodb", "dep:futures"]
+websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
+
+[dependencies]
+moon-runtime = { workspace = true }
+moon-lua = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+num_cpus = { workspace = true }
+
+bytes = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+dashmap = { workspace = true }
+lazy_static = { workspace = true }
+
+# Optional: Excel
+calamine = { workspace = true, optional = true }
+csv = { workspace = true, optional = true }
+
+# Optional: HTTP client
+reqwest = { workspace = true, optional = true }
+httparse = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+form_urlencoded = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+# Optional: HTTP server
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+
+# Optional: SQLx
+sqlx = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+phf = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+# Optional: MongoDB
+mongodb = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+# Optional: HTTP date formatting/parsing
+httpdate = { workspace = true, optional = true }
+
+# Optional: WebSocket
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }

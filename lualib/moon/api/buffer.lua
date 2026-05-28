@@ -1,6 +1,4 @@
 ---@meta
-error("DO NOT REQUIRE THIS FILE")
-
 --- Represents a `Rust Buffer` object, which is not managed by `Lua GC`. 
 --- This is often used for data transmission between Lua and Rust layers.
 --- This object can be used as an argument for `moon.raw_send` or `socket.write`, 
