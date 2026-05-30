@@ -64,7 +64,7 @@ fn setup_signal() {
         type DWORD = u32;
         type ConsoleHandlerRoutine = extern "system" fn(DWORD) -> i32;
 
-        extern "system" {
+        unsafe extern "system" {
             fn SetConsoleTitleA(title: *const i8) -> i32;
             fn SetConsoleCtrlHandler(f: ConsoleHandlerRoutine, add: i32) -> i32;
         }

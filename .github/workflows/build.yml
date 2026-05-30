@@ -38,10 +38,16 @@ jobs:
           override: true
           target: ${{ matrix.target }}
 
+      - name: Install musl toolchain
+        if: matrix.build == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build binary
         run: cargo build --verbose --release --target ${{ matrix.target }}
         env:
           RUST_BACKTRACE: 1
+          CC_x86_64_unknown_linux_musl: ${{ matrix.build == 'linux' && 'musl-gcc' || '' }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.build == 'linux' && 'musl-gcc' || '' }}
 
       - name: Strip binary (linux and macos)
         if: matrix.build == 'linux' || matrix.build == 'macos'
