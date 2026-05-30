@@ -381,9 +381,9 @@ extern "C-unwind" fn lua_actor_send(state: LuaState) -> c_int {
 
     let actor = LuaActor::from_lua_state(state);
 
-    let from = unsafe { (*actor).id };
-
     let session = laux::lua_opt(state, 4).unwrap_or(unsafe { (*actor).next_session() });
+
+    let from = laux::lua_opt(state, 5).unwrap_or(unsafe { (*actor).id });
 
     if let Some(m) = CONTEXT.send(Message {
         ptype,

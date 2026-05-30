@@ -6,102 +6,111 @@ require("base.math")
 require("base.util")
 require("base.class")
 
-local core = require("moon.core")
-local seri = require("seri")
+local core             = require("moon.core")
+local seri             = require("seri")
 
-local pairs = pairs
-local type = type
-local error = error
-local tremove = table.remove
-local traceback = debug.traceback
+local pairs            = pairs
+local type             = type
+local error            = error
+local tremove          = table.remove
+local traceback        = debug.traceback
 
-local co_create = coroutine.create
-local co_running = coroutine.running
-local co_yield = coroutine.yield
-local co_resume = coroutine.resume
-local co_close = coroutine.close
+local co_create        = coroutine.create
+local co_running       = coroutine.running
+local co_yield         = coroutine.yield
+local co_resume        = coroutine.resume
+local co_close         = coroutine.close
 
-local _send = core.send
-local _now = core.now
-local _addr = core.id
-local _timeout = core.timeout
-local _newservice = core.new_service
-local _decode = core.decode
+local _send            = core.send
+local _now             = core.now
+local _addr            = core.id
+local _timeout         = core.timeout
+local _newservice      = core.new_service
+local _decode          = core.decode
+
+---@alias buffer_ptr lightuserdata
+---@alias message_ptr lightuserdata
+
+---@alias PTYPE
+---| 'lua'       # Lua object messages (serialized)
+---| 'text'      # Plain text messages
+---| 'system'    # System control messages
+---| 'error'     # Error messages
+---| 'debug'     # Debug messages
+---| 'shutdown'  # Shutdown signals
+---| 'timer'     # Timer events
+---| 'tcp'       # TCP socket messages
+---| 'udp'       # UDP socket messages
+---| 'integer'   # Integer messages
+
+---@alias LogLevel
+---| 1 # LOG_ERROR
+---| 2 # LOG_WARN
+---| 3 # LOG_INFO
+---| 4 # LOG_DEBUG
 
 ---@class moon : runtime
-local moon = core
+local moon             = core
 
-moon.PTYPE_SYSTEM = 1
-moon.PTYPE_TEXT = 2
-moon.PTYPE_LUA = 3
-moon.PTYPE_ERROR = 4
-moon.PTYPE_DEBUG = 5
-moon.PTYPE_SHUTDOWN = 6
-moon.PTYPE_TIMER = 7
-moon.PTYPE_SOCKET_TCP = 8
-moon.PTYPE_SOCKET_UDP = 9
--- moon.PTYPE_SOCKET_WS = 10
--- moon.PTYPE_SOCKET_MOON = 11
-moon.PTYPE_INTEGER = 12
-moon.PTYPE_HTTPC = 13
--- moon.PTYPE_QUIT = 14
-moon.PTYPE_SQLX = 15
-moon.PTYPE_MONGODB = 16
-moon.PTYPE_WEBSOCKET = 17
-moon.PTYPE_HTTPD = 18
+moon.PTYPE_SYSTEM      = 1
+moon.PTYPE_TEXT        = 2
+moon.PTYPE_LUA         = 3
+moon.PTYPE_ERROR       = 4
+moon.PTYPE_DEBUG       = 5
+moon.PTYPE_SHUTDOWN    = 6
+moon.PTYPE_TIMER       = 7
+moon.PTYPE_SOCKET_TCP  = 8
+moon.PTYPE_SOCKET_UDP  = 9
+moon.PTYPE_INTEGER     = 12
+moon.PTYPE_HTTPC       = 13
+moon.PTYPE_SQLX        = 15
+moon.PTYPE_MONGODB     = 16
+moon.PTYPE_WEBSOCKET   = 17
+moon.PTYPE_HTTPD       = 18
 
---moon.codecache = require("codecache")
-
--- LOG_ERROR = 1
--- LOG_WARN = 2
--- LOG_INFO = 3
--- LOG_DEBUG = 4
-moon.DEBUG = function()
-    return core.loglevel() == 4 -- LOG_DEBUG
+--- Checks if debug logging is enabled
+--- @return boolean
+moon.DEBUG             = function()
+    return core.loglevel() == 4
 end
 
 local LOG_ERROR = 1
-local LOG_WARN = 2
-local LOG_INFO = 3
+local LOG_WARN  = 2
+local LOG_INFO  = 3
 local LOG_DEBUG = 4
 
---- Logs an informational message.
 --- @param ... any @ The message content.
 moon.info = function(...)
     core.log(LOG_INFO, 2, ...)
 end
 
---- Logs a warning message.
 --- @param ... any @ The message content.
 moon.warn = function(...)
     core.log(LOG_WARN, 2, ...)
 end
 
---- Logs an error message.
 --- @param ... any @ The message content.
 moon.error = function(...)
     core.log(LOG_ERROR, 2, ...)
 end
 
---- Logs a debug message.
 --- @param ... any @ The message content.
 moon.debug = function(...)
     core.log(LOG_DEBUG, 2, ...)
 end
 
----@type fun(log_level:integer, stack_level:integer, ...) Description
+---@type fun(log_level:integer, stack_level:integer, ...)
 moon.log = core.log
 
-moon.pack = seri.pack
-moon.unpack = seri.unpack
+moon.pack              = seri.pack
+moon.unpack            = seri.unpack
 
---export global variable
 local _g = _G
 
----rewrite lua print
 _g["print"] = moon.info
 
---- Sets a Lua global variable. It is not recommended to use this unless necessary.
+--- Global variable export mechanism.
+--- It is not recommended to use this unless necessary.
 moon.exports = {}
 
 setmetatable(
@@ -116,26 +125,26 @@ setmetatable(
     }
 )
 
--- disable create unexpected global variable
 setmetatable(
     _g,
     {
         __newindex = function(_, name, value)
-            if name:sub(1, 4) ~= 'sol.' then --ignore sol2 registed library
-                local msg = string.format('USE "moon.exports.%s = <value>" INSTEAD OF SET GLOBAL VARIABLE', name)
-                moon.error(traceback(msg, 2))
-            else
-                rawset(_g, name, value)
-            end
+            local msg = string.format('USE "moon.exports.%s = <value>" INSTEAD OF SET GLOBAL VARIABLE', name)
+            moon.error(traceback(msg, 2))
         end
     }
 )
 
+---@type table<integer, thread?>
 local session_id_coroutine = {}
 local protocol = {}
 local session_watcher = {}
 local timer_routine = {}
+local timer_profile_trace = {}
 
+--- Safely resumes a coroutine with error handling
+--- @param co thread
+--- @return boolean, string?
 local function coresume(co, ...)
     local ok, err = co_resume(co, ...)
     if not ok then
@@ -147,7 +156,7 @@ local function coresume(co, ...)
 end
 
 --- Sends a message to the specified service. The message content will be packed according to the `PTYPE` type.
---- @param PTYPE string @ The protocol type, e.g., "lua".
+--- @param PTYPE PTYPE @ The protocol type, e.g., "lua".
 --- @param receiver integer @ The service ID of the receiver.
 --- @param ... any @ The message content.
 function moon.send(PTYPE, receiver, ...)
@@ -159,23 +168,33 @@ function moon.send(PTYPE, receiver, ...)
 end
 
 --- Sends a message to the specified service without packing the message content.
---- @param PTYPE string @ The protocol type.
+--- @param PTYPE PTYPE @ The protocol type.
 --- @param receiver integer @ The service ID of the receiver.
---- @param data? string|buffer_ptr @ The message content.
---- @param session? integer @ The session ID.
-function moon.raw_send(PTYPE, receiver, data, session)
+--- @param data? string|buffer_ptr @ The message content (raw data).
+--- @param session? integer @ The session ID for request-response pattern.
+--- @param sender? integer @ The dummy sender's service ID.
+--- @return integer @ The session ID used for the message.
+function moon.raw_send(PTYPE, receiver, data, session, sender)
     local p = protocol[PTYPE]
     if not p then
         error(string.format("moon send unknown PTYPE[%s] message", PTYPE))
     end
     session = session or 0
-    _send(p.PTYPE, receiver, data, session)
+    return _send(p.PTYPE, receiver, data, session, sender)
 end
 
---- @class service_params
---- @field name string The name of the service.
---- @field source string The path to the startup script file for the service.
---- @field unique? boolean An optional boolean that indicates whether the service is unique. The default is `false`. If set to `true`, you can use the `moon.query(name)` function to query the service ID.
+---@class protocol_config
+---@field name string The protocol name
+---@field PTYPE integer The protocol type constant
+---@field pack? fun(...: any): string|buffer_ptr The packing function
+---@field unpack? fun(data: string|cstring_ptr, len?: integer): any ... The unpacking function
+---@field dispatch? fun(sender: integer, session: integer, ...: any) The message handler
+---@field israw? boolean Whether this is a raw protocol (receives message_ptr directly)
+
+---@class service_params
+---@field name string The name of the service.
+---@field source string The path to the startup script file for the service.
+---@field unique? boolean Whether the service is unique. Default is `false`. If `true`, use `moon.query(name)` to query the service ID.
 
 --- Creates a new service.
 --- @async
@@ -283,12 +302,13 @@ function moon.async(fn, ...)
     return co
 end
 
---- Suspends the current coroutine.
+--- Suspends the current coroutine and waits for a message or wakeup.
+--- @async
 --- @param session? integer @ An optional session ID used to map the coroutine for wakeup.
 --- @param receiver? integer @ An optional receiver's service ID.
---- @return ... @ Returns the unpacked message if the coroutine is resumed by a message. If the coroutine is resumed by `moon.wakeup`, it returns the additional parameters passed by `moon.wakeup`. If the coroutine is broken, it returns `false` and "BREAK".
-function moon.wait(session, receiver)
-    -- print("moon.wait", session, receiver)
+--- @param is_raw? boolean @ Whether to return raw message data instead of unpacked data.
+--- @return any ... @ Returns the unpacked message if the coroutine is resumed by a message. If the coroutine is resumed by `moon.wakeup`, it returns the additional parameters passed by `moon.wakeup`. If the coroutine is broken, it returns `false` and "BREAK".
+function moon.wait(session, receiver, is_raw)
     if session then
         session_id_coroutine[session] = co_running()
         if receiver then
@@ -302,18 +322,20 @@ function moon.wait(session, receiver)
 
     local a, b, c = co_yield()
     if a then
-        -- sz,len,PTYPE
+        if is_raw then
+            return a, b
+        end
         return protocol[c].unpack(a, b)
     else
-        -- false, "BREAK", {...}
         if session then
+            ---@diagnostic disable-next-line: assign-type-mismatch
             session_id_coroutine[session] = false
         end
 
-        if c then -- Extra parameters passed to moon.wakeup
+        if c then
             return table.unpack(c)
         else
-            return a, b --- false, "BREAK"
+            return a, b
         end
     end
 end
@@ -349,14 +371,16 @@ end
 --     return moon.wait(sessionid)
 -- end
 
---- Sends a message to the target service and waits for a response. The receiver must call `moon.response` to return the result.
----  - If the request is successful, the return value is the `params` part of `moon.response(id, response, params...)`.
----  - If the request fails, it returns `false` and an error message string.
----@async
----@param PTYPE string @ The protocol type.
----@param receiver integer @ The service ID of the receiver.
----@return ... @ The response from the receiver.
----@nodiscard
+--- Sends a message to the target service and waits for a response.
+--- The receiver must call `moon.response` to return the result.
+--- - If the request is successful, the return value is the `params` part of `moon.response(id, response, params...)`.
+--- - If the request fails, it returns `false` and an error message string.
+--- @async
+--- @param PTYPE PTYPE @ The protocol type.
+--- @param receiver integer @ The service ID of the receiver.
+--- @param ... any @ The message content to send.
+--- @return any ... @ The response from the receiver.
+--- @nodiscard
 function moon.call(PTYPE, receiver, ...)
     local p = protocol[PTYPE]
     if not p then
@@ -400,8 +424,8 @@ local function _dispatch(PTYPE, sender, session, sz, len, m)
     if session > 0 then
         session_watcher[session] = nil
         local co = session_id_coroutine[session]
+        session_id_coroutine[session] = nil
         if co then
-            session_id_coroutine[session] = nil
             --print(coroutine.status(co))
             coresume(co, sz, len, PTYPE)
             --print(coroutine.status(co))
@@ -432,6 +456,7 @@ end
 core.callback(_dispatch)
 
 --- Registers a new message protocol.
+--- @param t protocol_config @ Protocol configuration table
 function moon.register_protocol(t)
     local PTYPE = t.PTYPE
     if protocol[PTYPE] then
@@ -444,24 +469,24 @@ end
 local reg_protocol = moon.register_protocol
 
 --- Sets the message handler for the specified protocol type.
---- @param PTYPE string @ The protocol type.
---- @param fn fun(sender:integer, session:integer, ...) @ The message handler
+--- @param PTYPE PTYPE @ The protocol type.
+--- @param fn fun(sender: integer, session: integer, ...: any) @ The message handler function.
 function moon.dispatch(PTYPE, fn)
     local p = protocol[PTYPE]
-    if fn then
-        p.dispatch = fn
-    end
+    ---@diagnostic disable-next-line: need-check-nil, assign-type-mismatch
+    p.dispatch = fn
 end
 
---- Sets the message handler for the specified protocol type. Unlike `moon.dispatch`, this function does not unpack the message.
---- @param PTYPE string @ The protocol type.
---- @param fn fun(m:message_ptr) The message handler.
+--- Sets the message handler for the specified protocol type.
+--- Unlike `moon.dispatch`, this function does not unpack the message and receives the raw message pointer.
+--- @param PTYPE PTYPE @ The protocol type.
+--- @param fn fun(m: message_ptr) @ The message handler function that receives raw message.
 function moon.raw_dispatch(PTYPE, fn)
     local p = protocol[PTYPE]
-    if fn then
-        p.dispatch = fn
-        p.israw = true
-    end
+    ---@diagnostic disable-next-line: need-check-nil, assign-type-mismatch
+    p.dispatch = fn
+    ---@diagnostic disable-next-line: need-check-nil, assign-type-mismatch
+    p.israw = true
 end
 
 reg_protocol {
@@ -503,16 +528,19 @@ reg_protocol {
 reg_protocol {
     name = "error",
     PTYPE = moon.PTYPE_ERROR,
-    israw = true,
     pack = function(...)
         return ...
     end,
     unpack = function(sz, len)
-        local data = moon.tostring(sz, len) or "unknown error"
-        return false, data
+        ---@diagnostic disable-next-line: param-type-mismatch
+        return false, moon.tostring(sz, len) or "unknown error"
+    end,
+    dispatch = function(_, _, ...)
+        moon.error(...)
     end
 }
 
+---@type table<string, fun(...: any)>
 local system_command = {}
 
 system_command._service_exit = function(sender, what)
@@ -528,6 +556,9 @@ system_command._service_exit = function(sender, what)
     end
 end
 
+--- Registers a system command handler.
+--- @param cmd string @ The command name.
+--- @param fn fun(sender: integer, ...: any) @ The handler function.
 moon.system = function(cmd, fn)
     system_command[cmd] = fn
 end
@@ -570,30 +601,29 @@ reg_protocol {
     end
 }
 
-local cb_shutdown
+local _shutdown = function()
+    if moon.name == "bootstrap" or 0 == moon.query(moon.name) then
+        moon.quit()
+    end
+end
 
 reg_protocol {
     name = "shutdown",
     PTYPE = moon.PTYPE_SHUTDOWN,
     israw = true,
     dispatch = function()
-        if cb_shutdown then
-            cb_shutdown()
-        else
-            --- bootstrap or not unique service will quit immediately
-            if moon.name == "bootstrap" or 0 == moon.query(moon.name) then
-                moon.quit()
-            end
-        end
+        _shutdown()
     end
 }
 
---- Registers a process exit signal handler function. You need to actively call `moon.quit` in the handler, otherwise the service will not exit.
---- You can start a new coroutine to execute asynchronous logic: such as the server safe shutdown process, waiting for services to close in a specified order, saving data, etc.
+--- Registers a process exit signal handler function.
+--- You need to actively call `moon.quit` in the handler, otherwise the service will not exit.
+--- You can start a new coroutine to execute asynchronous logic: such as the server safe shutdown process,
+--- waiting for services to close in a specified order, saving data, etc.
 --- **For unique services, you generally need to register this function to handle the exit process, or use `moon.kill` to force close**
----@param callback fun() @ The function to be called when the process is shutting down.
+--- @param callback fun() @ The function to be called when the process is shutting down.
 function moon.shutdown(callback)
-    cb_shutdown = callback
+    _shutdown = callback
 end
 
 --------------------------Timer-------------
@@ -606,13 +636,20 @@ reg_protocol {
         local timerid = _decode(m, "S")
         local v = timer_routine[timerid]
         timer_routine[timerid] = nil
+        local trace = timer_profile_trace[timerid]
+        timer_profile_trace[timerid] = nil
         if not v then
             return
         end
+        local st = moon.clock()
         if type(v) == "thread" then
             coresume(v, timerid)
         else
-            v()
+            v(timerid)
+        end
+        local elapsed = moon.clock() - st
+        if trace and elapsed > 0.1 then
+            moon.warn(string.format("Timer %s cost %.3fs trace '%s'", timerid, elapsed, trace))
         end
     end
 }
@@ -623,24 +660,30 @@ function moon.remove_timer(timerid)
     timer_routine[timerid] = false
 end
 
---- Creates a timer that triggers a callback function after waiting for a specified number of milliseconds. If `mills <= 0`, the behavior of this function degenerates into posting a message to the message queue, which is very useful for operations that need to be delayed.
+--- Creates a timer that triggers a callback function after waiting for a specified number of milliseconds.
+--- If `mills <= 0`, the behavior degenerates into posting a message to the message queue.
 --- @param mills integer @ The number of milliseconds to wait.
---- @param fn function @ The callback function to be triggered.
+--- @param fn fun(timerid: integer) @ The callback function to be triggered.
+--- @param profile_trace? string @ Trace info for timer profiling (useful for debugging slow timers).
 --- @return integer @ Returns the timer ID. You can use `moon.remove_timer` to remove the timer.
-function moon.timeout(mills, fn)
+function moon.timeout(mills, fn, profile_trace)
     local timerid = _timeout(mills)
     timer_routine[timerid] = fn
+    timer_profile_trace[timerid] = profile_trace
     return timerid
 end
 
 --- Suspends the current coroutine for at least `mills` milliseconds.
+--- @async
 --- @param mills integer @ The number of milliseconds to suspend.
+--- @param profile_trace? string @ Trace info for timer profiling.
 --- @return boolean, string? @ If the timer is awakened by `moon.wakeup`, it returns `false`. If the timer is triggered normally, it returns `true`.
-function moon.sleep(mills)
-    local timerid = core.timeout(mills)
+function moon.sleep(mills, profile_trace)
+    local timerid = _timeout(mills)
     timer_routine[timerid] = co_running()
+    timer_profile_trace[timerid] = profile_trace
     local id, reason = co_yield()
-    if timerid ~= id then
+    if id ~= timerid then
         timer_routine[timerid] = false
         return false, reason
     end
@@ -649,25 +692,25 @@ end
 
 --------------------------DEBUG----------------------------
 
+---@type table<string, fun(...: any): any ...>
 local debug_command = {}
 
-debug_command.gc = function(sender, sessionid)
+debug_command.gc = function()
     collectgarbage("collect")
-    moon.response("debug", sender, sessionid, collectgarbage("count"))
+    return collectgarbage("count")
 end
 
-debug_command.mem = function(sender, sessionid)
-    moon.response("debug", sender, sessionid, collectgarbage("count"))
+debug_command.mem = function()
+    return collectgarbage("count")
 end
 
-debug_command.ping = function(sender, sessionid)
-    moon.response("debug", sender, sessionid, "pong")
+debug_command.ping = function()
+    return "pong"
 end
 
-debug_command.state = function(sender, sessionid)
+debug_command.state = function()
     local running_num, free_num = moon.coroutine_num()
-    local s = string.format("co-running %d co-free %d cpu:%d", running_num, free_num, moon.cpu())
-    moon.response("debug", sender, sessionid, s)
+    return string.format("coroutine: running %d free %d. cpu:%d", running_num, free_num, moon.cpu())
 end
 
 reg_protocol {
@@ -678,9 +721,9 @@ reg_protocol {
     dispatch = function(sender, session, cmd, ...)
         local func = debug_command[cmd]
         if func then
-            func(sender, session, ...)
+            moon.response("debug", sender, session, func(...))
         else
-            moon.response("debug", sender, session, "unknow debug cmd " .. cmd)
+            moon.response("debug", sender, session, "unknown debug cmd " .. cmd)
         end
     end
 }
