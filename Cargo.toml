@@ -36,6 +36,7 @@ base64 = "^0.22"
 sha2 = "0.11"
 md-5 = "0.11"
 sha1 = "0.11"
+rand = "0.10"
 
 httparse = "1.8.0"
 percent-encoding = "2.3.1"
@@ -54,9 +55,16 @@ http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-util = { version = "0.7", features = ["io"] }
 httpdate = "1"
+lexical-core = "1.0"
+memchr = "2"
 
 [profile.release]
 strip = true
 codegen-units = 1
 lto = true
 # panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
