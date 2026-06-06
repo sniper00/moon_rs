@@ -1,8 +1,9 @@
 use crate::lua_json::{JsonOptions, encode_table};
 use dashmap::DashMap;
+use futures::TryStreamExt;
 use lazy_static::lazy_static;
 use moon_runtime::actor::LuaActor;
-use moon_runtime::context::{self, CONTEXT};
+use moon_runtime::context::{self, ActorId, CONTEXT};
 use moon_lua::laux::LuaState;
 use moon_lua::{
     cstr, ffi, laux,
@@ -21,7 +22,8 @@ use std::{
     sync::{Arc, atomic::AtomicI64},
     time::Duration,
 };
-use tokio::{sync::mpsc, time::timeout};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 
 lazy_static! {
     static ref DATABASE_CONNECTIONS: DashMap<String, DatabaseConnection> = DashMap::new();
@@ -361,9 +363,25 @@ impl DatabasePool {
 // Request / Response / Connection types
 // ---------------------------------------------------------------------------
 
+enum CursorSignal {
+    Next(ActorId, i64),
+    Close,
+}
+
+struct SqlxCursorHandle(Option<oneshot::Sender<CursorSignal>>);
+
+impl Drop for SqlxCursorHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(CursorSignal::Close);
+        }
+    }
+}
+
 enum DatabaseRequest {
-    Query(i64, i64, DatabaseQuery),
-    Transaction(i64, i64, Vec<DatabaseQuery>),
+    Query(ActorId, i64, DatabaseQuery),
+    QueryStream(ActorId, i64, DatabaseQuery, usize),
+    Transaction(ActorId, i64, Vec<DatabaseQuery>),
     Close(),
 }
 
@@ -378,6 +396,9 @@ enum DatabaseResponse {
     PgRows(Vec<PgRow>),
     MysqlRows(Vec<MySqlRow>),
     SqliteRows(Vec<SqliteRow>),
+    PgBatch(Vec<PgRow>, Option<oneshot::Sender<CursorSignal>>),
+    MysqlBatch(Vec<MySqlRow>, Option<oneshot::Sender<CursorSignal>>),
+    SqliteBatch(Vec<SqliteRow>, Option<oneshot::Sender<CursorSignal>>),
     Error(sqlx::Error),
     Timeout(String),
     Transaction,
@@ -412,7 +433,7 @@ async fn handle_result(
     failed_times: &mut i32,
     counter: &Arc<AtomicI64>,
     protocol_type: u8,
-    owner: i64,
+    owner: ActorId,
     session: i64,
     res: Result<DatabaseResponse, sqlx::Error>,
 ) -> bool {
@@ -490,6 +511,73 @@ async fn database_handler(
                 .await
                 {}
             }
+            DatabaseRequest::QueryStream(owner, session, query_op, batch_size) => {
+                counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                let batch_size = *batch_size;
+                let mut current_owner = *owner;
+                let mut current_session = *session;
+
+                macro_rules! do_stream {
+                    ($pool:expr, $variant:ident) => {{
+                        let query_result = DatabasePool::make_query(query_op.sql.clone(), &query_op.binds);
+                        match query_result {
+                            Ok(q) => {
+                                let mut stream = q.fetch($pool);
+                                loop {
+                                    let mut batch = Vec::with_capacity(batch_size);
+                                    let mut errored = false;
+                                    for _ in 0..batch_size {
+                                        match stream.try_next().await {
+                                            Ok(Some(row)) => batch.push(row),
+                                            Ok(None) => break,
+                                            Err(err) => {
+                                                CONTEXT.response_error(0, current_owner, -current_session, err.to_string());
+                                                errored = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if errored { break; }
+
+                                    let cursor_exhausted = batch.len() < batch_size;
+                                    let (next_tx, next_rx) = if !cursor_exhausted {
+                                        let (tx, rx) = oneshot::channel();
+                                        (Some(tx), Some(rx))
+                                    } else {
+                                        (None, None)
+                                    };
+
+                                    let _ = CONTEXT.send_value(
+                                        protocol_type,
+                                        current_owner,
+                                        current_session,
+                                        DatabaseResponse::$variant(batch, next_tx),
+                                    );
+
+                                    if cursor_exhausted { break; }
+
+                                    match next_rx.unwrap().await {
+                                        Ok(CursorSignal::Next(new_owner, new_session)) => {
+                                            current_owner = new_owner;
+                                            current_session = new_session;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                CONTEXT.response_error(0, current_owner, -current_session, err.to_string());
+                            }
+                        }
+                    }};
+                }
+
+                match pool {
+                    DatabasePool::MySql(p) => do_stream!(p, MysqlBatch),
+                    DatabasePool::Postgres(p) => do_stream!(p, PgBatch),
+                    DatabasePool::Sqlite(p) => do_stream!(p, SqliteBatch),
+                }
+            }
             DatabaseRequest::Close() => {
                 break;
             }
@@ -517,7 +605,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let database_url = database_url.to_string();
     let name = name.to_string();
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         match DatabasePool::connect(
             &database_url,
             Duration::from_millis(connect_timeout),
@@ -612,12 +700,13 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
     Ok(res)
 }
 
-extern "C-unwind" fn query(state: LuaState) -> c_int {
+extern "C-unwind" fn query(state: LuaState) -> c_int { query_impl(state, false) }
+extern "C-unwind" fn exec_query(state: LuaState) -> c_int { query_impl(state, true) }
+
+fn query_impl(state: LuaState, forget: bool) -> c_int {
     let mut args = LuaArgs::new(1);
     let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
         .expect("invalid database connection pointer");
-
-    let session = laux::lua_get(state, args.iter_arg());
 
     let sql = unsafe { laux::lua_check_str(state, args.iter_arg()) };
     let mut params = Vec::new();
@@ -632,7 +721,9 @@ extern "C-unwind" fn query(state: LuaState) -> c_int {
         }
     }
 
-    let owner = unsafe { (*LuaActor::from_lua_state(state)).id };
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+    let session: i64 = if forget { 0 } else { unsafe { (*actor).next_session() } };
 
     match conn.tx.try_send(DatabaseRequest::Query(
         owner,
@@ -641,6 +732,51 @@ extern "C-unwind" fn query(state: LuaState) -> c_int {
             sql: sql.to_string(),
             binds: params,
         },
+    )) {
+        Ok(_) => {
+            conn.counter
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            if forget { laux::lua_push(state, true); } else { laux::lua_push(state, session); }
+            1
+        }
+        Err(err) => {
+            push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
+            1
+        }
+    }
+}
+
+extern "C-unwind" fn query_stream(state: LuaState) -> c_int {
+    let mut args = LuaArgs::new(1);
+    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
+        .expect("invalid database connection pointer");
+
+    let batch_size: usize = laux::lua_opt(state, args.iter_arg()).unwrap_or(100);
+    let sql = unsafe { laux::lua_check_str(state, args.iter_arg()) };
+    let mut params = Vec::new();
+    let top = laux::lua_top(state);
+    for i in args.iter_arg()..=top {
+        match get_query_param(state, i) {
+            Ok(value) => params.push(value),
+            Err(err) => {
+                push_lua_table!(state, "kind" => "ERROR", "message" => err);
+                return 1;
+            }
+        }
+    }
+
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+    let session = unsafe { (*actor).next_session() };
+
+    match conn.tx.try_send(DatabaseRequest::QueryStream(
+        owner,
+        session,
+        DatabaseQuery {
+            sql: sql.to_string(),
+            binds: params,
+        },
+        batch_size,
     )) {
         Ok(_) => {
             conn.counter
@@ -692,17 +828,20 @@ extern "C-unwind" fn make_transaction(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn transaction(state: LuaState) -> c_int {
+extern "C-unwind" fn transaction(state: LuaState) -> c_int { transaction_impl(state, false) }
+extern "C-unwind" fn exec_transaction(state: LuaState) -> c_int { transaction_impl(state, true) }
+
+fn transaction_impl(state: LuaState, forget: bool) -> c_int {
     let mut args = LuaArgs::new(1);
     let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
         .expect("invalid database connection pointer");
 
-    let session = laux::lua_get(state, args.iter_arg());
-
     let queries = laux::lua_touserdata::<TransactionQueries>(state, args.iter_arg())
         .expect("invalid transaction queries pointer");
 
-    let owner = unsafe { (*LuaActor::from_lua_state(state)).id };
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+    let session: i64 = if forget { 0 } else { unsafe { (*actor).next_session() } };
 
     match conn.tx.try_send(DatabaseRequest::Transaction(
         owner,
@@ -712,7 +851,7 @@ extern "C-unwind" fn transaction(state: LuaState) -> c_int {
         Ok(_) => {
             conn.counter
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
-            laux::lua_push(state, session);
+            if forget { laux::lua_push(state, true); } else { laux::lua_push(state, session); }
             1
         }
         Err(err) => {
@@ -744,7 +883,10 @@ extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
         Some(pair) => {
             let l = [
                 lreg!("query", query),
+                lreg!("exec_query", exec_query),
+                lreg!("query_stream", query_stream),
                 lreg!("transaction", transaction),
+                lreg!("exec_transaction", exec_transaction),
                 lreg!("close", close),
                 lreg_null!(),
             ];
@@ -767,6 +909,48 @@ extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
     1
 }
 
+extern "C-unwind" fn sqlx_cursor_next(state: LuaState) -> c_int {
+    let handle = laux::lua_touserdata::<SqlxCursorHandle>(state, 1)
+        .expect("invalid sqlx cursor handle");
+    if let Some(tx) = handle.0.take() {
+        let actor = LuaActor::from_lua_state(state);
+        let owner = unsafe { (*actor).id };
+        let session = unsafe { (*actor).next_session() };
+        let _ = tx.send(CursorSignal::Next(owner, session));
+        laux::lua_push(state, session);
+        1
+    } else {
+        crate::lua_push_error(state, "sqlx cursor: already consumed or closed")
+    }
+}
+
+extern "C-unwind" fn sqlx_cursor_close(state: LuaState) -> c_int {
+    let handle = laux::lua_touserdata::<SqlxCursorHandle>(state, 1)
+        .expect("invalid sqlx cursor handle");
+    if let Some(tx) = handle.0.take() {
+        let _ = tx.send(CursorSignal::Close);
+    }
+    0
+}
+
+fn push_cursor_handle(state: LuaState, next_tx: Option<oneshot::Sender<CursorSignal>>) {
+    if let Some(tx) = next_tx {
+        let methods = [
+            lreg!("next", sqlx_cursor_next),
+            lreg!("close", sqlx_cursor_close),
+            lreg_null!(),
+        ];
+        laux::lua_newuserdata(
+            state,
+            SqlxCursorHandle(Some(tx)),
+            cstr!("sqlx_cursor_handle"),
+            &methods,
+        );
+    } else {
+        laux::lua_pushnil(state);
+    }
+}
+
 extern "C-unwind" fn decode(state: LuaState) -> c_int {
     laux::lua_checkstack(state, 6, std::ptr::null());
     let result = lua_into_userdata::<DatabaseResponse>(state, 1);
@@ -777,6 +961,21 @@ extern "C-unwind" fn decode(state: LuaState) -> c_int {
         }
         DatabaseResponse::MysqlRows(rows) => process_rows::<MySql>(state, &rows),
         DatabaseResponse::SqliteRows(rows) => process_rows::<Sqlite>(state, &rows),
+        DatabaseResponse::PgBatch(rows, next_tx) => {
+            process_rows::<Postgres>(state, &rows);
+            push_cursor_handle(state, next_tx);
+            2
+        }
+        DatabaseResponse::MysqlBatch(rows, next_tx) => {
+            process_rows::<MySql>(state, &rows);
+            push_cursor_handle(state, next_tx);
+            2
+        }
+        DatabaseResponse::SqliteBatch(rows, next_tx) => {
+            process_rows::<Sqlite>(state, &rows);
+            push_cursor_handle(state, next_tx);
+            2
+        }
         DatabaseResponse::Transaction => {
             push_lua_table!(state, "message" => "ok");
             1

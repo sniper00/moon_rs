@@ -1,7 +1,7 @@
 local json = require("json")
 local buffer = require("buffer")
 local socket = require("moon.socket")
-local c = require("http.core")
+local c = require("httpc.core")
 
 
 local table = table
@@ -184,7 +184,7 @@ local function read_chunked(fd, content_max_len)
 end
 
 local function read_response(fd, method, read_timeout)
-    local data, err = socket.read(fd, "\r\n\r\n", read_timeout)
+    local data, err = socket.read(fd, "\r\n\r\n", nil, read_timeout)
     if not data then
         return { error = err }
     end
@@ -274,7 +274,7 @@ function M.read_request(fd, timeout, prefix_data, opt)
     local header_max_len = opt.header_max_len or 8192
     local content_max_len = opt.content_max_len or 5242880 -- 5MB
 
-    local data, err = socket.read(fd, "^\r\n\r\n", header_max_len)
+    local data, err = socket.read(fd, "^\r\n\r\n", header_max_len, timeout)
     if not data then
         return { error = err, network_error = true }
     end

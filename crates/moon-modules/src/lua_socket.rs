@@ -1,17 +1,16 @@
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use moon_runtime::{buffer::Buffer, check_buffer, context::MessageData};
+use moon_runtime::{buffer::Buffer, check_arc_buffer, context::MessageBody};
 use moon_lua::{
     cstr, ffi,
     laux::{self, LuaState, LuaType},
     lreg, lreg_null, luaL_newlib,
 };
+use std::ffi::c_void;
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{
-    ffi::c_int,
-    sync::atomic::{AtomicI64, Ordering},
-};
+use std::ffi::c_int;
 use tokio::io::AsyncReadExt;
 
 use tokio::{
@@ -26,86 +25,91 @@ use tokio::{
 
 use moon_runtime::{
     actor::LuaActor,
-    context::{self, CONTEXT, Message},
+    context::{self, ActorId, CONTEXT, Message},
 };
+
+use crate::next_net_fd;
+
+use crate::ShortBytes;
 
 lazy_static! {
     static ref NET: DashMap<i64, NetChannel> = DashMap::new();
-    static ref NET_UUID: AtomicI64 = AtomicI64::new(1);
 }
+
+/// Delimiter type used in ReadUntil: max 7 bytes, no heap allocation.
+pub type Delimiter = ShortBytes<8>;
 
 #[derive(Debug)]
 pub enum NetOp {
-    Accept(i64, i64),                         //owner,session
-    ReadUntil(i64, i64, usize, Vec<u8>, u64), //owner,session,max_size
-    ReadBytes(i64, i64, usize, u64),          //owner,session,size
-    Write(i64, Box<Buffer>, bool),            //owner,data
+    ReadUntil(ActorId, i64, usize, Delimiter, u64), //owner,session,max_size,delim,timeout_ms
+    ReadBytes(ActorId, i64, usize, u64),             //owner,session,size,timeout_ms
+    ReadFrame(ActorId, i64, u64),                    //owner,session,read_timeout
+    Write(ActorId, Arc<Buffer>, bool),               //owner,data,close
     Close(),
 }
 
 pub struct NetChannel(pub mpsc::Sender<NetOp>, pub mpsc::Sender<NetOp>);
 
-pub(crate) fn next_net_fd() -> i64 {
-    let fd = NET_UUID.fetch_add(1, Ordering::AcqRel);
-    if fd == i64::MAX {
-        panic!("net fd overflow");
-    }
-    fd
-}
+const SOCKET_DATA_ACCEPT: u8 = 2;
+const SOCKET_DATA_MESSAGE: u8 = 3;
+const SOCKET_DATA_CLOSE: u8 = 4;
 
-// pub const SOCKET_ACCEPT: i8 = 1;
-// pub const SOCKET_READ: i8 = 2;
-// pub const SOCKET_WRITE: i8 = 3;
-// pub const SOCKET_CONNECT: i8 = 4;
+const MESSAGE_CONTINUED_FLAG: u16 = u16::MAX;
+
+pub enum SocketEvent {
+    Accept(i64, i64, String), // listen_fd, conn_fd, remote_addr
+    Message(i64, Box<Buffer>),
+    Close(i64, String, String),
+}
 
 async fn read_until(
     reader: &mut BufReader<OwnedReadHalf>,
-    owner: i64,
+    owner: ActorId,
     session: i64,
     max_size: usize,
-    delim: Vec<u8>,
+    delim: Delimiter,
     read_timeout: u64,
 ) -> bool {
     let mut with_delim = false;
-    let mut delim = delim.as_slice();
-    if delim.is_empty() || (delim[0] == b'^' && delim.len() < 2) {
-        CONTEXT.response_error(
-            0,
-            owner,
-            -session,
-            "socket op:ReadUntil delim is empty".to_string(),
-        );
-        return false;
-    }
-
-    if delim[0] == b'^' {
-        delim = &delim[1..];
+    let raw = delim.as_slice();
+    let delim_bytes = if raw[0] == b'^' {
+        if raw.len() < 2 {
+            CONTEXT.response_error(
+                0,
+                owner,
+                -session,
+                "read_until: delim is empty".to_string(),
+            );
+            return false;
+        }
         with_delim = true;
-    }
+        &raw[1..]
+    } else {
+        raw
+    };
 
     let mut buffer = Box::new(Buffer::with_capacity(std::cmp::min(max_size, 512)));
+    let last_byte = *delim_bytes.last().unwrap();
+    let delim_len = delim_bytes.len();
     loop {
-        let read_res;
-        if read_timeout > 0 {
+        let read_res = if read_timeout > 0 {
             match timeout(
                 Duration::from_millis(read_timeout),
-                reader.read_until(*delim.last().unwrap(), buffer.as_mut_vec()),
+                reader.read_until(last_byte, buffer.as_mut_vec()),
             )
             .await
             {
-                Ok(res) => {
-                    read_res = res;
-                }
-                Err(err) => {
-                    CONTEXT.response_error(0, owner, -session, format!("read timeout: {}", err));
+                Ok(res) => res,
+                Err(_) => {
+                    CONTEXT.response_error(0, owner, -session, "read timeout".to_string());
                     return false;
                 }
             }
         } else {
-            read_res = reader
-                .read_until(*delim.last().unwrap(), buffer.as_mut_vec())
-                .await;
-        }
+            reader
+                .read_until(last_byte, buffer.as_mut_vec())
+                .await
+        };
 
         match read_res {
             Ok(0) => {
@@ -114,20 +118,20 @@ async fn read_until(
             }
             Ok(_) => {
                 if buffer.len() >= max_size {
-                    CONTEXT.response_error(0, owner, -session, "max read size limit".to_string());
+                    CONTEXT.response_error(0, owner, -session, "read_until: max size exceeded".to_string());
                     return false;
                 }
-                if buffer.as_vec().ends_with(delim.as_ref()) {
+                let buf_len = buffer.len();
+                if buf_len >= delim_len && buffer.as_vec()[buf_len - delim_len..] == *delim_bytes {
                     if !with_delim {
-                        buffer.revert(delim.len());
+                        buffer.revert(delim_len);
                     }
                     if CONTEXT
                         .send(Message {
-                            ptype: context::PTYPE_SOCKET_TCP,
                             from: 0,
                             to: owner,
                             session,
-                            data: MessageData::Buffer(buffer),
+                            data: MessageBody::Buffer(context::PTYPE_SOCKET_TCP, buffer),
                         })
                         .is_some()
                     {
@@ -135,7 +139,6 @@ async fn read_until(
                     }
                     break;
                 }
-                //log::warn!("continue read {}", session);
             }
             Err(err) => {
                 CONTEXT.response_error(0, owner, -session, err.to_string());
@@ -148,7 +151,7 @@ async fn read_until(
 
 async fn read_bytes(
     reader: &mut BufReader<OwnedReadHalf>,
-    owner: i64,
+    owner: ActorId,
     session: i64,
     size: usize,
     read_timeout: u64,
@@ -158,42 +161,38 @@ async fn read_bytes(
             0,
             owner,
             -session,
-            "socket op:ReadBytes size must be greater than 0".to_string(),
+            "read_bytes: size must be greater than 0".to_string(),
         );
         return false;
     }
     let mut buffer = Box::new(Buffer::with_capacity(size));
     let space = buffer.prepare(size);
-    let read_res;
-    if read_timeout > 0 {
+    let read_res = if read_timeout > 0 {
         match timeout(
             Duration::from_millis(read_timeout),
             reader.read_exact(space),
         )
         .await
         {
-            Ok(res) => {
-                read_res = res;
-            }
-            Err(err) => {
-                CONTEXT.response_error(0, owner, -session, format!("read timeout: {}", err));
+            Ok(res) => res,
+            Err(_) => {
+                CONTEXT.response_error(0, owner, -session, "read timeout".to_string());
                 return false;
             }
         }
     } else {
-        read_res = reader.read_exact(space).await;
-    }
+        reader.read_exact(space).await
+    };
 
     match read_res {
         Ok(_) => {
             let _ = buffer.commit(size);
             if CONTEXT
                 .send(Message {
-                    ptype: context::PTYPE_SOCKET_TCP,
                     from: 0,
                     to: owner,
                     session,
-                    data: MessageData::Buffer(buffer),
+                    data: MessageBody::Buffer(context::PTYPE_SOCKET_TCP, buffer),
                 })
                 .is_some()
             {
@@ -208,122 +207,286 @@ async fn read_bytes(
     true
 }
 
-async fn handle_read(reader: OwnedReadHalf, rx: &mut mpsc::Receiver<NetOp>) {
-    let mut reader = BufReader::new(reader);
-    while let Some(op) = rx.recv().await {
-        match op {
-            NetOp::ReadUntil(owner, session, max_size, delim, read_timeout) => {
-                if !read_until(&mut reader, owner, session, max_size, delim, read_timeout).await {
-                    return;
-                }
-            }
-            NetOp::ReadBytes(owner, session, size, read_timeout) => {
-                if !read_bytes(&mut reader, owner, session, size, read_timeout).await {
-                    return;
-                }
-            }
-            _ => {}
-        }
-    }
-}
+/// Wrapper that drains pending read operations on drop, sending error responses
+/// for any sessions that would otherwise be silently lost (e.g. when the read task
+/// is aborted because the write side closed first).
+struct ReadOpGuard(mpsc::Receiver<NetOp>);
 
-async fn handle_write(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<NetOp>) {
-    while let Some(op) = rx.recv().await {
-        match op {
-            NetOp::Write(owner, data, close) => {
-                if let Err(err) = writer.write_all(data.as_slice()).await {
-                    CONTEXT.response_error(0, owner, 0, format!("socket write error {}", err));
-                    return;
-                }
-                if close {
-                    return;
-                }
-            }
-            NetOp::Close() => {
-                return;
-            }
-            _ => {
-                log::error!("write: {:?}", op);
-            }
-        }
-    }
-}
-
-async fn handle_client(socket: tokio::net::TcpStream, owner: i64, session: i64) {
-    let fd = next_net_fd();
-    let (tx_reader, rx_reader) = mpsc::channel::<NetOp>(1);
-    let (tx_writer, rx_writer) = mpsc::channel::<NetOp>(100);
-    NET.insert(fd, NetChannel(tx_reader, tx_writer));
-
-    if CONTEXT
-        .send(Message {
-            ptype: context::PTYPE_INTEGER,
-            from: 0,
-            to: owner,
-            session,
-            data: MessageData::ISize(fd as isize),
-        })
-        .is_some()
-    {
-        NET.remove(&fd);
-        return;
-    }
-
-    socket.set_nodelay(true).unwrap_or_default();
-
-    let (reader, writer) = socket.into_split();
-
-    let mut read_task = tokio::spawn(async move {
-        let mut rx = rx_reader;
-        handle_read(reader, &mut rx).await;
-        let mut left = Vec::with_capacity(10);
-        rx.recv_many(&mut left, 10).await;
-        for op in left {
+impl Drop for ReadOpGuard {
+    fn drop(&mut self) {
+        while let Ok(op) = self.0.try_recv() {
             match op {
-                NetOp::ReadUntil(owner, session, ..) | NetOp::ReadBytes(owner, session, ..) => {
-                    CONTEXT.response_error(0, owner, -session, "closed".to_string());
+                NetOp::ReadUntil(owner, session, ..)
+                | NetOp::ReadBytes(owner, session, ..)
+                | NetOp::ReadFrame(owner, session, ..) => {
+                    if session > 0 {
+                        CONTEXT.response_error(0, owner, -session, "closed".to_string());
+                    }
                 }
                 _ => {}
             }
         }
-    });
-
-    let mut write_task = tokio::spawn(handle_write(writer, rx_writer));
-
-    if tokio::try_join!(&mut read_task, &mut write_task).is_err() {
-        read_task.abort();
-        write_task.abort();
     }
+}
 
+/// Unified read handler: supports ReadUntil, ReadBytes, and ReadFrame on any fd.
+/// Returns `Some(reason)` when the connection ended due to an I/O error (the reason
+/// should appear in the close event). Returns `None` for clean exits (explicit close,
+/// owner dead, channel closed).
+async fn handle_read(reader: OwnedReadHalf, fd: i64, _addr: String, rx: mpsc::Receiver<NetOp>) -> Option<String> {
+    let mut rx = ReadOpGuard(rx);
+    let mut reader = BufReader::new(reader);
+    while let Some(op) = rx.0.recv().await {
+        match op {
+            NetOp::ReadUntil(owner, session, max_size, delim, read_timeout) => {
+                if !read_until(&mut reader, owner, session, max_size, delim, read_timeout).await {
+                    return None;
+                }
+            }
+            NetOp::ReadBytes(owner, session, size, read_timeout) => {
+                if !read_bytes(&mut reader, owner, session, size, read_timeout).await {
+                    return None;
+                }
+            }
+            NetOp::ReadFrame(owner, session, read_timeout) => {
+                if session > 0 {
+                    match read_one_frame(&mut reader, read_timeout).await {
+                        Ok(buf) => {
+                            if CONTEXT.send(Message {
+                                from: 0,
+                                to: owner,
+                                session,
+                                data: MessageBody::Buffer(context::PTYPE_SOCKET_EVENT, buf),
+                            }).is_some() {
+                                return None;
+                            }
+                        }
+                        Err(err_msg) => {
+                            CONTEXT.response_error(0, owner, -session, err_msg.clone());
+                            return Some(err_msg);
+                        }
+                    }
+                } else {
+                    return frame_read_loop(&mut reader, owner, fd, read_timeout).await;
+                }
+            }
+            NetOp::Close() => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+async fn handle_write(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<NetOp>) -> Option<String> {
+    while let Some(op) = rx.recv().await {
+        match op {
+            NetOp::Write(_owner, data, close) => {
+                if let Err(err) = writer.write_all(data.as_slice()).await {
+                    return Some(format!("write: {}", err));
+                }
+                if close {
+                    return None;
+                }
+            }
+            NetOp::Close() => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Read one complete framed message from the reader.
+/// Returns Ok(Some(buf)) on success, Ok(None) if owner is dead, Err(msg) on I/O error.
+async fn read_one_frame(
+    reader: &mut BufReader<OwnedReadHalf>,
+    read_timeout: u64,
+) -> std::result::Result<Box<Buffer>, String> {
+    let mut data: Option<Box<Buffer>> = None;
+
+    loop {
+        let mut header_buf = [0u8; 2];
+        let header_res = if read_timeout > 0 {
+            match timeout(Duration::from_millis(read_timeout), reader.read_exact(&mut header_buf)).await {
+                Ok(res) => res,
+                Err(_) => return Err("read timeout".to_string()),
+            }
+        } else {
+            reader.read_exact(&mut header_buf).await
+        };
+        if let Err(err) = header_res {
+            let err_msg = if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                "eof".to_string()
+            } else {
+                err.to_string()
+            };
+            return Err(err_msg);
+        }
+
+        let header = u16::from_be_bytes(header_buf);
+        let fin = header != MESSAGE_CONTINUED_FLAG;
+        let size = header as usize;
+
+        if size == 0 && fin {
+            if let Some(buf) = data.take() {
+                return Ok(buf);
+            }
+            continue;
+        }
+
+        let buf = data.get_or_insert_with(|| {
+            let alloc_size = if fin { size } else { size * 2 };
+            Box::new(Buffer::with_capacity(alloc_size))
+        });
+
+        if size > 0 {
+            let space = buf.prepare(size);
+            let body_res = if read_timeout > 0 {
+                match timeout(Duration::from_millis(read_timeout), reader.read_exact(&mut space[..size])).await {
+                    Ok(res) => res,
+                    Err(_) => return Err("read timeout".to_string()),
+                }
+            } else {
+                reader.read_exact(&mut space[..size]).await
+            };
+            if let Err(err) = body_res {
+                let err_msg = if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    "eof".to_string()
+                } else {
+                    err.to_string()
+                };
+                return Err(err_msg);
+            }
+            let _ = buf.commit(size);
+        }
+
+        if fin {
+            if let Some(buf) = data.take() {
+                return Ok(buf);
+            }
+        }
+    }
+}
+
+/// Auto-read loop: continuously reads framed messages and dispatches to owner via callback.
+/// Returns `Some(reason)` on I/O error, `None` if the owner is dead (send failed).
+async fn frame_read_loop(
+    reader: &mut BufReader<OwnedReadHalf>,
+    owner: ActorId,
+    fd: i64,
+    read_timeout: u64,
+) -> Option<String> {
+    loop {
+        match read_one_frame(reader, read_timeout).await {
+            Ok(buf) => {
+                if CONTEXT.send_value(
+                    context::PTYPE_SOCKET_EVENT,
+                    owner,
+                    0,
+                    SocketEvent::Message(fd, buf),
+                ).is_some() {
+                    return None;
+                }
+            }
+            Err(err_msg) => {
+                return Some(err_msg);
+            }
+        }
+    }
+}
+
+/// Set up a connection: start read/write tasks. Assumes NET entry is already inserted.
+async fn run_connection(socket: tokio::net::TcpStream, owner: ActorId, fd: i64, rx_reader: mpsc::Receiver<NetOp>, rx_writer: mpsc::Receiver<NetOp>) {
+    let addr = socket
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    socket.set_nodelay(true).unwrap_or_default();
+    let (reader, writer) = socket.into_split();
+
+    let addr_clone = addr.clone();
+    let mut read_task = CONTEXT.io_runtime().spawn(
+        handle_read(reader, fd, addr_clone, rx_reader)
+    );
+    let mut write_task = CONTEXT.io_runtime().spawn(handle_write(writer, rx_writer));
+
+    let close_reason = tokio::select! {
+        res = &mut read_task => {
+            write_task.abort();
+            res.ok().flatten().unwrap_or_else(|| "closed".to_string())
+        }
+        res = &mut write_task => {
+            read_task.abort();
+            res.ok().flatten().unwrap_or_else(|| "closed".to_string())
+        }
+    };
+
+    let _ = CONTEXT.send_value(
+        context::PTYPE_SOCKET_EVENT,
+        owner,
+        0,
+        SocketEvent::Close(fd, addr, close_reason),
+    );
     NET.remove(&fd);
 }
 
-fn listen(addr: &str) -> Result<i64> {
+fn setup_net_channel(fd: i64) -> (mpsc::Receiver<NetOp>, mpsc::Receiver<NetOp>) {
+    let (tx_reader, rx_reader) = mpsc::channel::<NetOp>(1);
+    let (tx_writer, rx_writer) = mpsc::channel::<NetOp>(64 * 1024);
+    NET.insert(fd, NetChannel(tx_reader, tx_writer));
+    (rx_reader, rx_writer)
+}
+
+fn listen(addr: &str, owner: ActorId) -> Result<i64> {
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(listener)?;
 
-    let (tx, mut rx) = mpsc::channel::<NetOp>(1);
     let fd = next_net_fd();
+    let (tx, mut rx) = mpsc::channel::<NetOp>(1);
     NET.insert(fd, NetChannel(tx.clone(), tx));
 
-    tokio::spawn(async move {
-        while let Some(op) = rx.recv().await {
-            match op {
-                NetOp::Accept(owner, session) => match listener.accept().await {
-                    Ok((socket, _)) => {
-                        tokio::spawn(handle_client(socket, owner, session));
+    CONTEXT.io_runtime().spawn(async move {
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((socket, _)) => {
+                            let conn_fd = next_net_fd();
+                            let remote_addr = socket
+                                .peer_addr()
+                                .map(|a| a.to_string())
+                                .unwrap_or_default();
+
+                            let (rx_reader, rx_writer) = setup_net_channel(conn_fd);
+
+                            if CONTEXT.send_value(
+                                context::PTYPE_SOCKET_EVENT,
+                                owner,
+                                0,
+                                SocketEvent::Accept(fd, conn_fd, remote_addr),
+                            ).is_some() {
+                                NET.remove(&conn_fd);
+                                break;
+                            }
+
+                            CONTEXT.io_runtime().spawn(
+                                run_connection(socket, owner, conn_fd, rx_reader, rx_writer)
+                            );
+                        }
+                        Err(err) => {
+                            log::warn!("accept error: {}", err);
+                            sleep(Duration::new(1, 0)).await;
+                        }
                     }
-                    Err(err) => {
-                        log::warn!("accept error: {}", err);
-                        sleep(Duration::new(1, 0)).await;
-                    }
-                },
-                NetOp::Close() => {
-                    break;
                 }
-                _ => {
-                    log::warn!("listen recv unknown op: {:?}", op);
+                op = rx.recv() => {
+                    match op {
+                        Some(NetOp::Close()) | None => break,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -334,42 +497,21 @@ fn listen(addr: &str) -> Result<i64> {
 }
 
 extern "C-unwind" fn lua_socket_listen(state: LuaState) -> c_int {
+    let _guard = CONTEXT.io_runtime().enter();
+
     let addr = unsafe { laux::lua_check_str(state, 1) };
-    match listen(addr) {
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+
+    match listen(addr, owner) {
         Ok(fd) => {
             laux::lua_push(state, fd);
             1
         }
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("Listen '{}' failed: {}", addr, err));
-            2
+            crate::lua_push_error(state, &format!("Listen '{}' failed: {}", addr, err))
         }
     }
-}
-
-extern "C-unwind" fn lua_socket_accept(state: LuaState) -> c_int {
-    let fd = laux::lua_get(state, 1);
-    let actor = LuaActor::from_lua_state(state);
-    let owner = unsafe { (*actor).id };
-    let session = unsafe { (*actor).next_session() };
-
-    if let Some(channel) = NET.get(&fd) {
-        match channel.value().0.try_send(NetOp::Accept(owner, session)) {
-            Ok(_) => {}
-            Err(err) => {
-                laux::lua_push(state, false);
-                laux::lua_push(state, format!("socket_accept channel send error: {}", err));
-                return 2;
-            }
-        }
-    } else {
-        laux::lua_push(state, false);
-        laux::lua_push(state, format!("socket_accept error fd not found: {}", fd));
-        return 2;
-    }
-    laux::lua_push(state, session);
-    1
 }
 
 extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
@@ -380,32 +522,28 @@ extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
     let session = unsafe { (*actor).next_session() };
 
     let op = if laux::lua_type(state, 2) == LuaType::Integer {
-        let max_size = laux::lua_get(state, 2);
-        let read_timeout = laux::lua_opt(state, 3).unwrap_or(0);
-
-        NetOp::ReadBytes(owner, session, max_size, read_timeout)
+        let size = laux::lua_get(state, 2);
+        let read_timeout: u64 = laux::lua_opt(state, 3).unwrap_or(0);
+        NetOp::ReadBytes(owner, session, size, read_timeout)
     } else {
         let delim = unsafe { laux::lua_check_lstring(state, 2) };
-        if delim.is_empty() {
-            laux::lua_error(state, "socket_read error: delim is empty".to_string());
-        }
-
+        let delim = match Delimiter::new(delim) {
+            Some(d) => d,
+            None => {
+                laux::lua_error(state, format!("read: delim is empty or too long (max {} bytes)", 7));
+            }
+        };
         let max_size = laux::lua_opt(state, 3).unwrap_or(0x1000000);
-        let read_timeout = laux::lua_opt(state, 4).unwrap_or(30000);
-
-        NetOp::ReadUntil(owner, session, max_size, delim.to_vec(), read_timeout)
+        let read_timeout: u64 = laux::lua_opt(state, 4).unwrap_or(0);
+        NetOp::ReadUntil(owner, session, max_size, delim, read_timeout)
     };
 
     if let Some(channel) = NET.get(&fd) {
         if let Err(err) = channel.value().0.try_send(op) {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("socket_read channel send error: {}", err));
-            return 2;
+            return crate::lua_push_error(state, &format!("read: channel full (fd={}): {}", fd, err));
         }
     } else {
-        laux::lua_push(state, false);
-        laux::lua_push(state, format!("socket_read error: fd not found: {}", fd));
-        return 2;
+        return crate::lua_push_error(state, &format!("read: fd {} not found", fd));
     }
 
     laux::lua_push(state, session);
@@ -418,10 +556,18 @@ extern "C-unwind" fn lua_socket_write(state: LuaState) -> c_int {
     let owner = unsafe { (*actor).id };
 
     let fd = laux::lua_get(state, 1);
-    let data = check_buffer(state, 2);
-    let close = laux::lua_opt(state, 3).unwrap_or_default();
+    let data = check_arc_buffer(state, 2);
+    let max_write_capacity = laux::lua_opt(state, 3).unwrap_or(u16::MAX);
+    let close = laux::lua_opt(state, 4).unwrap_or(false);
 
     if let Some(channel) = NET.get(&fd) {
+        if max_write_capacity != u16::MAX {
+            let pending = channel.value().1.max_capacity() - channel.value().1.capacity();
+            if pending > max_write_capacity as usize {
+                let _ = channel.value().1.try_send(NetOp::Close());
+                return crate::lua_push_error(state, &format!("write: backpressure (fd={})", fd));
+            }
+        }
         match channel
             .value()
             .1
@@ -429,52 +575,112 @@ extern "C-unwind" fn lua_socket_write(state: LuaState) -> c_int {
         {
             Ok(_) => {
                 laux::lua_push(state, true);
-                return 1;
+                1
             }
             Err(err) => {
-                laux::lua_push(state, false);
-                laux::lua_push(state, format!("socket_write channel send error: {}", err));
+                crate::lua_push_error(state, &format!("write: channel full (fd={}): {}", fd, err))
             }
         }
     } else {
-        laux::lua_push(state, false);
-        laux::lua_push(state, format!("socket_write error: fd not found: {}", fd));
+        crate::lua_push_error(state, &format!("write: fd {} not found", fd))
     }
-    2
 }
 
 extern "C-unwind" fn lua_socket_connect(state: LuaState) -> c_int {
-    let addr = unsafe { laux::lua_check_str(state, 1) };
+    let addr = unsafe { laux::lua_check_str(state, 1) }.to_string();
     let connect_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(5000);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         match timeout(
             Duration::from_millis(connect_timeout),
-            tokio::net::TcpStream::connect(addr),
+            tokio::net::TcpStream::connect(addr.as_str()),
         )
         .await
         {
             Ok(Ok(socket)) => {
-                tokio::spawn(async move {
-                    handle_client(socket, owner, session).await;
-                });
+                let fd = next_net_fd();
+                let (rx_reader, rx_writer) = setup_net_channel(fd);
+                if CONTEXT.send(Message {
+                    from: 0,
+                    to: owner,
+                    session,
+                    data: MessageBody::ISize(context::PTYPE_INTEGER, fd as isize),
+                }).is_some() {
+                    NET.remove(&fd);
+                    return;
+                }
+                CONTEXT.io_runtime().spawn(run_connection(socket, owner, fd, rx_reader, rx_writer));
             }
             Ok(Err(err)) => {
-                CONTEXT.response_error(0, owner, -session, format!("connect error: {}", err));
+                CONTEXT.response_error(0, owner, -session, format!("connect '{}': {}", addr, err));
             }
-            Err(err) => {
-                CONTEXT.response_error(0, owner, -session, format!("connect timeout: {}", err));
+            Err(_) => {
+                CONTEXT.response_error(
+                    0,
+                    owner,
+                    -session,
+                    format!("connect '{}': timeout ({}ms)", addr, connect_timeout),
+                );
             }
         }
     });
 
     laux::lua_push(state, session);
-
     1
+}
+
+extern "C-unwind" fn lua_read_frame(state: LuaState) -> c_int {
+    let fd: i64 = laux::lua_get(state, 1);
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+    let session = unsafe { (*actor).next_session() };
+    let read_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(0);
+
+    if let Some(channel) = NET.get(&fd) {
+        match channel.value().0.try_send(NetOp::ReadFrame(owner, session, read_timeout)) {
+            Ok(_) => {}
+            Err(err) => {
+                return crate::lua_push_error(
+                    state,
+                    &format!("read_frame: channel full (fd={}): {}", fd, err),
+                );
+            }
+        }
+    } else {
+        return crate::lua_push_error(state, &format!("read_frame: fd {} not found", fd));
+    }
+
+    laux::lua_push(state, session);
+    1
+}
+
+/// Start auto-read mode for a framed fd (session=0, callback-based).
+extern "C-unwind" fn lua_start_read_frame(state: LuaState) -> c_int {
+    let fd: i64 = laux::lua_get(state, 1);
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+    let read_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(0);
+
+    if let Some(channel) = NET.get(&fd) {
+        match channel.value().0.try_send(NetOp::ReadFrame(owner, 0, read_timeout)) {
+            Ok(_) => {
+                laux::lua_push(state, true);
+                1
+            }
+            Err(err) => {
+                crate::lua_push_error(
+                    state,
+                    &format!("start_read_frame: channel full (fd={}): {}", fd, err),
+                )
+            }
+        }
+    } else {
+        crate::lua_push_error(state, &format!("start_read_frame: fd {} not found", fd))
+    }
 }
 
 extern "C-unwind" fn lua_socket_close(state: LuaState) -> c_int {
@@ -505,14 +711,106 @@ extern "C-unwind" fn lua_host(state: LuaState) -> c_int {
     0
 }
 
+extern "C-unwind" fn lua_write_frame(state: LuaState) -> c_int {
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+
+    let fd: i64 = laux::lua_get(state, 1);
+    let data = check_arc_buffer(state, 2);
+    let max_write_capacity = laux::lua_opt(state, 3).unwrap_or(u16::MAX);
+    let close = laux::lua_opt(state, 4).unwrap_or(false);
+
+    if data.is_empty() {
+        laux::lua_push(state, true);
+        return 1;
+    }
+
+    let src = data.as_slice();
+    let src_len = src.len();
+    let num_full_chunks = src_len / MESSAGE_CONTINUED_FLAG as usize;
+    let remainder = src_len % MESSAGE_CONTINUED_FLAG as usize;
+    let needs_end_marker = remainder == 0 && src_len > 0;
+
+    let out_size = src_len + (num_full_chunks + 1) * 2 + if needs_end_marker { 2 } else { 0 };
+    let mut out = Buffer::with_capacity(out_size);
+
+    let mut offset = 0usize;
+    while src_len - offset >= MESSAGE_CONTINUED_FLAG as usize {
+        out.write_slice(&MESSAGE_CONTINUED_FLAG.to_be_bytes());
+        out.write_slice(&src[offset..offset + MESSAGE_CONTINUED_FLAG as usize]);
+        offset += MESSAGE_CONTINUED_FLAG as usize;
+    }
+
+    let remaining = src_len - offset;
+    if remaining > 0 {
+        out.write_slice(&(remaining as u16).to_be_bytes());
+        out.write_slice(&src[offset..]);
+    } else if needs_end_marker {
+        out.write_slice(&0u16.to_be_bytes());
+    }
+
+    let arc_out = Arc::new(out);
+
+    if let Some(channel) = NET.get(&fd) {
+        if max_write_capacity != u16::MAX {
+            let pending = channel.value().1.max_capacity() - channel.value().1.capacity();
+            if pending > max_write_capacity as usize {
+                let _ = channel.value().1.try_send(NetOp::Close());
+                return crate::lua_push_error(state, &format!("write_frame: backpressure (fd={})", fd));
+            }
+        }
+        match channel.value().1.try_send(NetOp::Write(owner, arc_out, close)) {
+            Ok(_) => {
+                laux::lua_push(state, true);
+                1
+            }
+            Err(err) => {
+                crate::lua_push_error(state, &format!("write_frame: channel full (fd={}): {}", fd, err))
+            }
+        }
+    } else {
+        crate::lua_push_error(state, &format!("write_frame: fd {} not found", fd))
+    }
+}
+
+extern "C-unwind" fn lua_decode_socket_event(state: LuaState) -> c_int {
+    let event = laux::lua_into_userdata::<SocketEvent>(state, 1);
+
+    match *event {
+        SocketEvent::Accept(listen_fd, conn_fd, addr) => {
+            laux::lua_push(state, listen_fd);
+            laux::lua_push(state, SOCKET_DATA_ACCEPT as i64);
+            laux::lua_push(state, conn_fd);
+            laux::lua_push(state, addr.as_str());
+            4
+        }
+        SocketEvent::Message(fd, data) => {
+            laux::lua_push(state, fd);
+            laux::lua_push(state, SOCKET_DATA_MESSAGE as i64);
+            laux::lua_pushlightuserdata(state, Box::into_raw(data) as *mut c_void);
+            3
+        }
+        SocketEvent::Close(fd, addr, err) => {
+            laux::lua_push(state, fd);
+            laux::lua_push(state, SOCKET_DATA_CLOSE as i64);
+            laux::lua_push(state, addr.as_str());
+            laux::lua_push(state, err.as_str());
+            4
+        }
+    }
+}
+
 pub extern "C-unwind" fn luaopen_socket(state: LuaState) -> c_int {
     let l = [
         lreg!("listen", lua_socket_listen),
-        lreg!("accept", lua_socket_accept),
         lreg!("read", lua_socket_read),
+        lreg!("read_frame", lua_read_frame),
+        lreg!("start_read_frame", lua_start_read_frame),
         lreg!("write", lua_socket_write),
+        lreg!("write_frame", lua_write_frame),
         lreg!("connect", lua_socket_connect),
         lreg!("close", lua_socket_close),
+        lreg!("decode_socket_event", lua_decode_socket_event),
         lreg!("host", lua_host),
         lreg_null!(),
     ];

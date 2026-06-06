@@ -99,7 +99,7 @@ elseif conf.receiver then
     return
 end
 
-
+local receivers = {}
 moon.async(function()
 
     local sender = moon.new_service( {
@@ -110,12 +110,13 @@ moon.async(function()
     })
     assert(sender>0)
 
-    local receivers = {}
+
     for i=1, nreceiver do
         local id = moon.new_service( {
-            name = "receiver",
+            name = "receiver"..i,
             source = "benchmark_send.lua",
-            receiver = true
+            receiver = true,
+            unique = true,
         })
 
         table.insert(receivers, id)
@@ -126,5 +127,11 @@ end)
 
 
 
-
+moon.shutdown(function()
+    for _, id in ipairs(receivers) do
+        moon.kill(id)
+    end
+    moon.kill(moon.query('sender'))
+    moon.quit()
+end)
 

@@ -110,9 +110,7 @@ fn read_xlxs(state: LuaState, path: &Path, max_row: usize) -> i32 {
             1
         }
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("{}", err).as_str());
-            2
+            crate::lua_push_error(state, &format!("{}", err))
         }
     }
 }
@@ -129,9 +127,7 @@ extern "C-unwind" fn lua_excel_read(state: LuaState) -> i32 {
                 "csv" => read_csv(state, path, max_row),
                 "xlsx" => read_xlxs(state, path, max_row),
                 _ => {
-                    laux::lua_push(state, false);
-                    laux::lua_push(state, format!("unsupport file type: {}", ext));
-                    2
+                    crate::lua_push_error(state, &format!("unsupport file type: {}", ext))
                 }
             }
         }

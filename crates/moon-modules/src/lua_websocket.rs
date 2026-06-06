@@ -1,6 +1,5 @@
 use std::{
     ffi::c_int,
-    sync::atomic::{AtomicI64, Ordering},
     time::Duration,
 };
 
@@ -24,7 +23,7 @@ use tokio_tungstenite::{
 
 use moon_runtime::{
     actor::LuaActor,
-    context::{self, CONTEXT},
+    context::{self, ActorId, CONTEXT},
 };
 use moon_lua::{
     cstr, ffi,
@@ -34,7 +33,6 @@ use moon_lua::{
 
 lazy_static! {
     static ref WS_NET: DashMap<i64, WsChannel> = DashMap::new();
-    static ref WS_UUID: AtomicI64 = AtomicI64::new(1);
 }
 
 #[derive(Clone)]
@@ -45,10 +43,10 @@ struct WsChannel {
 
 #[derive(Debug)]
 enum WsRequest {
-    Read(i64, i64, u64),
+    Read(ActorId, i64, u64),
     Write(Message, bool),
     Close(Message),
-    Accept(i64, i64),
+    Accept(ActorId, i64),
 }
 
 enum WsResponse {
@@ -59,17 +57,13 @@ enum WsResponse {
 }
 
 fn next_ws_fd() -> i64 {
-    let fd = WS_UUID.fetch_add(1, Ordering::AcqRel);
-    if fd == i64::MAX {
-        panic!("ws fd overflow");
-    }
-    fd
+    crate::next_net_fd()
 }
 
 // ---------- Generic connection handler ----------
 
 async fn handle_read<S>(
-    owner: i64,
+    owner: ActorId,
     session: i64,
     read_timeout: u64,
     reader: &mut futures_util::stream::SplitStream<WebSocketStream<S>>,
@@ -152,7 +146,7 @@ async fn run_connection<S>(
 {
     let (writer, mut reader) = stream.split();
 
-    let mut read_task = tokio::spawn(async move {
+    let mut read_task = CONTEXT.io_runtime().spawn(async move {
         let mut closed = false;
         while let Some(op) = rx_reader.recv().await {
             if let WsRequest::Read(owner, session, read_timeout) = op {
@@ -180,7 +174,7 @@ async fn run_connection<S>(
         }
     });
 
-    let mut write_task = tokio::spawn(handle_write(writer, rx_writer));
+    let mut write_task = CONTEXT.io_runtime().spawn(handle_write(writer, rx_writer));
 
     if tokio::try_join!(&mut read_task, &mut write_task).is_err() {
         read_task.abort();
@@ -195,7 +189,7 @@ async fn run_connection<S>(
 async fn on_client_connected(
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     response: response::Response<Option<Vec<u8>>>,
-    owner: i64,
+    owner: ActorId,
     session: i64,
 ) {
     let (fd, rx_reader, rx_writer) = setup_ws_connection();
@@ -213,7 +207,7 @@ async fn on_client_connected(
 async fn on_server_accepted(
     stream: WebSocketStream<TcpStream>,
     addr: String,
-    owner: i64,
+    owner: ActorId,
     session: i64,
 ) {
     let (fd, rx_reader, rx_writer) = setup_ws_connection();
@@ -231,9 +225,11 @@ async fn on_server_accepted(
 extern "C-unwind" fn ws_read(state: LuaState) -> c_int {
     let conn =
         laux::lua_touserdata::<WsChannel>(state, 1).expect("invalid ws connection pointer");
-    let owner: i64 = laux::lua_get(state, 2);
-    let session: i64 = laux::lua_get(state, 3);
-    let read_timeout: u64 = laux::lua_opt(state, 4).unwrap_or(5000);
+    let read_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(5000);
+
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+    let session = unsafe { (*actor).next_session() };
 
     match conn
         .tx_reader
@@ -244,9 +240,7 @@ extern "C-unwind" fn ws_read(state: LuaState) -> c_int {
             1
         }
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("ws read error: {}", err));
-            2
+            crate::lua_push_error(state, &format!("ws read error: {}", err))
         }
     }
 }
@@ -309,9 +303,7 @@ extern "C-unwind" fn ws_write(state: LuaState) -> c_int {
             1
         }
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("ws write error: {}", err));
-            2
+            crate::lua_push_error(state, &format!("ws write error: {}", err))
         }
     }
 }
@@ -332,9 +324,7 @@ extern "C-unwind" fn ws_close(state: LuaState) -> c_int {
             1
         }
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("ws close error: {}", err));
-            2
+            crate::lua_push_error(state, &format!("ws close error: {}", err))
         }
     }
 }
@@ -364,7 +354,7 @@ extern "C-unwind" fn ws_connect(state: LuaState) -> c_int {
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         match timeout(
             Duration::from_millis(connect_timeout),
             connect_async_with_config(url, Some(ws_config), false),
@@ -372,7 +362,7 @@ extern "C-unwind" fn ws_connect(state: LuaState) -> c_int {
         .await
         {
             Ok(Ok((stream, response))) => {
-                tokio::spawn(on_client_connected(stream, response, owner, session));
+                CONTEXT.io_runtime().spawn(on_client_connected(stream, response, owner, session));
             }
             Ok(Err(err)) => {
                 let _ = CONTEXT.send_value(
@@ -398,6 +388,8 @@ extern "C-unwind" fn ws_connect(state: LuaState) -> c_int {
 }
 
 extern "C-unwind" fn ws_listen(state: LuaState) -> c_int {
+    let _guard = CONTEXT.io_runtime().enter();
+
     let addr = unsafe { laux::lua_check_str(state, 1) };
 
     let ws_config = if laux::lua_type(state, 2) == laux::LuaType::Table {
@@ -409,24 +401,18 @@ extern "C-unwind" fn ws_listen(state: LuaState) -> c_int {
     let listener = match std::net::TcpListener::bind(addr) {
         Ok(l) => l,
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("ws listen '{}' failed: {}", addr, err));
-            return 2;
+            return crate::lua_push_error(state, &format!("ws listen '{}' failed: {}", addr, err));
         }
     };
 
     if let Err(err) = listener.set_nonblocking(true) {
-        laux::lua_push(state, false);
-        laux::lua_push(state, format!("ws listen '{}' failed: {}", addr, err));
-        return 2;
+        return crate::lua_push_error(state, &format!("ws listen '{}' failed: {}", addr, err));
     }
 
     let listener = match TcpListener::from_std(listener) {
         Ok(l) => l,
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("ws listen '{}' failed: {}", addr, err));
-            return 2;
+            return crate::lua_push_error(state, &format!("ws listen '{}' failed: {}", addr, err));
         }
     };
 
@@ -434,14 +420,14 @@ extern "C-unwind" fn ws_listen(state: LuaState) -> c_int {
     let (tx, mut rx) = mpsc::channel::<WsRequest>(1);
     WS_NET.insert(fd, WsChannel { tx_reader: tx.clone(), tx_writer: tx });
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         while let Some(op) = rx.recv().await {
             match op {
                 WsRequest::Accept(owner, session) => match listener.accept().await {
                     Ok((stream, addr)) => {
                         let addr_str = addr.to_string();
                         let cfg = ws_config;
-                        tokio::spawn(async move {
+                        CONTEXT.io_runtime().spawn(async move {
                             match accept_async_with_config(stream, Some(cfg)).await {
                                 Ok(ws_stream) => {
                                     on_server_accepted(ws_stream, addr_str, owner, session).await;
@@ -488,14 +474,10 @@ extern "C-unwind" fn ws_accept(state: LuaState) -> c_int {
 
     if let Some(channel) = WS_NET.get(&fd) {
         if let Err(err) = channel.tx_reader.try_send(WsRequest::Accept(owner, session)) {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("ws accept error: {}", err));
-            return 2;
+            return crate::lua_push_error(state, &format!("ws accept error: {}", err));
         }
     } else {
-        laux::lua_push(state, false);
-        laux::lua_push(state, format!("ws: fd {} not found", fd));
-        return 2;
+        return crate::lua_push_error(state, &format!("ws: fd {} not found", fd));
     }
     laux::lua_push(state, session);
     1
@@ -591,9 +573,7 @@ extern "C-unwind" fn ws_decode(state: LuaState) -> c_int {
             2
         }
         WsResponse::Error(ref err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, err.as_str());
-            2
+            crate::lua_push_error(state, err.as_str())
         }
     }
 }

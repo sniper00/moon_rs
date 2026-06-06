@@ -7,14 +7,19 @@ local onecount = 1000
 
 if arg and arg.runner then
     if arg.type == "receiver" then
-        moon.dispatch("lua", function(sender, session, ...)
+        moon.dispatch("lua", function (sender, session, ...)
+            local n = 0
+            for i = 1, 32 do
+                n = n + 1
+            end
+
             moon.response("lua", sender, session, ...)
         end)
         return
     else
-        moon.dispatch("lua", function(sender, session, ...)
-            for i=1,onecount do
-                local ok,err= moon.call("lua", arg.target, "hello")
+        moon.dispatch("lua", function (sender, session, ...)
+            for i = 1, onecount do
+                local ok, err = moon.call("lua", arg.target, "hello")
                 assert(ok, err)
             end
             moon.send("lua", arg.main, moon.clock())
@@ -24,44 +29,45 @@ else
     local counter = 0
     local stime = 0
     local endtime = 0
-    moon.dispatch("lua", function(sender, session, etime)
+
+    moon.dispatch("lua", function (sender, session, etime)
         if etime > endtime then
             endtime = etime
         end
         counter = counter + 1
         if counter >= nsender then
-            print( nsender ,"call" ,nsender, "per", onecount, "total",  nsender*onecount, "cost", endtime - stime)
+            print(nsender, "call", nsender, "per", onecount, "total", nsender * onecount, "cost", endtime - stime)
             moon.sleep(3000)
             moon.exit(0)
         end
     end)
 
-    moon.async(function()
+    moon.async(function ()
         local sender_addrs = {}
 
         local bt = moon.clock()
-        for i=1,nsender do
+        for i = 1, nsender do
             local receiver = moon.new_service({
-                name="test",
+                name = "test",
                 source = "benchmark_call.lua",
                 runner = true,
                 type = "receiver"
             })
 
             local addr = moon.new_service({
-                name="test",
+                name = "test",
                 source = "benchmark_call.lua",
                 runner = true,
                 type = "sender",
                 target = receiver,
                 main = moon.id
             })
-            sender_addrs[#sender_addrs+1] = addr
+            sender_addrs[#sender_addrs + 1] = addr
         end
 
         moon.warn("call start, create services cost", moon.clock() - bt)
         stime = moon.clock()
-        for k,v in ipairs(sender_addrs) do
+        for k, v in ipairs(sender_addrs) do
             moon.send("lua", v, "start")
         end
     end)

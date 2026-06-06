@@ -63,7 +63,7 @@ local function request_handler(fd, request)
             response:write(static_src.bin)
             if not M.keepalive or request.headers["connection"] == "close" then
                 response:write_header("Connection", "close")
-                socket.write(fd, buffer.concat(response:collect()), true)
+                socket.write(fd, buffer.concat(response:collect()), nil, true)
                 return
             else
                 socket.write(fd, buffer.concat(response:collect()))
@@ -99,7 +99,7 @@ local function request_handler(fd, request)
 
     if not M.keepalive or request.headers["connection"] == "close" then
         response:write_header("Connection", "close")
-        socket.write(fd, buffer.concat(response:collect()), true)
+        socket.write(fd, buffer.concat(response:collect()), nil, true)
     else
         socket.write(fd, buffer.concat(response:collect()))
         return true
@@ -124,7 +124,7 @@ function M.start(fd, timeout, pre)
             if request.error then
                 local res = http_response.new()
                 res.status_code = 400
-                socket.write(fd, buffer.concat(res:collect()), true)
+                socket.write(fd, buffer.concat(res:collect()), nil, true)
                 if M.error then
                     M.error(fd, request.error)
                 elseif not request.network_error then
@@ -141,20 +141,12 @@ function M.start(fd, timeout, pre)
 end
 
 ---@param addr string @ ip address
----@param timeout? integer @read timeout in seconds
+---@param timeout? integer @read timeout in milliseconds
 function M.listen(addr, timeout)
     assert(not listenfd, "http server can only listen port once.")
-    listenfd = assert(socket.listen(addr))
-    moon.async(function()
-        while true do
-            local fd, err = socket.accept(listenfd)
-            if not fd then
-                print("httpserver accept", err)
-            else
-                M.start(fd, timeout)
-            end
-        end --while
-    end)
+    listenfd = assert(socket.listen(addr, function(fd)
+        M.start(fd, timeout)
+    end))
 end
 
 ---@param path string

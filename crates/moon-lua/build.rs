@@ -11,6 +11,9 @@ fn main() {
     builder.include("./lua55");
     builder.std("c11");
 
+    #[cfg(unix)]
+    builder.define("LUA_USE_POSIX", None);
+
     #[cfg(target_os = "windows")]
     builder.flag("/experimental:c11atomics");
     builder.compile("lua55");

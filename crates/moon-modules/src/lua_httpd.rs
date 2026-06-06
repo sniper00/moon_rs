@@ -1,6 +1,6 @@
 use std::ffi::c_int;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -28,9 +28,9 @@ use moon_lua::{
     lreg, lreg_null, luaL_newlib,
 };
 use moon_runtime::actor::LuaActor;
-use moon_runtime::context::{self, CONTEXT};
+use moon_runtime::context::{self, ActorId, CONTEXT};
 
-use crate::lua_socket::next_net_fd;
+use crate::next_net_fd;
 
 const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_MAX_CONNECTIONS: usize = 10000;
@@ -161,7 +161,7 @@ lazy_static! {
 }
 
 /// Full path resolution: metadata -> canonicalize -> metadata.
-async fn resolve_file_meta(root: &PathBuf, file_path: &PathBuf) -> Option<CachedFileMeta> {
+async fn resolve_file_meta(root: &Path, file_path: &Path) -> Option<CachedFileMeta> {
     let resolved = if tokio::fs::metadata(file_path)
         .await
         .map(|m| m.is_dir())
@@ -169,11 +169,11 @@ async fn resolve_file_meta(root: &PathBuf, file_path: &PathBuf) -> Option<Cached
     {
         file_path.join("index.html")
     } else {
-        file_path.clone()
+        file_path.to_path_buf()
     };
 
     let canonical = tokio::fs::canonicalize(&resolved).await.ok()?;
-    if !canonical.starts_with(root.as_path()) {
+    if !canonical.starts_with(root) {
         return None;
     }
 
@@ -238,12 +238,12 @@ async fn revalidate_meta(prev: &CachedFileMeta) -> Option<CachedFileMeta> {
     })
 }
 
-fn update_cache(file_path: &PathBuf, meta: Option<CachedFileMeta>) {
+fn update_cache(file_path: &Path, meta: Option<CachedFileMeta>) {
     if FILE_META_CACHE.len() >= MAX_CACHE_ENTRIES {
         FILE_META_CACHE.retain(|_, e| e.cached_at.elapsed() < CACHE_TTL);
     }
     FILE_META_CACHE.insert(
-        file_path.clone(),
+        file_path.to_path_buf(),
         CacheEntry {
             meta,
             cached_at: Instant::now(),
@@ -251,7 +251,7 @@ fn update_cache(file_path: &PathBuf, meta: Option<CachedFileMeta>) {
     );
 }
 
-async fn get_cached_meta(root: &PathBuf, file_path: &PathBuf) -> Option<CachedFileMeta> {
+async fn get_cached_meta(root: &Path, file_path: &Path) -> Option<CachedFileMeta> {
     if let Some(entry) = FILE_META_CACHE.get(file_path) {
         if entry.cached_at.elapsed() < CACHE_TTL {
             return entry.meta.clone();
@@ -280,7 +280,7 @@ async fn get_cached_meta(root: &PathBuf, file_path: &PathBuf) -> Option<CachedFi
 // ---------------------------------------------------------------------------
 
 async fn serve_static_file(
-    root: &PathBuf,
+    root: &Path,
     req_path: &str,
     req_headers: &HeaderMap,
 ) -> Option<Response<HttpBody>> {
@@ -439,7 +439,7 @@ struct HttpSrvResponse {
 
 async fn handle_request(
     req: Request<Incoming>,
-    owner: i64,
+    owner: ActorId,
     max_body_size: usize,
     static_dir: Option<Arc<PathBuf>>,
 ) -> Result<Response<HttpBody>, hyper::Error> {
@@ -502,6 +502,8 @@ async fn handle_request(
 }
 
 extern "C-unwind" fn listen(state: LuaState) -> c_int {
+    let _guard = CONTEXT.io_runtime().enter();
+
     let addr = unsafe { laux::lua_check_str(state, 1) };
 
     let has_opts = laux::lua_type(state, 2) == laux::LuaType::Table;
@@ -559,7 +561,7 @@ extern "C-unwind" fn listen(state: LuaState) -> c_int {
 
     let semaphore = Arc::new(Semaphore::new(max_connections));
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -576,7 +578,7 @@ extern "C-unwind" fn listen(state: LuaState) -> c_int {
                             };
                             let io = TokioIo::new(stream);
                             let static_dir = static_dir.clone();
-                            tokio::spawn(async move {
+                            CONTEXT.io_runtime().spawn(async move {
                                 let _permit = permit;
                                 let svc = service_fn(move |req| {
                                     let static_dir = static_dir.clone();
@@ -638,17 +640,13 @@ extern "C-unwind" fn response(state: LuaState) -> c_int {
     let handle = match laux::lua_touserdata::<ResponseHandle>(state, 1) {
         Some(h) => h,
         None => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, "httpd response: null handle");
-            return 2;
+            return crate::lua_push_error(state, "httpd response: null handle");
         }
     };
     let tx = match handle.0.take() {
         Some(tx) => tx,
         None => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, "httpd response: already consumed");
-            return 2;
+            return crate::lua_push_error(state, "httpd response: already consumed");
         }
     };
 

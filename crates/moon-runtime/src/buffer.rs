@@ -387,34 +387,34 @@ mod tests {
     #[test]
     fn test_buffer_1() {
         let mut buf = Buffer::with_capacity(12);
-        buf.commit(4);
+        let _ = buf.commit(4);
         buf.write_str("1234567");
         buf.seek(4);
-        assert_eq!(buf.write_front("bbbb".as_bytes()), true);
+        assert!(buf.write_front("bbbb".as_bytes()));
 
         let r = buf.read(8);
         log::info!("{}", String::from_utf8_lossy(r.unwrap().as_ref()));
 
         buf.write_str("abcd");
         assert!(buf.read(4).unwrap() == "567a".as_bytes());
-        assert!(buf.len() == 3);
+        assert_eq!(buf.len(), 3);
     }
     #[test]
     fn test_buffer_2() {
         let mut buf = Buffer::with_capacity(128);
-        assert!(buf.len() == 0);
+        assert_eq!(buf.len(), 0);
         let n: i32 = 0;
         buf.write_slice(n.to_le_bytes().as_ref());
         assert_eq!(buf.len(), 4);
         assert!(buf.read(4).unwrap() == n.to_le_bytes().as_ref());
-        assert!(buf.len() == 0);
+        assert_eq!(buf.len(), 0);
         assert!(buf.read(4).is_none());
     }
 
     #[test]
     fn test_buffer_3() {
         let mut buf = Buffer::with_capacity(32);
-        assert!(buf.len() == 0);
+        assert_eq!(buf.len(), 0);
 
         for _ in 0..100 {
             buf.write_slice(vec![0; 17].as_ref());
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn test_write_front() {
         let mut buffer = Buffer::new();
-        buffer.commit(1);
+        let _ = buffer.commit(1);
         buffer.write_slice(&[1, 2, 3, 4]);
         buffer.seek(1);
         assert!(buffer.write_front(&[0]));
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn test_write_front_byte() {
         let mut buffer = Buffer::new();
-        buffer.commit(1);
+        let _ = buffer.commit(1);
         buffer.write_slice(&[1, 2, 3, 4]);
         buffer.seek(1);
         assert!(buffer.write_front_byte(0));

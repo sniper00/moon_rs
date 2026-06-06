@@ -1,14 +1,13 @@
-local moon = require "moon"
-local httpserver = require "moon.httpd"
+--- Shared demo/test routes for moon.httpd.
+--- Used by example, test, and benchmark scripts to avoid duplicating handlers.
 
-local test_addr = "127.0.0.1:19878"
+local M = {}
 
--------------------- Server Setup --------------------
+M.addr = "127.0.0.1:19878"
 
-local listener_fd = httpserver.listen(test_addr, { static_dir = "./" })
-print(string.format("HTTP server listening on %s (fd=%d)", test_addr, listener_fd))
-
-httpserver.dispatch(function(req)
+---@param req httpd.Request
+---@return integer?, table<string,string>?, string?
+function M.handler(req)
     if req.path == "/hello" then
         return 200, {["content-type"] = "text/plain"}, "Hello World!"
     elseif req.path == "/echo" then
@@ -31,4 +30,6 @@ httpserver.dispatch(function(req)
     else
         return 404, {["content-type"] = "text/plain"}, "Unknown"
     end
-end)
+end
+
+return M

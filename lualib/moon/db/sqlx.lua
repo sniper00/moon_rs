@@ -47,7 +47,7 @@ end
 ---@param sql string
 ---@vararg any
 function M:execute(sql, ...)
-    local res = self.obj:query(0, sql, ...)
+    local res = self.obj:exec_query(sql, ...)
     if type(res) == "table" then
         moon.error(print_r(res, true))
     end
@@ -59,7 +59,7 @@ end
 ---@vararg any
 ---@return table
 function M:query(sql, ...)
-    local session = self.obj:query(moon.next_session(), sql, ...)
+    local session = self.obj:query(sql, ...)
     if type(session) == "table" then
         return session
     end
@@ -75,7 +75,7 @@ function M:transaction(querys)
     for _, v in ipairs(querys) do
         trans:push(table.unpack(v))
     end
-    local session = self.obj:transaction(moon.next_session(), trans)
+    local session = self.obj:transaction(trans)
     if type(session) == "table" then
         return session
     end
@@ -88,10 +88,70 @@ function M:execute_transaction(querys)
     for _, v in ipairs(querys) do
         trans:push(table.unpack(v))
     end
-    local res = self.obj:transaction(0, trans)
+    local res = self.obj:exec_transaction(trans)
     if type(res) == "table" then
         moon.error(print_r(res, true))
     end
+end
+
+---@async
+---@param sql string SQL query
+---@param batch_size? integer Rows per batch (default 100)
+---@vararg any Query parameters
+---@return fun():table|nil Iterator function returning one row at a time
+---@return nil
+---@return nil
+---@return table to-be-closed stream state
+function M:query_stream(sql, batch_size, ...)
+    batch_size = batch_size or 100
+    local res = self.obj:query_stream(batch_size, sql, ...)
+    if type(res) == "table" then
+        return nil, res.message or res.kind
+    end
+    local current_session = res
+    local buffer
+    local idx = 0
+    local done = false
+    local pending_cursor
+
+    local stream_state = setmetatable({}, {
+        __close = function()
+            if pending_cursor then
+                pending_cursor:close()
+                pending_cursor = nil
+            end
+        end,
+    })
+
+    local function iter()
+        while true do
+            if buffer and idx < #buffer then
+                idx = idx + 1
+                return buffer[idx]
+            end
+            if done then
+                return nil
+            end
+            if pending_cursor then
+                current_session = pending_cursor:next()
+                pending_cursor = nil
+            end
+            local rows, cursor_handle = moon.wait(current_session)
+            if not rows or #rows == 0 then
+                done = true
+                return nil
+            end
+            buffer = rows
+            idx = 0
+            if cursor_handle then
+                pending_cursor = cursor_handle
+            else
+                done = true
+            end
+        end
+    end
+
+    return iter, nil, nil, stream_state
 end
 
 --- Wrap a value as an explicit JSON query parameter. Use this instead of

@@ -8,7 +8,7 @@ if arg and arg.runner then
         moon.sleep(0)
         local i = 0
         while i<5 do
-            utils.thread_sleep(6000)
+            utils.thread_sleep(20000)
             moon.sleep(0)
             i=i+1
         end
@@ -23,7 +23,7 @@ else
         })
     end)
 
-    moon.system("endless_loop", function (who, what)
+    moon.system("slow_message", function (who, what)
         print(who..":",  what)
     end)
 end

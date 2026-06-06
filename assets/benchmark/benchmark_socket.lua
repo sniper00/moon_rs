@@ -27,22 +27,13 @@ local function handle_connection(fd)
 end
 
 moon.async(function()
-
-    local listenfd  = assert(socket.listen(conf.host..":"..conf.port))
+    local listenfd  = assert(socket.listen(conf.host..":"..conf.port, function(fd)
+        handle_connection(fd)
+    end))
 
     print(string.format([[
 
         network text benchmark run at %s %d with %d slaves.
-        run benchmark use: redis-benchmark -t ping -p %d -c 100 -n 100000
+        run benchmark use: redis-benchmark -t ping -p %d -c 100 -n 1000000
     ]], conf.host, conf.port, conf.count, conf.port))
-
-    while true do
-        local fd,err = socket.accept(listenfd)
-        if not fd then
-            print("accept failed", err)
-            return
-        end
-        --print("accept", fd)
-        handle_connection(fd)
-    end
 end)

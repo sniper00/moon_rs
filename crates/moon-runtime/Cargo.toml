@@ -19,3 +19,4 @@ serde_json = { workspace = true}
 colored = { workspace = true}
 chrono = { workspace = true}
 derive_more = { workspace = true}
+num_cpus = "1"

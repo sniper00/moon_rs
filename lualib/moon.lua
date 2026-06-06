@@ -61,12 +61,15 @@ moon.PTYPE_SHUTDOWN    = 6
 moon.PTYPE_TIMER       = 7
 moon.PTYPE_SOCKET_TCP  = 8
 moon.PTYPE_SOCKET_UDP  = 9
+moon.PTYPE_SOCKET_EVENT = 10
 moon.PTYPE_INTEGER     = 12
 moon.PTYPE_HTTPC       = 13
 moon.PTYPE_SQLX        = 15
 moon.PTYPE_MONGODB     = 16
 moon.PTYPE_WEBSOCKET   = 17
 moon.PTYPE_HTTPD       = 18
+moon.PTYPE_PG          = 19
+moon.PTYPE_REDIS       = 20
 
 --- Checks if debug logging is enabled
 --- @return boolean
@@ -135,7 +138,7 @@ setmetatable(
     }
 )
 
----@type table<integer, thread?>
+---@type table<integer, boolean|thread?>
 local session_id_coroutine = {}
 local protocol = {}
 local session_watcher = {}
@@ -253,6 +256,7 @@ end
 ---
 ---@return string[] @An array of the command-line arguments
 function moon.args()
+    ---@diagnostic disable-next-line: need-check-nil
     return load(moon.env("ARG"))()
 end
 
@@ -269,6 +273,7 @@ local function invoke(co, fn, ...)
     co_pool[#co_pool + 1] = co
 end
 
+---@async
 local function routine(fn, ...)
     local co = co_running()
     invoke(co, fn, ...)
@@ -320,21 +325,33 @@ function moon.wait(session, receiver, is_raw)
         end
     end
 
+    -- co_yield() suspends this coroutine until resumed by the dispatcher.
+    -- When resumed by a message: a = data_ptr, b = data_len, c = protocol_type (PTYPE_*)
+    -- When resumed by wakeup/break: a = false, b = "BREAK" or nil, c = extra args table or nil
     local a, b, c = co_yield()
     if a then
-        if is_raw then
+        -- Received a message response.
+        -- If is_raw mode, return raw (ptr, len) directly — except for errors which
+        -- must always be decoded so callers get the standard (false, err_msg) return.
+        -- For non-raw mode (and errors), delegate to protocol[c].unpack:
+        --   normal type  → unpacks into typed return values
+        --   PTYPE_ERROR  → returns (false, error_string)
+        if is_raw and c ~= moon.PTYPE_ERROR then
             return a, b
         end
         return protocol[c].unpack(a, b)
     else
+        -- Resumed without a message (wakeup or break).
         if session then
             ---@diagnostic disable-next-line: assign-type-mismatch
             session_id_coroutine[session] = false
         end
 
         if c then
+            -- c is a table of extra args passed by moon.wakeup(co, ...)
             return table.unpack(c)
         else
+            -- a=false, b="BREAK" (coroutine was broken)
             return a, b
         end
     end
@@ -581,18 +598,6 @@ reg_protocol {
 }
 
 reg_protocol {
-    name = "tcp",
-    PTYPE = moon.PTYPE_SOCKET_TCP,
-    pack = function(...)
-        return ...
-    end,
-    unpack = moon.tostring,
-    dispatch = function()
-        error("PTYPE_SOCKET_TCP dispatch not implemented")
-    end
-}
-
-reg_protocol {
     name = "udp",
     PTYPE = moon.PTYPE_SOCKET_UDP,
     pack = function(...) return ... end,
@@ -631,9 +636,8 @@ end
 reg_protocol {
     name = "timer",
     PTYPE = moon.PTYPE_TIMER,
-    israw = true,
-    dispatch = function(m)
-        local timerid = _decode(m, "S")
+    unpack = function(sz, len) return sz end,
+    dispatch = function(sender, session, timerid)
         local v = timer_routine[timerid]
         timer_routine[timerid] = nil
         local trace = timer_profile_trace[timerid]

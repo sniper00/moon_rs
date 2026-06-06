@@ -1,4 +1,42 @@
-use moon_lua::{cstr, ffi, laux::LuaState};
+#![allow(clippy::collapsible_if)]
+
+use std::ffi::c_int;
+use std::sync::atomic::{AtomicI64, Ordering};
+use moon_lua::{cstr, ffi, laux::{self, LuaState}};
+
+/// Stack-allocated byte buffer. `data[0]` stores the length, `data[1..]` stores
+/// the content (string or binary). Max capacity is N-1 bytes. No heap allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct ShortBytes<const N: usize> {
+    data: [u8; N],
+}
+
+impl<const N: usize> ShortBytes<N> {
+    pub fn new(src: &[u8]) -> Option<Self> {
+        if src.is_empty() || src.len() >= N {
+            return None;
+        }
+        let mut data = [0u8; N];
+        data[0] = src.len() as u8;
+        data[1..1 + src.len()].copy_from_slice(src);
+        Some(Self { data })
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[1..1 + self.data[0] as usize]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data[0] as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data[0] == 0
+    }
+}
 
 mod lua_buffer;
 #[cfg(feature = "excel")]
@@ -13,13 +51,37 @@ mod lua_utils;
 mod lua_sqlx;
 #[cfg(feature = "mongodb")]
 mod lua_mongodb;
+#[cfg(feature = "pg")]
+mod lua_pg;
+#[cfg(feature = "redis")]
+mod lua_redis;
 #[cfg(feature = "websocket")]
 mod lua_websocket;
 #[cfg(feature = "httpd")]
 mod lua_httpd;
+#[cfg(feature = "cluster")]
+mod lua_cluster;
 
 pub mod lua_json;
 pub mod lua_actor;
+
+static NET_UUID: AtomicI64 = AtomicI64::new(1);
+
+pub fn next_net_fd() -> i64 {
+    let fd = NET_UUID.fetch_add(1, Ordering::AcqRel);
+    if fd == i64::MAX {
+        panic!("net fd overflow");
+    }
+    fd
+}
+
+/// Unified Lua error return: pushes `(false, errmsg)` and returns 2.
+pub fn lua_push_error(state: LuaState, msg: &str) -> c_int {
+    laux::lua_push(state, false);
+    laux::lua_push(state, msg);
+    2
+}
+
 
 #[macro_export]
 macro_rules! not_null_wrapper {
@@ -63,8 +125,14 @@ pub fn luaopen_custom_libs(state: LuaState) {
     lua_require!(state, "sqlx.core", lua_sqlx::luaopen_sqlx);
     #[cfg(feature = "mongodb")]
     lua_require!(state, "mongodb.core", lua_mongodb::luaopen_mongodb);
+    #[cfg(feature = "pg")]
+    lua_require!(state, "pg.core", lua_pg::luaopen_pg);
+    #[cfg(feature = "redis")]
+    lua_require!(state, "redis.core", lua_redis::luaopen_redis);
     #[cfg(feature = "websocket")]
     lua_require!(state, "ws.core", lua_websocket::luaopen_websocket);
+    #[cfg(feature = "cluster")]
+    lua_require!(state, "cluster.core", lua_cluster::luaopen_cluster);
     lua_require!(state, "utils", lua_utils::luaopen_utils);
 }
 
@@ -293,6 +361,8 @@ mod tests {
         let result = run_lua_expr(state, r#"require("json").encode(require("json").array({}))"#);
         assert_eq!(result, "[]");
     }
+
+    // ========================= PG protocol (json.pq_*) tests =========================
 
     // ========================= Seri tests =========================
 

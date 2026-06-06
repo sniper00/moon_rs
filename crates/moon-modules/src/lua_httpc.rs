@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use moon_runtime::{
     actor::LuaActor,
-    context::{self, CONTEXT},
+    context::{self, ActorId, CONTEXT},
 };
 use moon_lua::{
     self, cstr,
@@ -21,7 +21,7 @@ lazy_static! {
 }
 
 struct HttpRequest {
-    id: i64,
+    id: ActorId,
     session: i64,
     method: String,
     url: String,
@@ -142,9 +142,7 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
     let headers = match extract_headers(state, 1) {
         Ok(headers) => headers,
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, err);
-            return 2;
+            return crate::lua_push_error(state, &err);
         }
     };
 
@@ -164,7 +162,7 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
         proxy: laux::opt_field(state, 1, "proxy").unwrap_or_default(),
     };
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         if let Err(err) = http_request(req).await {
             let _ = CONTEXT.send_value(
                 context::PTYPE_HTTPC,
@@ -248,28 +246,25 @@ extern "C-unwind" fn lua_http_parse_response(state: LuaState) -> c_int {
     let version_line = match lines.next() {
         Some(version_line) => version_line,
         None => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, "No input");
-            return 2;
+            return crate::lua_push_error(state, "No input");
         }
     };
 
     let mut parts = version_line.splitn(3, |&x| x == b' ');
     let version = match parts.next() {
-        Some(part) => &part[5..],
+        Some(part) if part.len() >= 5 => &part[5..],
+        Some(_) => {
+            return crate::lua_push_error(state, "Invalid HTTP version");
+        }
         None => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, "No version");
-            return 2;
+            return crate::lua_push_error(state, "No version");
         }
     };
 
     let status_code = match parts.next() {
         Some(part) => part,
         None => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, "No status code");
-            return 2;
+            return crate::lua_push_error(state, "No status code");
         }
     };
 
@@ -332,14 +327,10 @@ extern "C-unwind" fn lua_http_parse_request(state: LuaState) -> c_int {
             1
         }
         Ok(httparse::Status::Partial) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, "Incomplete request");
-            2
+            crate::lua_push_error(state, "Incomplete request")
         }
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, err.to_string());
-            2
+            crate::lua_push_error(state, &err.to_string())
         }
     }
 }

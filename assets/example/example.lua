@@ -35,6 +35,7 @@ moon.dispatch("lua", function(sender, session, arg)
     print_r(arg)
 end)
 
+local workerid 
 moon.async(function()
     print("before sleep")
     moon.sleep(1000)
@@ -44,10 +45,11 @@ moon.async(function()
     moon.send("lua", moon.id, { a = 1, b = 2 })
 
     -- create service
-    local workerid = moon.new_service({
+    workerid = moon.new_service({
         name = "example",
         source = "example.lua",
         worker = true, -- see line 5
+        unique = true
     })
 
     -- send to other actor
@@ -76,6 +78,7 @@ end)
 moon.shutdown(function()
     print("server shutdown")
     moon.async(function(...)
+    moon.kill(workerid)
         moon.quit()
     end)
 end)

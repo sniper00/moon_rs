@@ -1,17 +1,19 @@
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use std::{
     collections::BTreeSet,
+    ptr,
     sync::{
-        atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, Mutex},
+    runtime::Builder,
+    sync::{Mutex, mpsc},
     time::timeout,
 };
 
@@ -28,6 +30,7 @@ pub const PTYPE_SHUTDOWN: u8 = 6;
 pub const PTYPE_TIMER: u8 = 7;
 pub const PTYPE_SOCKET_TCP: u8 = 8;
 pub const PTYPE_SOCKET_UDP: u8 = 9;
+pub const PTYPE_SOCKET_EVENT: u8 = 10;
 pub const PTYPE_INTEGER: u8 = 12;
 pub const PTYPE_HTTPC: u8 = 13;
 pub const PTYPE_QUIT: u8 = 14;
@@ -35,35 +38,42 @@ pub const PTYPE_SQLX: u8 = 15;
 pub const PTYPE_MONGODB: u8 = 16;
 pub const PTYPE_WEBSOCKET: u8 = 17;
 pub const PTYPE_HTTPD: u8 = 18;
+pub const PTYPE_PG: u8 = 19;
+pub const PTYPE_REDIS: u8 = 20;
 
-pub const BOOTSTRAP_ACTOR_ADDR: i64 = 1;
+pub type ActorId = u32;
 
-static GLOBAL_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+pub const BOOTSTRAP_ACTOR_ADDR: ActorId = 1;
+const ACTOR_ID_WRAP_START: u32 = 1000;
 
 lazy_static! {
     pub static ref CONTEXT: LuaActorServer = {
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
 
+        let io_runtime = Builder::new_multi_thread()
+            .worker_threads(num_cpus::get().min(4))
+            .enable_time()
+            .enable_io()
+            .build()
+            .expect("Init IO tokio runtime failed");
+
         LuaActorServer {
-            actor_uuid: AtomicI64::new(1),
+            actor_uuid: AtomicU32::new(1),
             actor_counter: AtomicU32::new(0),
             exit_code: AtomicI32::new(i32::MAX),
             actors: DashMap::new(),
             unique_actors: DashMap::new(),
             clock: Instant::now(),
             env: DashMap::new(),
-            monitor: DashMap::new(),
             timer_tx,
             timer_rx: Mutex::new(timer_rx),
             now: Utc::now(),
             time_offset: AtomicU64::new(0),
+            io_runtime,
+            main_handle: std::sync::OnceLock::new(),
         }
     };
     pub static ref LOGGER: Logger = Logger::new();
-}
-
-thread_local! {
-    static THREAD_ID: u64 = GLOBAL_THREAD_ID.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Type-erased heap value with automatic cleanup on drop.
@@ -78,9 +88,11 @@ pub struct BoxedValue {
 
 unsafe impl Send for BoxedValue {}
 
-unsafe fn typed_drop<T>(ptr: *mut ()) { unsafe {
-    let _ = Box::from_raw(ptr as *mut T);
-}}
+unsafe fn typed_drop<T>(ptr: *mut ()) {
+    unsafe {
+        let _ = Box::from_raw(ptr as *mut T);
+    }
+}
 
 impl BoxedValue {
     pub fn new<T: Send>(value: T) -> Self {
@@ -108,32 +120,50 @@ impl Drop for BoxedValue {
     }
 }
 
-pub enum MessageData {
-    ISize(isize),
-    Buffer(Box<Buffer>),
-    Boxed(Box<BoxedValue>),
-    None,
+pub enum MessageBody {
+    ISize(u8, isize),
+    Buffer(u8, Box<Buffer>),
+    Boxed(u8, Box<BoxedValue>),
+    None(u8),
 }
 
-impl std::fmt::Display for MessageData {
+impl MessageBody {
+    #[inline]
+    pub fn ptype(&self) -> u8 {
+        match self {
+            MessageBody::ISize(p, _) => *p,
+            MessageBody::Buffer(p, _) => *p,
+            MessageBody::Boxed(p, _) => *p,
+            MessageBody::None(p) => *p,
+        }
+    }
+}
+
+impl std::fmt::Display for MessageBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MessageData::ISize(i) => write!(f, "ISize({})", i),
-            MessageData::Buffer(data) => {
-                write!(f, "Buffer({:?})", escape_print(data.as_slice()))
+            MessageBody::ISize(_, i) => write!(f, "ISize({})", i),
+            MessageBody::Buffer(_, data) => {
+                write!(f, "Buffer(\"{}\")", escape_print(data.as_slice()))
             }
-            MessageData::Boxed(b) => write!(f, "Boxed({:p})", b.ptr),
-            MessageData::None => write!(f, "None"),
+            MessageBody::Boxed(_, b) => write!(f, "Boxed({:p})", b.ptr),
+            MessageBody::None(_) => write!(f, "None"),
         }
     }
 }
 
 pub struct Message {
-    pub ptype: u8,
-    pub from: i64,
-    pub to: i64,
+    pub from: ActorId,
+    pub to: ActorId,
     pub session: i64,
-    pub data: MessageData,
+    pub data: MessageBody,
+}
+
+impl Message {
+    #[inline]
+    pub fn ptype(&self) -> u8 {
+        self.data.ptype()
+    }
 }
 
 impl std::fmt::Display for Message {
@@ -141,31 +171,82 @@ impl std::fmt::Display for Message {
         write!(
             f,
             "Message {{ ptype: {}, from: 0x{:08x}, to: 0x{:08x}, session: {}, data: {} }}",
-            self.ptype, self.from, self.to, self.session, self.data
+            self.ptype(),
+            self.from,
+            self.to,
+            self.session,
+            self.data
         )
     }
 }
 
-struct Monitor {
-    ptype: u8,
-    tm: f64,
-    from: i64,
-    to: i64,
+pub struct Watchdog {
+    /// Dispatch start time in milliseconds (from CONTEXT.clock), 0 = idle.
+    heartbeat_ms: AtomicU64,
+    /// Raw pointer to the Message currently being processed.
+    /// Valid only when heartbeat_ms != 0 (actor is inside handle()).
+    msg_ptr: AtomicPtr<Message>,
+}
+
+unsafe impl Send for Watchdog {}
+unsafe impl Sync for Watchdog {}
+
+impl Watchdog {
+    pub fn new() -> Self {
+        Watchdog {
+            heartbeat_ms: AtomicU64::new(0),
+            msg_ptr: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// Ordering contract (paired with `check_watchdogs`):
+    ///
+    /// `begin`: store msg_ptr BEFORE heartbeat_ms.
+    /// `end`:   store heartbeat_ms=0 BEFORE clearing msg_ptr.
+    ///
+    /// The monitor reads heartbeat_ms first (Acquire). If it sees a non-zero
+    /// value written by `begin`, the Release/Acquire pair guarantees the
+    /// preceding msg_ptr store is also visible, so the pointer is valid.
+    /// If it sees 0 (written by `end`), it skips the entry entirely --
+    /// msg_ptr may still be non-null momentarily, but is never read.
+    #[inline]
+    pub fn begin(&self, clock_ms: u64, m: *const Message) {
+        self.msg_ptr.store(m as *mut Message, Ordering::Release);
+        self.heartbeat_ms.store(clock_ms, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn end(&self) {
+        self.heartbeat_ms.store(0, Ordering::Release);
+        self.msg_ptr.store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
+impl Default for Watchdog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct ActorEntry {
+    tx: mpsc::UnboundedSender<Message>,
+    watchdog: Arc<Watchdog>,
 }
 
 pub struct LuaActorServer {
-    actor_uuid: AtomicI64,
+    actor_uuid: AtomicU32,
     actor_counter: AtomicU32,
     exit_code: AtomicI32,
-    actors: DashMap<i64, mpsc::UnboundedSender<Message>>,
-    unique_actors: DashMap<String, i64>,
+    actors: DashMap<ActorId, ActorEntry>,
+    unique_actors: DashMap<String, ActorId>,
     clock: Instant,
     env: DashMap<String, Arc<String>>,
-    monitor: DashMap<u64, Monitor>,
     timer_tx: mpsc::UnboundedSender<Timer>,
     timer_rx: Mutex<mpsc::UnboundedReceiver<Timer>>,
     now: DateTime<Utc>,
-    time_offset: AtomicU64
+    time_offset: AtomicU64,
+    io_runtime: tokio::runtime::Runtime,
+    main_handle: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 impl LuaActorServer {
@@ -173,27 +254,40 @@ impl LuaActorServer {
         &self,
         actor: &mut LuaActor,
         tx: mpsc::UnboundedSender<Message>,
-    ) -> Result<(), String> {
-        self.actor_counter.fetch_add(1, Ordering::AcqRel);
-        self.actors.insert(actor.id, tx);
-        if actor.unique {
-            if let Some(v) = self.unique_actors.insert(actor.name.clone(), actor.id) {
-                self.unique_actors.insert(actor.name.clone(), v);
-                return Err(format!("unique actor named {} already exists", actor.name));
-            }
+    ) -> Result<Arc<Watchdog>, String> {
+        if actor.unique && self.unique_actors.contains_key(&actor.name) {
+            return Err(format!("unique actor named {} already exists", actor.name));
         }
-        Ok(())
+
+        self.actor_counter.fetch_add(1, Ordering::AcqRel);
+        let watchdog = Arc::new(Watchdog::new());
+        self.actors.insert(
+            actor.id,
+            ActorEntry {
+                tx,
+                watchdog: watchdog.clone(),
+            },
+        );
+        if actor.unique {
+            self.unique_actors.insert(actor.name.clone(), actor.id);
+        }
+        Ok(watchdog)
     }
 
-    pub fn remove(&self, id: i64) -> Option<(i64, mpsc::UnboundedSender<Message>)> {
-        self.actors.remove(&id)
+    pub fn register_pseudo_actor(&self, id: ActorId, tx: mpsc::UnboundedSender<Message>) {
+        let watchdog = Arc::new(Watchdog::new());
+        self.actors.insert(id, ActorEntry { tx, watchdog });
     }
 
-    pub fn query(&self, name: &str) -> Option<dashmap::mapref::one::Ref<'_, String, i64>> {
+    pub fn remove(&self, id: ActorId) -> Option<mpsc::UnboundedSender<Message>> {
+        self.actors.remove(&id).map(|(_, entry)| entry.tx)
+    }
+
+    pub fn query(&self, name: &str) -> Option<dashmap::mapref::one::Ref<'_, String, ActorId>> {
         self.unique_actors.get(name)
     }
 
-    pub fn remove_actor(&self, id: i64, name: &str) {
+    pub fn remove_actor(&self, id: ActorId, name: &str) {
         self.actors.remove(&id);
         if !name.is_empty() {
             self.unique_actors.remove(name);
@@ -207,15 +301,17 @@ impl LuaActorServer {
         //notify actor exit to unique actors
         self.unique_actors.iter().for_each(|v| {
             let _ = self.send(Message {
-                ptype: PTYPE_SYSTEM,
                 from: id,
                 to: *v.value(),
                 session: 0,
-                data: MessageData::Buffer(Box::new(
-                    format!("_service_exit,Actor id:{} quited", id)
-                        .into_bytes()
-                        .into(),
-                )),
+                data: MessageBody::Buffer(
+                    PTYPE_SYSTEM,
+                    Box::new(
+                        format!("_service_exit,Actor id:{} quited", id)
+                            .into_bytes()
+                            .into(),
+                    ),
+                ),
             });
         });
     }
@@ -254,22 +350,19 @@ impl LuaActorServer {
         );
         self.exit_code.store(exit_code, Ordering::Release);
         self.actors.iter().for_each(|v| {
-            let _ = v.value().send(Message {
-                ptype: PTYPE_SHUTDOWN,
+            let _ = v.value().tx.send(Message {
                 from: 0,
                 to: 0,
                 session: 0,
-                data: MessageData::None,
+                data: MessageBody::None(PTYPE_SHUTDOWN),
             });
         });
-
     }
 
     #[must_use]
     pub fn send(&self, msg: Message) -> Option<Message> {
-        //log::info!("send message: from {:?} to {} ptype {} session {}", msg.from, msg.to, msg.ptype, msg.session);
-        if let Some(addr) = self.actors.get(&msg.to) {
-            if let Err(err) = addr.value().send(msg) {
+        if let Some(entry) = self.actors.get(&msg.to) {
+            if let Err(err) = entry.value().tx.send(msg) {
                 return Some(err.0);
             } else {
                 return None;
@@ -279,22 +372,41 @@ impl LuaActorServer {
     }
 
     #[must_use]
-    pub fn send_value<T: Send>(&self, protocol_type: u8, owner: i64, session: i64, res: T) -> Option<Message> {
+    pub fn send_value<T: Send>(
+        &self,
+        protocol_type: u8,
+        owner: ActorId,
+        session: i64,
+        res: T,
+    ) -> Option<Message> {
         self.send(Message {
-            ptype: protocol_type,
             from: 0,
             to: owner,
             session,
-            data: MessageData::Boxed(Box::new(BoxedValue::new(res))),
+            data: MessageBody::Boxed(protocol_type, Box::new(BoxedValue::new(res))),
         })
     }
 
-    pub fn next_actor_id(&self) -> i64 {
-        let id: i64 = self.actor_uuid.fetch_add(1, Ordering::AcqRel);
-        if id == i64::MAX {
-            panic!("actor id overflow");
+    pub fn next_actor_id(&self) -> ActorId {
+        loop {
+            let id = self.actor_uuid.fetch_add(1, Ordering::AcqRel);
+            if id == 0 {
+                // Wrapped around to 0. The fetch_add already advanced the
+                // counter to 1, so try to CAS it forward to ACTOR_ID_WRAP_START
+                // to skip IDs reserved for long-lived startup services.
+                // If another thread already moved it past 1, the CAS is a no-op.
+                let _ = self.actor_uuid.compare_exchange(
+                    1,
+                    ACTOR_ID_WRAP_START,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                continue;
+            }
+            if !self.actors.contains_key(&id) {
+                return id;
+            }
         }
-        id
     }
 
     pub fn clock(&self) -> f64 {
@@ -313,60 +425,79 @@ impl LuaActorServer {
         self.time_offset.fetch_add(offset, Ordering::Release);
     }
 
-    pub fn response_error(&self, from: i64, to: i64, session: i64, err: String) {
+    pub fn response_error(&self, from: ActorId, to: ActorId, session: i64, err: String) {
         if session >= 0 {
             log::error!("{}. ({}:{})", err, file!(), line!());
         } else {
             let _ = self.send(Message {
-                ptype: PTYPE_ERROR,
                 from,
                 to,
                 session: -session,
-                data: MessageData::Buffer(Box::new(err.into_bytes().into())),
+                data: MessageBody::Buffer(PTYPE_ERROR, Box::new(err.into_bytes().into())),
             });
         }
     }
 
-    pub fn update_monitor(&self, ptype: u8, tm: f64, from: i64, to: i64) {
-        THREAD_ID.with(|id| {
-            self.monitor.insert(
-                *id,
-                Monitor {
-                    ptype,
-                    tm,
-                    from,
-                    to,
-                },
-            );
+    pub fn clock_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis() as u64
+    }
+
+    pub fn check_watchdogs(&self) {
+        let now_ms = self.clock_ms();
+        self.actors.iter().for_each(|entry| {
+            let id = *entry.key();
+            let wd = &entry.value().watchdog;
+            let hb = wd.heartbeat_ms.load(Ordering::Acquire);
+            if hb > 0 && now_ms.saturating_sub(hb) >= 10_000 {
+                let elapsed_s = (now_ms - hb) / 1000;
+                let msg_info = unsafe {
+                    let p = wd.msg_ptr.load(Ordering::Acquire);
+                    if !p.is_null() {
+                        format!("{}", &*p)
+                    } else {
+                        "unknown".to_string()
+                    }
+                };
+                let s = format!(
+                    "slow_message,Actor 0x{:08X} blocked for {}s, msg: {}",
+                    id, elapsed_s, msg_info
+                );
+                log::error!("{}", s);
+                let _ = self.send(Message {
+                    from: id,
+                    to: BOOTSTRAP_ACTOR_ADDR,
+                    session: 0,
+                    data: MessageBody::Buffer(PTYPE_SYSTEM, Box::new(s.into())),
+                });
+                wd.heartbeat_ms.store(now_ms, Ordering::Release);
+            }
         });
     }
 
-    pub fn check_monitor(&self) {
-        self.monitor.iter().for_each(|v| {
-            let w = v.value();
-            //log::info!("check_monitor thread id: {:?} tm: {:?} clock: {}. diff {}", v.key(), w.tm, self.clock(), self.clock() - w.tm);
-            if w.tm > 0.0 && self.clock() - w.tm >= 1.0 {
-                let s =  format!("endless_loop,A message PTYPE {} from {:08X} to {:08X} maybe in an endless loop (tm={})", v.ptype, v.from, v.to, (self.now + Duration::from_secs_f64(v.tm)).with_timezone(&Local));
-                log::error!("{}", s);
-                let _ = self.send(Message {
-                    ptype: PTYPE_SYSTEM,
-                    from: v.to,
-                    to: BOOTSTRAP_ACTOR_ADDR,
-                    session: 0,
-                    data: MessageData::Buffer(Box::new(s.into())),
-                });
-            }
-        });
+    pub fn io_runtime(&self) -> &tokio::runtime::Runtime {
+        &self.io_runtime
+    }
+
+    pub fn set_main_handle(&self, handle: tokio::runtime::Handle) {
+        self.main_handle.set(handle).ok();
+    }
+
+    pub fn main_handle(&self) -> &tokio::runtime::Handle {
+        self.main_handle
+            .get()
+            .expect("main runtime not initialized")
     }
 }
 
 pub fn run_monitor() {
-    thread::spawn(|| loop {
-        if CONTEXT.exit_code() != i32::MAX && CONTEXT.stopped() {
-            break;
+    thread::spawn(|| {
+        loop {
+            if CONTEXT.exit_code() != i32::MAX && CONTEXT.stopped() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(5));
+            CONTEXT.check_watchdogs();
         }
-        thread::sleep(Duration::from_secs(5));
-        CONTEXT.check_monitor();
     });
 }
 
@@ -374,10 +505,10 @@ pub fn run_monitor() {
 struct Timer {
     expiry_clock: i64,
     timer_id: i64,
-    owner: i64,
+    owner: ActorId,
 }
 
-pub fn insert_timer(owner: i64, timer_id: i64, interval: u64) {
+pub fn insert_timer(owner: ActorId, timer_id: i64, interval: u64) {
     let expiry_clock = CONTEXT.now_clock() + Duration::from_millis(interval);
     let _ = CONTEXT.timer_tx.send(Timer {
         timer_id,
@@ -410,11 +541,10 @@ pub fn run_timer() {
                 if diff <= 0 {
                     //println!("timer timeout: {:?} {:?}", timer, CONTEXT.now_clock());
                     let _ = CONTEXT.send(Message {
-                        ptype: PTYPE_TIMER,
-                        from: timer.timer_id,
+                        from: 0,
                         to: timer.owner,
                         session: 0,
-                        data: MessageData::None,
+                        data: MessageBody::ISize(PTYPE_TIMER, timer.timer_id as isize),
                     });
                     btree_map.pop_first();
                 } else {
@@ -427,9 +557,9 @@ pub fn run_timer() {
 }
 
 pub struct LuaActorParam {
-    pub id: i64,
+    pub id: ActorId,
     pub unique: bool,
-    pub creator: i64,
+    pub creator: ActorId,
     pub session: i64,
     pub memlimit: i64,
     pub name: String,

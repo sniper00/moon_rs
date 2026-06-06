@@ -100,7 +100,7 @@ end
 ---@param timeout? integer Timeout in milliseconds. Default 5000ms
 ---@return string data, string kind  kind: "t"=text, "b"=binary, "p"=ping, "o"=pong, "c"=close
 function M:read(timeout)
-    return moon.wait(self.obj:read(moon.id, moon.next_session(), timeout or 5000))
+    return moon.wait(self.obj:read(timeout or 5000))
 end
 
 ---@param data string|lightuserdata Binary data

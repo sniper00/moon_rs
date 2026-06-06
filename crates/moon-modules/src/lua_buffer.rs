@@ -5,6 +5,7 @@ use moon_lua::{
     lreg, lreg_null, luaL_newlib,
 };
 use std::ffi::{c_int, c_void};
+use std::sync::Arc;
 
 use moon_runtime::buffer::{self, Buffer};
 
@@ -297,6 +298,32 @@ extern "C-unwind" fn clear(state: LuaState) -> c_int {
     0
 }
 
+extern "C-unwind" fn into_arc_buffer(state: LuaState) -> c_int {
+    let val = LuaValue::from_stack(state, 1);
+    match val {
+        LuaValue::LightUserData(ptr) => {
+            if ptr.is_null() {
+                laux::lua_error(
+                    state,
+                    "bad argument #1 (non-null lightuserdata expected)".to_string(),
+                );
+            }
+            let data = unsafe { Arc::<Buffer>::from(Box::from_raw(ptr as *mut Buffer)) };
+            laux::lua_newuserdata(state, data, cstr!("shared_buffer"), &[lreg_null!()]);
+            1
+        }
+        _ => {
+            laux::lua_error(
+                state,
+                format!(
+                    "bad argument #1 (buffer lightuserdata expected, got {})",
+                    laux::type_name(state, 1)
+                ),
+            );
+        }
+    }
+}
+
 pub extern "C-unwind" fn luaopen_buffer(state: LuaState) -> c_int {
     let l = [
         lreg!("new", buffer_new),
@@ -312,6 +339,7 @@ pub extern "C-unwind" fn luaopen_buffer(state: LuaState) -> c_int {
         lreg!("prepare", prepare),
         lreg!("size", size),
         lreg!("clear", clear),
+        lreg!("into_arc_buffer", into_arc_buffer),
         lreg_null!(),
     ];
 

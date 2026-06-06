@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use futures::stream::TryStreamExt;
 use lazy_static::lazy_static;
 use moon_runtime::actor::LuaActor;
-use moon_runtime::context::{self, CONTEXT};
+use moon_runtime::context::{self, ActorId, CONTEXT};
 use moon_lua::{
     cstr, ffi,
     laux::{self, LuaArgs, LuaState, LuaTable, LuaValue},
@@ -20,34 +20,55 @@ use std::{
     sync::{atomic::AtomicI64, Arc},
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 lazy_static! {
     static ref DATABASE_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
 }
 
 enum DatabaseRequest {
-    CreateCollection(i64, i64, String, String), // owner, session, db_name, collection_name
-    InsertOne(i64, i64, String, String, Document), // owner, session, db_name, collection_name, doc
-    InsertMany(i64, i64, String, String, Vec<Document>), // owner, session, db_name, collection_name, docs
-    DeleteOne(i64, i64, String, String, Document), // owner, session, db_name, collection_name, filter
-    DeleteMany(i64, i64, String, String, Document), // owner, session, db_name, collection_name, filter
-    UpdateOne(i64, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, update
-    UpdateMany(i64, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, update
-    FindOne(i64, i64, String, String, Document), // owner, session, db_name, collection_name, filter
-    Find(i64, i64, String, String, Document, Box<Option<FindOptions>>), // owner, session, db_name, collection_name, filter
-    ReplacOne(i64, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, replacement
-    Count(i64, i64, String, String, Document), // owner, session, db_name, collection_name, filter
-    Exists(i64, i64, String, String, Document), // owner, session, db_name, collection_name, filter,
+    CreateCollection(ActorId, i64, String, String), // owner, session, db_name, collection_name
+    InsertOne(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, doc
+    InsertMany(ActorId, i64, String, String, Vec<Document>), // owner, session, db_name, collection_name, docs
+    DeleteOne(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, filter
+    DeleteMany(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, filter
+    UpdateOne(ActorId, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, update
+    UpdateMany(ActorId, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, update
+    FindOne(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, filter
+    Find(ActorId, i64, String, String, Document, Box<Option<FindOptions>>), // owner, session, db_name, collection_name, filter
+    ReplacOne(ActorId, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, replacement
+    Count(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, filter
+    Exists(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, filter,
     CreateIndex(
-        i64,
+        ActorId,
         i64,
         String,
         String,
         Box<IndexModel>,
         Box<Option<CreateIndexOptions>>,
     ), // owner, session, db_name, collection_name, keys, options
+    FindStream(ActorId, i64, String, String, Document, Box<Option<FindOptions>>, usize),
     Close(),
+}
+
+enum CursorSignal {
+    Next(ActorId, i64),
+    Close,
+}
+
+struct CursorBatch {
+    docs: Vec<Document>,
+    next_tx: Option<oneshot::Sender<CursorSignal>>,
+}
+
+struct CursorHandle(Option<oneshot::Sender<CursorSignal>>);
+
+impl Drop for CursorHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(CursorSignal::Close);
+        }
+    }
 }
 
 enum DatabaseResponse {
@@ -61,6 +82,7 @@ enum DatabaseResponse {
     UpdateMany(results::UpdateResult),
     FindOne(Option<Document>),
     Find(Vec<Document>),
+    FindBatch(CursorBatch),
     ReplacOne(results::UpdateResult),
     Count(u64),
     Exists(bool),
@@ -97,7 +119,7 @@ impl DatabaseState {
         })
     }
 
-    fn send_result(&self, owner: i64, session: i64, res: Result<DatabaseResponse, Error>) {
+    fn send_result(&self, owner: ActorId, session: i64, res: Result<DatabaseResponse, Error>) {
         match res {
             Ok(res) => {
                 if session != 0 {
@@ -316,6 +338,61 @@ async fn database_handler(
                 );
             }
 
+            DatabaseRequest::FindStream(owner, session, db_name, collection_name, filter, options, batch_size) => {
+                let db = state.client.database(&db_name);
+                let coll: Collection<Document> = db.collection(&collection_name);
+                match coll.find(filter.clone()).with_options(*options).await {
+                    Ok(mut cur) => {
+                        let mut current_owner = owner;
+                        let mut current_session = session;
+                        loop {
+                            let mut batch = Vec::with_capacity(batch_size);
+                            let mut errored = false;
+                            for _ in 0..batch_size {
+                                match cur.try_next().await {
+                                    Ok(Some(doc)) => batch.push(doc),
+                                    Ok(None) => break,
+                                    Err(err) => {
+                                        CONTEXT.response_error(0, current_owner, -current_session, err.to_string());
+                                        errored = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if errored { break; }
+
+                            let cursor_exhausted = batch.len() < batch_size;
+                            let (next_tx, next_rx) = if !cursor_exhausted {
+                                let (tx, rx) = oneshot::channel();
+                                (Some(tx), Some(rx))
+                            } else {
+                                (None, None)
+                            };
+
+                            let _ = CONTEXT.send_value(
+                                state.protocol_type,
+                                current_owner,
+                                current_session,
+                                DatabaseResponse::FindBatch(CursorBatch { docs: batch, next_tx }),
+                            );
+
+                            if cursor_exhausted { break; }
+
+                            match next_rx.unwrap().await {
+                                Ok(CursorSignal::Next(new_owner, new_session)) => {
+                                    current_owner = new_owner;
+                                    current_session = new_session;
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        CONTEXT.response_error(0, owner, -session, err.to_string());
+                    }
+                }
+            }
+
             DatabaseRequest::Close() => {
                 break;
             }
@@ -333,7 +410,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
-    tokio::spawn(async move {
+    CONTEXT.io_runtime().spawn(async move {
         match DatabaseState::connect(context::PTYPE_MONGODB, database_url.to_string()).await {
             Ok(state) => {
                 let (tx, rx) = mpsc::unbounded_channel();
@@ -594,7 +671,7 @@ fn extract_index_options(table: LuaTable) -> Result<IndexOptions, String> {
 }
 
 fn make_request(
-    owner: i64,
+    owner: ActorId,
     session: i64,
     db_name: String,
     collection_name: String,
@@ -707,6 +784,26 @@ fn make_request(
                 Box::new(options),
             )
         }
+        "find_stream" => {
+            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let find_options =
+                if let LuaValue::Table(options) = LuaValue::from_stack(state, args.iter_arg()) {
+                    Some(extract_find_options(options)?)
+                } else {
+                    None
+                };
+            let batch_size: usize = laux::lua_opt(state, args.iter_arg()).unwrap_or(100);
+
+            DatabaseRequest::FindStream(
+                owner,
+                session,
+                db_name,
+                collection_name,
+                filter,
+                Box::new(find_options),
+                batch_size,
+            )
+        }
         "close" => DatabaseRequest::Close(),
         _ => {
             return Err(format!("Invalid operation: {}", op_name));
@@ -716,19 +813,50 @@ fn make_request(
     Ok(request)
 }
 
+extern "C-unwind" fn lua_mongodb_close(state: LuaState) -> c_int {
+    let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1)
+        .expect("Invalid database connect pointer");
+    let _ = conn.tx.send(DatabaseRequest::Close());
+    0
+}
+
+extern "C-unwind" fn cursor_next(state: LuaState) -> c_int {
+    let handle = laux::lua_touserdata::<CursorHandle>(state, 1)
+        .expect("invalid cursor handle");
+    if let Some(tx) = handle.0.take() {
+        let actor = LuaActor::from_lua_state(state);
+        let owner = unsafe { (*actor).id };
+        let session = unsafe { (*actor).next_session() };
+        let _ = tx.send(CursorSignal::Next(owner, session));
+        laux::lua_push(state, session);
+        1
+    } else {
+        crate::lua_push_error(state, "cursor: already consumed or closed")
+    }
+}
+
+extern "C-unwind" fn cursor_close(state: LuaState) -> c_int {
+    let handle = laux::lua_touserdata::<CursorHandle>(state, 1)
+        .expect("invalid cursor handle");
+    if let Some(tx) = handle.0.take() {
+        let _ = tx.send(CursorSignal::Close);
+    }
+    0
+}
+
 extern "C-unwind" fn operators(state: LuaState) -> c_int {
     let mut args = LuaArgs::new(1);
 
     let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
         .expect("Invalid database connect pointer");
 
-    let session = laux::lua_get(state, args.iter_arg());
     let op_name = unsafe { laux::lua_check_str(state, args.iter_arg()) };
     let db_name = laux::lua_get(state, args.iter_arg());
     let collection_name = laux::lua_get(state, args.iter_arg());
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
+    let session = unsafe { (*actor).next_session() };
 
     let request = match make_request(
         owner,
@@ -868,6 +996,36 @@ extern "C-unwind" fn decode(state: LuaState) -> c_int {
             }
             1
         }
+        DatabaseResponse::FindBatch(batch) => {
+            let table = laux::LuaTable::new(state, 0, batch.docs.len());
+            for (i, doc) in batch.docs.into_iter().enumerate() {
+                if let Err(err) = bson_to_lua(state, &Bson::Document(doc)) {
+                    push_lua_table!(
+                        state,
+                        "kind" => "ERROR",
+                        "message" => err
+                    );
+                    return 1;
+                }
+                table.rawseti(i + 1);
+            }
+            if let Some(next_tx) = batch.next_tx {
+                let methods = [
+                    lreg!("next", cursor_next),
+                    lreg!("close", cursor_close),
+                    lreg_null!(),
+                ];
+                laux::lua_newuserdata(
+                    state,
+                    CursorHandle(Some(next_tx)),
+                    cstr!("mongodb_cursor_handle"),
+                    &methods,
+                );
+            } else {
+                laux::lua_pushnil(state);
+            }
+            2
+        }
         DatabaseResponse::ReplacOne(res) => {
             push_lua_table!(
                 state,
@@ -924,7 +1082,7 @@ extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
     let name = unsafe { laux::lua_check_str(state, 1) };
     match DATABASE_CONNECTIONSS.get(name) {
         Some(pair) => {
-            let l = [lreg!("operators", operators), lreg_null!()];
+            let l = [lreg!("operators", operators), lreg!("close", lua_mongodb_close), lreg_null!()];
             if laux::lua_newuserdata(
                 state,
                 pair.value().clone(),

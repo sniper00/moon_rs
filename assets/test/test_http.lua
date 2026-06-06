@@ -1,3 +1,9 @@
+---
+--- test_http.lua — Functional tests for moon.http.server and moon.http.client.
+---
+--- Run: moon_rs assets/test/test_http.lua
+---
+
 local moon = require("moon")
 local json = require("json")
 local httpc = require("moon.http.client")

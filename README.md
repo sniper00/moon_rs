@@ -9,8 +9,8 @@ Please note that this project is still in the early stages of development. Contr
 ## Test
 
 ```
-cargo run --release assets/example.lua
-cargo run --release assets/benchmark_send.lua
+cargo run --release assets/example/example.lua
+cargo run --release assets/benchmark/benchmark_send.lua
 ```
 
 ## Development Status

@@ -1,17 +1,14 @@
-use crate::context::LuaActorParam;
+use crate::context::{ActorId, LuaActorParam};
 use moon_lua::laux::{LuaState, LuaGlobalState, LuaThread};
 
-use super::context::Message;
 pub use moon_lua as ffi;
-use tokio::sync::mpsc;
 
 pub struct LuaActor {
     pub ok: bool,
     pub unique: bool,
-    pub id: i64,
+    pub id: ActorId,
     uuid: i64,
     pub name: String,
-    pub rx: mpsc::UnboundedReceiver<Message>,
     pub main_state: Option<LuaGlobalState>,
     pub callback_state: LuaThread,
     pub mem: isize,
@@ -20,14 +17,13 @@ pub struct LuaActor {
 }
 
 impl LuaActor {
-    pub fn new(params: &LuaActorParam, rx: mpsc::UnboundedReceiver<Message>) -> Self {
+    pub fn new(params: &LuaActorParam) -> Self {
         LuaActor {
             ok: false,
             unique: params.unique,
             id: params.id,
             uuid: 0,
             name: params.name.clone(),
-            rx,
             main_state: None,
             callback_state: LuaThread::new(std::ptr::null_mut()),
             mem: 0,

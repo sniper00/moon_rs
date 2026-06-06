@@ -31,7 +31,7 @@ fn setup_signal() {
     {
         use tokio::signal::unix::SignalKind;
 
-        tokio::spawn(async {
+        CONTEXT.io_runtime().spawn(async {
             const SIGTERM: i32 = 15;
             const SIGINT: i32 = 2;
             const SIGQUIT: i32 = 3;
@@ -114,8 +114,17 @@ fn setup_signal() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
+    CONTEXT.set_main_handle(tokio::runtime::Handle::current());
     setup_signal();
 
     unsafe {

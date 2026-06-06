@@ -2,7 +2,7 @@ use crate::{lua_require, luaopen_custom_libs, not_null_wrapper};
 use moon_runtime::{
     actor::LuaActor,
     check_buffer,
-    context::{self, LuaActorParam, Message, MessageData, CONTEXT, LOGGER},
+    context::{self, LuaActorParam, Message, MessageBody, Watchdog, CONTEXT, LOGGER},
     log::Logger,
 };
 use moon_lua::{
@@ -18,7 +18,7 @@ use std::{
     ffi::{c_char, c_int, c_void, CString},
     ops::Deref,
     slice,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{atomic::{AtomicU32, Ordering}, Arc},
 };
 
 fn global_seed() -> std::ffi::c_uint {
@@ -141,63 +141,130 @@ unsafe extern "C" fn allocator(
     }
 }
 
-pub fn new_actor(params: LuaActorParam) {
-    tokio::spawn(async move {
-        match init(&params) {
-            Ok(mut actor) => {
-                log::info!(
-                    "{0:08X}| Actor id:{0:?} name:{1:?} started. ({2}:{3})",
-                    actor.id,
-                    actor.name,
-                    file!(),
-                    line!()
-                );
-
-                if params.creator != 0 {
-                    let _ = CONTEXT.send(Message {
-                        ptype: context::PTYPE_INTEGER,
-                        from: actor.id,
-                        to: params.creator,
-                        session: params.session,
-                        data: MessageData::ISize(actor.id as isize),
-                    });
-                }
-
-                while let Some(m) = actor.rx.recv().await {
-                    CONTEXT.update_monitor(m.ptype, CONTEXT.clock(), m.from, actor.id);
-                    handle(&mut actor, m);
-                    CONTEXT.update_monitor(0, 0.0, 0, 0);
-                }
-
-                log::info!(
-                    "{0:08X}| Actor id:{0:?} name:{1:?} stoped. ({2}:{3})",
-                    actor.id,
-                    actor.name,
-                    file!(),
-                    line!()
-                );
-            }
-            Err(err) => {
-                if params.creator != 0 {
-                    let _ = CONTEXT.send(Message {
-                        ptype: context::PTYPE_INTEGER,
-                        from: params.id,
-                        to: params.creator,
-                        session: params.session,
-                        data: MessageData::ISize(0),
-                    });
-                }
-                log::error!("Create actor failed: {}. ({}:{})", err, file!(), line!());
-            }
+fn handle_message(actor: &mut LuaActor, m: &mut Message, rx: &mut mpsc::UnboundedReceiver<Message>, watchdog: &Watchdog) -> bool {
+    if m.ptype() == context::PTYPE_QUIT {
+        if actor.id == context::BOOTSTRAP_ACTOR_ADDR {
+            CONTEXT.shutdown(0);
         }
-        CONTEXT.remove_actor(params.id, &params.name);
-    });
+        actor.ok = false;
+
+        let err = "actor quited";
+        while let Ok(m) = rx.try_recv() {
+            CONTEXT.response_error(m.to, m.from, m.session, err.to_string());
+        }
+
+        log::info!(
+            "{0:08X}| Actor id:{0:?} name:{1:?} stoped. ({2}:{3})",
+            actor.id,
+            actor.name,
+            file!(),
+            line!()
+        );
+        return false;
+    }
+
+    watchdog.begin(CONTEXT.clock_ms(), m as *const Message);
+    handle(actor, m);
+    watchdog.end();
+    true
 }
 
-pub fn init(params: &LuaActorParam) -> Result<Box<LuaActor>, String> {
+fn actor_started(actor: &LuaActor, params: &LuaActorParam) {
+    log::info!(
+        "{0:08X}| Actor id:{0:?} name:{1:?} started. ({2}:{3})",
+        actor.id,
+        actor.name,
+        file!(),
+        line!()
+    );
+
+    if params.creator != 0 {
+        let _ = CONTEXT.send(Message {
+            from: actor.id,
+            to: params.creator,
+            session: params.session,
+            data: MessageBody::ISize(context::PTYPE_INTEGER, actor.id as isize),
+        });
+    }
+}
+
+fn actor_init_failed(params: &LuaActorParam, err: String) {
+    if params.creator != 0 {
+        let _ = CONTEXT.send(Message {
+            from: params.id,
+            to: params.creator,
+            session: params.session,
+            data: MessageBody::ISize(context::PTYPE_INTEGER, 0),
+        });
+    }
+    log::error!("Create actor failed: {}. ({}:{})", err, file!(), line!());
+}
+
+fn run_actor_blocking(params: LuaActorParam, tx: mpsc::UnboundedSender<Message>, mut rx: mpsc::UnboundedReceiver<Message>) {
+    match init(&params, tx) {
+        Ok((mut actor, watchdog)) => {
+            actor_started(&actor, &params);
+            let mut buffer = Vec::new();
+            loop {
+                buffer.clear();
+                let n = rx.blocking_recv_many(&mut buffer, 16);
+                if n == 0 {
+                    break; // channel closed
+                }
+                if !dispatch_batch(&mut actor, &mut buffer, &mut rx, &watchdog) {
+                    break;
+                }
+            }
+        }
+        Err(err) => actor_init_failed(&params, err),
+    }
+    CONTEXT.remove_actor(params.id, &params.name);
+}
+
+async fn run_actor_async(params: LuaActorParam, tx: mpsc::UnboundedSender<Message>, mut rx: mpsc::UnboundedReceiver<Message>) {
+    match init(&params, tx) {
+        Ok((mut actor, watchdog)) => {
+            actor_started(&actor, &params);
+            while let Some(mut m) = rx.recv().await {
+                if !handle_message(&mut actor, &mut m, &mut rx, &watchdog) {
+                    break;
+                }
+            }
+        }
+        Err(err) => actor_init_failed(&params, err),
+    }
+    CONTEXT.remove_actor(params.id, &params.name);
+}
+
+fn dispatch_batch(actor: &mut LuaActor, buffer: &mut [Message], rx: &mut mpsc::UnboundedReceiver<Message>, watchdog: &Watchdog) -> bool {
+    for m in buffer.iter_mut() {
+        if !handle_message(actor, m, rx, watchdog) {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn new_actor(params: LuaActorParam) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut actor = Box::new(LuaActor::new(params, rx));
-    CONTEXT.add_actor(&mut actor, tx)?;
+
+    if params.unique {
+        std::thread::Builder::new()
+            .name(format!("actor-{}", params.name))
+            .spawn(move || {
+                run_actor_blocking(params, tx, rx);
+            })
+            .expect("failed to spawn exclusive thread");
+    } else {
+        CONTEXT.main_handle().spawn(async move {
+            run_actor_async(params, tx, rx).await;
+        });
+    }
+}
+
+pub fn init(params: &LuaActorParam, tx: mpsc::UnboundedSender<Message>) -> Result<(Box<LuaActor>, Arc<Watchdog>), String> {
+    let mut actor = Box::new(LuaActor::new(params));
+    let watchdog = CONTEXT.add_actor(&mut actor, tx)?;
 
     //log::info!("init actor id: {} name: {}", id, params.name);
     unsafe {
@@ -238,10 +305,10 @@ pub fn init(params: &LuaActorParam) -> Result<Box<LuaActor>, String> {
 
     actor.ok = true;
 
-    Ok(actor)
+    Ok((actor, watchdog))
 }
 
-fn handle(actor: &mut LuaActor, mut m: Message) {
+fn handle(actor: &mut LuaActor, m: &mut Message) {
     if !actor.ok {
         return;
     }
@@ -249,51 +316,36 @@ fn handle(actor: &mut LuaActor, mut m: Message) {
     debug_assert!(!actor.callback_state.0.is_null(), "moon_rs not initialized");
     let callback_state = actor.callback_state.0;
 
-    if m.ptype == context::PTYPE_QUIT {
-        if actor.id == context::BOOTSTRAP_ACTOR_ADDR {
-            CONTEXT.shutdown(0);
-        }
-        actor.ok = false;
-
-        let err = "actor quited";
-
-        while let Ok(m) = actor.rx.try_recv() {
-            CONTEXT.response_error(m.to, m.from, m.session, err.to_string());
-        }
-        actor.rx.close();
-        return;
-    }
-
     unsafe {
         let trace = 1;
         ffi::luaL_checkstack(callback_state, 8, cstr!("message dispatch"));
         ffi::lua_pushvalue(callback_state, 2);
 
-        ffi::lua_pushinteger(callback_state, m.ptype as ffi::lua_Integer);
+        ffi::lua_pushinteger(callback_state, m.ptype() as ffi::lua_Integer);
         ffi::lua_pushinteger(callback_state, m.from as ffi::lua_Integer);
         ffi::lua_pushinteger(callback_state, m.session as ffi::lua_Integer);
 
         match &mut m.data {
-            MessageData::Buffer(data) => {
+            MessageBody::Buffer(_, data) => {
                 ffi::lua_pushlightuserdata(callback_state, data.as_ptr() as *mut c_void);
                 ffi::lua_pushinteger(callback_state, data.len() as ffi::lua_Integer);
             }
-            MessageData::ISize(data) => {
+            MessageBody::ISize(_, data) => {
                 ffi::lua_pushinteger(callback_state, *data as ffi::lua_Integer);
                 ffi::lua_pushinteger(callback_state, 0 as ffi::lua_Integer);
             }
-            MessageData::Boxed(boxed) => {
+            MessageBody::Boxed(_, boxed) => {
                 let ptr = boxed.into_raw();
                 ffi::lua_pushinteger(callback_state, ptr as ffi::lua_Integer);
                 ffi::lua_pushinteger(callback_state, 0 as ffi::lua_Integer);
             }
-            MessageData::None => {
+            MessageBody::None(_) => {
                 ffi::lua_pushlightuserdata(callback_state, std::ptr::null_mut());
                 ffi::lua_pushinteger(callback_state, 0 as ffi::lua_Integer);
             }
         }
 
-        ffi::lua_pushlightuserdata(callback_state, &mut m as *mut Message as *mut c_void);
+        ffi::lua_pushlightuserdata(callback_state, m as *mut Message as *mut c_void);
 
         let r = ffi::lua_pcall(callback_state, 6, 0, trace);
         if r == ffi::LUA_OK {
@@ -334,14 +386,13 @@ fn handle(actor: &mut LuaActor, mut m: Message) {
     }
 }
 
-pub fn remove_actor(id: i64) -> Result<(), String> {
-    if let Some(res) = CONTEXT.remove(id) {
-        return match res.1.send(Message {
-            ptype: context::PTYPE_QUIT,
+pub fn remove_actor(id: context::ActorId) -> Result<(), String> {
+    if let Some(tx) = CONTEXT.remove(id) {
+        return match tx.send(Message {
             from: 0,
             to: id,
             session: 0,
-            data: MessageData::None,
+            data: MessageBody::None(context::PTYPE_QUIT),
         }) {
             Ok(_) => Ok(()),
             Err(err) => Err(format!("send error {}", err)),
@@ -372,8 +423,8 @@ extern "C-unwind" fn lua_actor_send(state: LuaState) -> c_int {
         laux::lua_arg_error(state, 1, cstr!("PTYPE must > 0"));
     }
 
-    let to: i64 = laux::lua_get(state, 2);
-    if to <= 0 {
+    let to: context::ActorId = laux::lua_get(state, 2);
+    if to == 0 {
         laux::lua_arg_error(state, 2, cstr!("receiver must > 0"));
     }
 
@@ -383,14 +434,13 @@ extern "C-unwind" fn lua_actor_send(state: LuaState) -> c_int {
 
     let session = laux::lua_opt(state, 4).unwrap_or(unsafe { (*actor).next_session() });
 
-    let from = laux::lua_opt(state, 5).unwrap_or(unsafe { (*actor).id });
+    let from: context::ActorId = laux::lua_opt(state, 5).unwrap_or(unsafe { (*actor).id });
 
     if let Some(m) = CONTEXT.send(Message {
-        ptype,
         from,
         to,
         session: -session,
-        data: MessageData::Buffer(data),
+        data: MessageBody::Buffer(ptype, data),
     }) {
         CONTEXT.response_error(
             m.to,
@@ -410,7 +460,7 @@ extern "C-unwind" fn lua_actor_send(state: LuaState) -> c_int {
 }
 
 extern "C-unwind" fn lua_kill_actor(state: LuaState) -> c_int {
-    let who = laux::lua_get(state, 1);
+    let who: context::ActorId = laux::lua_get(state, 1);
     let res = remove_actor(who);
     match res {
         Ok(_) => {
@@ -418,9 +468,7 @@ extern "C-unwind" fn lua_kill_actor(state: LuaState) -> c_int {
             1
         }
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, err);
-            2
+            crate::lua_push_error(state, &err)
         }
     }
 }
@@ -487,11 +535,10 @@ extern "C-unwind" fn lua_timeout(state: LuaState) -> c_int {
 
     if interval <= 0 {
         let _ = CONTEXT.send(Message {
-            ptype: context::PTYPE_TIMER,
-            from: timer_id,
+            from: 0,
             to: owner,
             session: 0,
-            data: MessageData::None,
+            data: MessageBody::ISize(context::PTYPE_TIMER, timer_id as isize),
         });
     } else {
         context::insert_timer(owner, timer_id, interval as u64);
@@ -615,7 +662,7 @@ extern "C-unwind" fn lua_message_decode(state: LuaState) -> c_int {
     for c in opt.chars() {
         match c {
             'T' => {
-                laux::lua_push(state, m.ptype);
+                laux::lua_push(state, m.ptype());
             }
             'S' => {
                 laux::lua_push(state, m.from);
@@ -627,28 +674,28 @@ extern "C-unwind" fn lua_message_decode(state: LuaState) -> c_int {
                 laux::lua_push(state, m.session);
             }
             'Z' => {
-                if let MessageData::Buffer(data) = &m.data {
+                if let MessageBody::Buffer(_, data) = &m.data {
                     laux::lua_push(state, data.as_slice());
                 } else {
                     laux::lua_pushnil(state);
                 }
             }
             'N' => {
-                if let MessageData::Buffer(data) = &m.data {
+                if let MessageBody::Buffer(_, data) = &m.data {
                     laux::lua_push(state, data.len());
                 } else {
                     laux::lua_push(state, 0);
                 }
             }
             'B' => {
-                if let MessageData::Buffer(data) = &mut m.data {
+                if let MessageBody::Buffer(_, data) = &mut m.data {
                     laux::lua_pushlightuserdata(state, data.as_mut().as_pointer() as *mut c_void);
                 } else {
                     laux::lua_pushnil(state);
                 }
             }
             'C' => {
-                if let MessageData::Buffer(data) = &m.data {
+                if let MessageBody::Buffer(_, data) = &m.data {
                     laux::lua_pushlightuserdata(state, data.as_ptr() as *mut c_void);
                     laux::lua_push(state, data.len());
                 } else {

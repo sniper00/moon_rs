@@ -3,6 +3,9 @@
 --- lightuserdata, cpp type `buffer*`
 ---@class buffer_ptr
 
+--- Arc<Buffer>
+---@class buffer_arc_ptr
+
 --- lightuserdata, cpp type `message*`
 ---@class message_ptr
 
