@@ -281,7 +281,7 @@ extern "C-unwind" fn commit(state: LuaState) -> c_int {
 extern "C-unwind" fn prepare(state: LuaState) -> c_int {
     let buf = get_mut_buffer(state);
     let len = laux::lua_get(state, 2);
-    let space: *mut u8 = buf.prepare(len).as_mut_ptr();
+    let space: *mut u8 = buf.prepare(len);
     laux::lua_pushlightuserdata(state, space as *mut c_void);
     1
 }

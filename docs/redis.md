@@ -14,7 +14,7 @@ High-performance native Redis driver with RESP protocol implementation in Rust.
 │    → send via mpsc channel                                  │
 │    → moon.wait(session) — coroutine yields                  │
 │                                                             │
-│  PTYPE_REDIS message arrives → c.decode(raw_resp)           │
+│  PTYPE_REDIS message arrives → moon.core.decode_message(m)  │
 │    → parse RESP into Lua values                             │
 │    → coroutine resumes with result                          │
 └─────────────┬───────────────────────────────────────────────┘
@@ -50,7 +50,7 @@ local rdb, err = redis.connect({
     port = 6379,
     auth = "password",   -- optional
     db = 0,              -- optional, default 0
-}, "default", 5000, 4)  -- name, timeout_ms, pool_size
+}, "default", 5000, 4)  -- name, timeout_ms, pool_size, queue_capacity?
 
 -- Or find existing pool
 local rdb = redis.find_connection("default")
@@ -160,6 +160,7 @@ local r = rdb:pipeline({
 | `name` | `"default"` | Pool name for lookup |
 | `timeout` | 5000ms | Connect timeout |
 | `pool_size` | 1 | Number of worker connections |
+| `queue_capacity` | 1024 | Per-worker bounded request queue capacity |
 
 ## Worker Lifecycle
 

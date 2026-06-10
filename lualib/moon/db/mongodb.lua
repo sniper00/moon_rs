@@ -5,9 +5,6 @@ moon.register_protocol {
     name = "mongodb",
     PTYPE = moon.PTYPE_MONGODB,
     pack = function(...) return ... end,
-    unpack = function(val)
-        return c.decode(val)
-    end
 }
 
 local function operators(self, ...)
@@ -36,9 +33,11 @@ local M = {}
 ---@nodiscard
 ---@param database_url string Database url e. "mongodb://127.0.0.1:27017"
 ---@param name string Connection name for find by other services
+---@param queue_capacity? integer Request queue capacity. Default 1024
 ---@return MongoDB
-function M.connect(database_url, name)
-    local res = moon.wait(c.connect(database_url, name))
+function M.connect(database_url, name, queue_capacity)
+    ---@diagnostic disable-next-line: redundant-parameter
+    local res = moon.wait(c.connect(database_url, name, queue_capacity))
     if res.kind then
         error(string.format("connect database failed: %s", res.message))
     end
@@ -115,7 +114,6 @@ end
 ---@return nil
 ---@return table to-be-closed stream state
 function M:find_stream(db_name, col_name, query, opts, batch_size)
-    batch_size = batch_size or 100
     local res = self.obj:operators("find_stream", db_name, col_name, query, opts, batch_size)
     if type(res) == "table" then
         return nil, res.message

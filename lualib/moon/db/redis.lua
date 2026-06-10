@@ -11,9 +11,6 @@ moon.register_protocol {
     name = "redis",
     PTYPE = moon.PTYPE_REDIS,
     pack = function(...) return ... end,
-    unpack = function(val)
-        return c.decode(val)
-    end
 }
 
 ---@class redis_result
@@ -43,15 +40,16 @@ end
 ---@param name? string @ Pool name for lookup (default "default")
 ---@param timeout? integer @ Connect timeout in milliseconds (default 5000)
 ---@param pool_size? integer @ Pool size (default 1)
+---@param queue_capacity? integer @ Per-worker request queue capacity (default 1024)
 ---@return redis|nil @ connection object, or nil on error
 ---@return string|nil @ error message on failure
-function M.connect(opts, name, timeout, pool_size)
-    name = name or "default"
-    local res = moon.wait(c.connect(opts, name, timeout, pool_size))
+function M.connect(opts, name, timeout, pool_size, queue_capacity)
+    ---@diagnostic disable-next-line: redundant-parameter
+    local res = moon.wait(c.connect(opts, name, timeout, pool_size, queue_capacity))
     if res.code then
         return nil, res.message
     end
-    return M.find_connection(name)
+    return M.find_connection(name or "default")
 end
 
 ---Pending request count per pool worker (async queue lengths).

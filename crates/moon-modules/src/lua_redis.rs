@@ -10,24 +10,20 @@
 //!    the actor thread.
 //!  - Async delivery via `PTYPE_REDIS` + `moon.wait(session)`.
 
+use crate::request_pool::{
+    PendingCounter, QueuedRequest, WorkerHandle, WorkerSet, drain_queued_requests,
+};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use moon_lua::laux::LuaState;
 use moon_lua::{
     cstr, ffi, laux,
-    laux::{LuaTable, LuaValue, lua_into_userdata},
+    laux::{LuaTable, LuaValue},
     lreg, lreg_null, luaL_newlib, push_lua_table,
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
-use std::{
-    ffi::c_int,
-    sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{ffi::c_int, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -55,47 +51,37 @@ struct ConnParams {
 // Pool
 // ---------------------------------------------------------------------------
 
-struct RedisWorker {
-    tx: mpsc::UnboundedSender<RedisRequest>,
-    counter: Arc<AtomicI64>,
-}
-
-struct RedisPoolInner {
-    name: String,
-    workers: Vec<RedisWorker>,
-    next: AtomicUsize,
+/// A message delivered to a worker: either a command request or a graceful
+/// shutdown signal (sent by `close()` so the worker exits and drops its
+/// connection even while the Lua-side pool handle keeps the pool `Arc` alive).
+enum RedisMessage {
+    Request(RedisRequest),
+    Shutdown,
 }
 
 #[derive(Clone)]
 struct RedisPool {
-    inner: Arc<RedisPoolInner>,
+    inner: Arc<WorkerSet<RedisMessage>>,
 }
 
 impl RedisPool {
-    fn dispatch(&self, owner: ActorId, session: i64, data: Vec<u8>, reply_count: u32) -> Result<(), String> {
-        let n = self.inner.workers.len();
-        let idx = self.inner.next.fetch_add(1, Ordering::Relaxed) % n;
-        let worker = &self.inner.workers[idx];
-        match worker.tx.send(RedisRequest {
+    fn dispatch(
+        &self,
+        owner: ActorId,
+        session: i64,
+        data: Vec<u8>,
+        reply_count: u32,
+    ) -> Result<(), String> {
+        self.inner.dispatch(RedisMessage::Request(RedisRequest {
             owner,
             session,
             data,
             reply_count,
-        }) {
-            Ok(_) => {
-                worker.counter.fetch_add(1, Ordering::Release);
-                Ok(())
-            }
-            Err(err) => Err(err.to_string()),
-        }
+        }))
     }
 
     fn pending(&self) -> i64 {
-        self.inner
-            .workers
-            .iter()
-            .map(|w| w.counter.load(Ordering::Acquire))
-            .sum()
+        self.inner.pending()
     }
 }
 
@@ -104,6 +90,15 @@ struct RedisRequest {
     session: i64,
     data: Vec<u8>,
     reply_count: u32,
+}
+
+impl QueuedRequest for RedisMessage {
+    fn owner_session(&self) -> Option<(ActorId, i64)> {
+        match self {
+            RedisMessage::Request(req) => Some((req.owner, req.session)),
+            RedisMessage::Shutdown => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +202,22 @@ async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp
                         }
                     }
                     Some(WatchOp::WaitMessage { owner, session }) => {
-                        pending_wait = Some(WatchMessageWait { owner, session });
+                        // Only one waiter is supported per watch connection. A
+                        // second concurrent wait must not silently replace the
+                        // first (that would hang the first coroutine forever):
+                        // reject the new request and keep the existing waiter.
+                        if pending_wait.is_some() {
+                            let _ = CONTEXT.send_value(
+                                context::PTYPE_REDIS,
+                                owner,
+                                session,
+                                RedisResponse::Error(
+                                    "watch: a message wait is already pending".to_string(),
+                                ),
+                            );
+                        } else {
+                            pending_wait = Some(WatchMessageWait { owner, session });
+                        }
                     }
                     Some(WatchOp::Close) | None => break,
                 }
@@ -240,14 +250,27 @@ async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp
             }
         }
     }
+
+    // The loop is exiting (explicit Close, all senders dropped, or a read
+    // error already handled above). If a waiter is still pending, wake it with
+    // an error instead of leaving the Lua coroutine blocked on `moon.wait`
+    // forever.
+    if let Some(wait) = pending_wait.take() {
+        let _ = CONTEXT.send_value(
+            context::PTYPE_REDIS,
+            wait.owner,
+            wait.session,
+            RedisResponse::Error("watch closed".to_string()),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
 
-const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
-const MAX_ARRAY_COUNT: usize = 1024 * 1024;
+const MAX_MESSAGE_LEN: usize = crate::LIMITS.db_wire_message_bytes;
+const MAX_ARRAY_COUNT: usize = crate::LIMITS.redis_array_items;
 
 struct RedisConn {
     stream: BufReader<TcpStream>,
@@ -291,7 +314,8 @@ impl RedisConn {
             if params.username.is_empty() {
                 conn.send_command(&["AUTH", &params.password]).await?;
             } else {
-                conn.send_command(&["AUTH", &params.username, &params.password]).await?;
+                conn.send_command(&["AUTH", &params.username, &params.password])
+                    .await?;
             }
             let reply = conn.read_reply().await?;
             match &reply {
@@ -304,7 +328,10 @@ impl RedisConn {
         // SELECT db
         if params.db > 0 {
             let mut tmp = [0u8; lexical_core::BUFFER_SIZE];
-            let db_str = std::str::from_utf8(lexical_core::write(params.db, &mut tmp)).unwrap();
+            // `lexical_core::write` always emits ASCII digits, so this is valid UTF-8.
+            let Ok(db_str) = std::str::from_utf8(lexical_core::write(params.db, &mut tmp)) else {
+                return Err("SELECT: db number is not valid utf-8".to_string());
+            };
             conn.send_command(&["SELECT", db_str]).await?;
             let reply = conn.read_reply().await?;
             match &reply {
@@ -394,7 +421,10 @@ impl RedisConn {
                     }
                     let count = count as usize;
                     if count > MAX_ARRAY_COUNT {
-                        return Err(format!("array too large: {} elements (max {})", count, MAX_ARRAY_COUNT));
+                        return Err(format!(
+                            "array too large: {} elements (max {})",
+                            count, MAX_ARRAY_COUNT
+                        ));
                     }
                     let mut items = Vec::with_capacity(count);
                     for _ in 0..count {
@@ -430,8 +460,7 @@ impl RedisConn {
     fn read_raw_reply_into<'a>(
         &'a mut self,
         out: &'a mut Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             self.line_buf.clear();
             self.stream
@@ -443,10 +472,8 @@ impl RedisConn {
             }
             let type_byte = self.line_buf[0];
             let num = if matches!(type_byte, b'$' | b'*') {
-                lexical_core::parse::<i64>(
-                    &self.line_buf[1..self.line_buf.len() - 2],
-                )
-                .map_err(|e| format!("invalid RESP length: {}", e))?
+                lexical_core::parse::<i64>(&self.line_buf[1..self.line_buf.len() - 2])
+                    .map_err(|e| format!("invalid RESP length: {}", e))?
             } else {
                 0
             };
@@ -476,7 +503,10 @@ impl RedisConn {
                     }
                     let count = num as usize;
                     if count > MAX_ARRAY_COUNT {
-                        return Err(format!("array too large: {} elements (max {})", count, MAX_ARRAY_COUNT));
+                        return Err(format!(
+                            "array too large: {} elements (max {})",
+                            count, MAX_ARRAY_COUNT
+                        ));
                     }
                     for _ in 0..count {
                         self.read_raw_reply_into(out).await?;
@@ -542,13 +572,27 @@ async fn worker_loop(
     name: String,
     params: ConnParams,
     timeout_ms: u64,
-    mut rx: mpsc::UnboundedReceiver<RedisRequest>,
-    counter: Arc<AtomicI64>,
+    mut rx: mpsc::Receiver<RedisMessage>,
+    counter: PendingCounter,
     initial_conn: Option<RedisConn>,
 ) {
     let mut conn: Option<RedisConn> = initial_conn;
 
-    while let Some(req) = rx.recv().await {
+    while let Some(msg) = rx.recv().await {
+        let req = match msg {
+            RedisMessage::Request(req) => req,
+            RedisMessage::Shutdown => {
+                drain_queued_requests(&mut rx, &counter, |owner, session| {
+                    let _ = CONTEXT.send_value(
+                        context::PTYPE_REDIS,
+                        owner,
+                        session,
+                        RedisResponse::Error("redis connection closed".to_string()),
+                    );
+                });
+                break;
+            }
+        };
         let mut failed_times = 0;
         loop {
             if conn.is_none() {
@@ -562,14 +606,11 @@ async fn worker_loop(
                                 req.session,
                                 RedisResponse::Error(e),
                             );
-                            counter.fetch_sub(1, Ordering::Release);
+                            counter.dec();
                             break;
                         } else {
                             if failed_times == 0 {
-                                log::error!(
-                                    "redis '{}' reconnect failed: {}. retrying.",
-                                    name, e,
-                                );
+                                log::error!("redis '{}' reconnect failed: {}. retrying.", name, e,);
                             }
                             failed_times += 1;
                             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -611,7 +652,7 @@ async fn worker_loop(
                                     req.session,
                                     response,
                                 );
-                                counter.fetch_sub(1, Ordering::Release);
+                                counter.dec();
                                 break;
                             }
                         }
@@ -625,7 +666,7 @@ async fn worker_loop(
                         req.session,
                         RedisResponse::Error(e),
                     );
-                    counter.fetch_sub(1, Ordering::Release);
+                    counter.dec();
                     break;
                 }
             } else {
@@ -653,7 +694,7 @@ async fn worker_loop(
                 };
                 match result {
                     Ok(()) => {
-                        counter.fetch_sub(1, Ordering::Release);
+                        counter.dec();
                         break;
                     }
                     Err(e) => {
@@ -782,9 +823,9 @@ fn parse_conn_params(state: LuaState, idx: i32) -> ConnParams {
 
     unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("read_timeout")) };
     let read_timeout_ms: u64 = if laux::lua_type(state, -1) == laux::LuaType::Number {
-        laux::lua_opt(state, -1).unwrap_or(10_000)
+        laux::lua_opt(state, -1).unwrap_or(crate::LIMITS.db_read_timeout_ms)
     } else {
-        10_000
+        crate::LIMITS.db_read_timeout_ms
     };
     laux::lua_pop(state, 1);
 
@@ -828,6 +869,9 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let timeout_ms: u64 = laux::lua_opt(state, 3).unwrap_or(5000);
     let pool_size: usize = laux::lua_opt(state, 4).unwrap_or(1);
     let pool_size = pool_size.max(1);
+    let queue_capacity: usize =
+        laux::lua_opt(state, 5).unwrap_or(crate::LIMITS.request_queue_capacity);
+    let queue_capacity = queue_capacity.max(1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -850,8 +894,8 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
         let mut workers = Vec::with_capacity(pool_size);
         let mut seed_conn = Some(first_conn);
         for _ in 0..pool_size {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let counter = Arc::new(AtomicI64::new(0));
+            let (tx, rx) = mpsc::channel(queue_capacity);
+            let counter = PendingCounter::new();
             CONTEXT.io_runtime().spawn(worker_loop(
                 name.clone(),
                 params.clone(),
@@ -860,17 +904,24 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
                 counter.clone(),
                 seed_conn.take(),
             ));
-            workers.push(RedisWorker { tx, counter });
+            workers.push(WorkerHandle::new(tx, counter));
         }
 
         let pool = RedisPool {
-            inner: Arc::new(RedisPoolInner {
-                name: name.clone(),
-                workers,
-                next: AtomicUsize::new(0),
-            }),
+            inner: Arc::new(WorkerSet::new(name.clone(), workers)),
         };
-        REDIS_CONNECTIONS.insert(name, pool);
+        // Replacing an existing pool of the same name: shut down the previous
+        // pool's workers so their tasks/connections don't leak (the old workers
+        // drain their queued requests, then exit on `Shutdown`).
+        if let Some(old) = REDIS_CONNECTIONS.insert(name, pool) {
+            log::warn!(
+                "redis '{}' reconnected with the same name; shutting down the previous pool",
+                old.inner.name()
+            );
+            for w in old.inner.workers() {
+                let _ = w.tx().send(RedisMessage::Shutdown).await;
+            }
+        }
         let _ = CONTEXT.send_value(context::PTYPE_REDIS, owner, session, RedisResponse::Connect);
     });
 
@@ -891,8 +942,13 @@ extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
                 lreg!("close", close),
                 lreg_null!(),
             ];
-            if laux::lua_newuserdata(state, pair.value().clone(), REDIS_POOL_META, methods.as_ref())
-                .is_none()
+            if laux::lua_newuserdata(
+                state,
+                pair.value().clone(),
+                REDIS_POOL_META,
+                methods.as_ref(),
+            )
+            .is_none()
             {
                 laux::lua_pushnil(state);
             }
@@ -962,7 +1018,6 @@ fn command_impl(state: LuaState, forget: bool) -> c_int {
     }
 }
 
-
 /// `handle:pipeline(ops, resp_flag)` — pipelined commands.
 ///
 /// `ops` is `{ {"SET", "k", "v"}, {"GET", "k"}, ... }`.
@@ -1026,16 +1081,28 @@ fn pipeline_impl(state: LuaState, forget: bool) -> c_int {
 
 extern "C-unwind" fn pool_len(state: LuaState) -> c_int {
     let pool = laux::lua_touserdata::<RedisPool>(state, 1).expect("invalid redis pool pointer");
-    let table = LuaTable::new(state, pool.inner.workers.len(), 0);
-    for w in &pool.inner.workers {
-        table.push(w.counter.load(Ordering::Acquire));
+    let table = LuaTable::new(state, pool.inner.workers().len(), 0);
+    for w in pool.inner.workers() {
+        table.push(w.counter().load());
     }
     1
 }
 
 extern "C-unwind" fn close(state: LuaState) -> c_int {
     let pool = laux::lua_touserdata::<RedisPool>(state, 1).expect("invalid redis pool pointer");
-    REDIS_CONNECTIONS.remove(&pool.inner.name);
+    // Only remove our own entry: if a `connect()` with the same name has already
+    // replaced this pool, closing through this (now stale) handle must not evict
+    // the newer pool. Identify ourselves by the `inner` Arc.
+    REDIS_CONNECTIONS.remove_if(pool.inner.name(), |_, v| Arc::ptr_eq(&v.inner, &pool.inner));
+    // Signal every worker to finish any queued requests and then exit, so its
+    // task ends and the TCP connection is dropped. Removing the registry entry
+    // alone is not enough because the Lua handle still holds a pool `Arc`.
+    for worker in pool.inner.workers() {
+        let tx = worker.tx().clone();
+        CONTEXT.io_runtime().spawn(async move {
+            let _ = tx.send(RedisMessage::Shutdown).await;
+        });
+    }
     laux::lua_push(state, true);
     1
 }
@@ -1227,8 +1294,8 @@ fn parse_raw_push(state: LuaState, raw: &[u8], pos: usize) -> Result<usize, Stri
             Ok(next)
         }
         b':' => {
-            let v = lexical_core::parse::<i64>(data)
-                .map_err(|e| format!("invalid integer: {}", e))?;
+            let v =
+                lexical_core::parse::<i64>(data).map_err(|e| format!("invalid integer: {}", e))?;
             laux::lua_push(state, v);
             Ok(next)
         }
@@ -1257,7 +1324,10 @@ fn parse_raw_push(state: LuaState, raw: &[u8], pos: usize) -> Result<usize, Stri
             }
             let count = count as usize;
             if count > MAX_ARRAY_COUNT {
-                return Err(format!("array too large: {} elements (max {})", count, MAX_ARRAY_COUNT));
+                return Err(format!(
+                    "array too large: {} elements (max {})",
+                    count, MAX_ARRAY_COUNT
+                ));
             }
             laux::lua_checkstack(state, 4, std::ptr::null());
             let table = LuaTable::new(state, count, 0);
@@ -1272,31 +1342,28 @@ fn parse_raw_push(state: LuaState, raw: &[u8], pos: usize) -> Result<usize, Stri
     }
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> c_int {
-    laux::lua_checkstack(state, 8, std::ptr::null());
-    let response = lua_into_userdata::<RedisResponse>(state, 1);
-
-    match *response {
+fn push_redis_response(state: LuaState, response: RedisResponse) -> c_int {
+    match response {
         RedisResponse::Connect => {
             LuaTable::new(state, 0, 0);
             1
         }
-        RedisResponse::Error(ref msg) => {
+        RedisResponse::Error(msg) => {
             push_lua_table!(state, "code" => "SOCKET", "message" => msg.as_str());
             1
         }
-        RedisResponse::Raw(ref raw) => {
-            if let Err(e) = parse_raw_push(state, raw, 0) {
+        RedisResponse::Raw(raw) => {
+            if let Err(e) = parse_raw_push(state, &raw, 0) {
                 push_lua_table!(state, "code" => "DECODE", "message" => e.as_str());
             }
             1
         }
-        RedisResponse::RawPipeline(ref raw, count) => {
+        RedisResponse::RawPipeline(raw, count) => {
             let count = count as usize;
             let table = LuaTable::new(state, count, 0);
             let mut pos = 0;
             for i in 0..count {
-                match parse_raw_push(state, raw, pos) {
+                match parse_raw_push(state, &raw, pos) {
                     Ok(next) => {
                         pos = next;
                         table.rawseti(i + 1);
@@ -1314,12 +1381,22 @@ extern "C-unwind" fn decode(state: LuaState) -> c_int {
             push_watch_userdata(state, watch);
             1
         }
-        RedisResponse::WatchMessage(ref reply) => {
-            if let Err(e) = push_reply_to_lua(state, reply) {
+        RedisResponse::WatchMessage(reply) => {
+            if let Err(e) = push_reply_to_lua(state, &reply) {
                 push_lua_table!(state, "code" => "DECODE", "message" => e.as_str());
             }
             1
         }
+    }
+}
+
+pub unsafe extern "C-unwind" fn decode_redis_message(
+    state: LuaState,
+    m: *mut moon_runtime::context::Message,
+) -> c_int {
+    match unsafe { crate::message_decode::take_boxed::<RedisResponse>(m) } {
+        Ok(response) => push_redis_response(state, response),
+        Err(e) => crate::lua_push_error(state, &e),
     }
 }
 
@@ -1328,7 +1405,6 @@ pub extern "C-unwind" fn luaopen_redis(state: LuaState) -> c_int {
         lreg!("connect", connect),
         lreg!("find_connection", find_connection),
         lreg!("watch", watch_connect),
-        lreg!("decode", decode),
         lreg!("stats", stats),
         lreg_null!(),
     ];
@@ -1438,22 +1514,22 @@ mod tests {
             username: String::new(),
             password: String::new(),
             db: 0,
-            read_timeout_ms: 10_000,
+            read_timeout_ms: crate::LIMITS.db_read_timeout_ms,
         };
         assert_eq!(p.host, "localhost");
         assert_eq!(p.port, 6379);
         assert!(p.username.is_empty());
         assert!(p.password.is_empty());
         assert_eq!(p.db, 0);
-        assert_eq!(p.read_timeout_ms, 10_000);
+        assert_eq!(p.read_timeout_ms, crate::LIMITS.db_read_timeout_ms);
     }
 
     // -- Limits --------------------------------------------------------------
 
     #[test]
     fn max_constants_are_reasonable() {
-        assert_eq!(MAX_MESSAGE_LEN, 64 * 1024 * 1024);
-        assert_eq!(MAX_ARRAY_COUNT, 1024 * 1024);
+        assert_eq!(MAX_MESSAGE_LEN, crate::LIMITS.db_wire_message_bytes);
+        assert_eq!(MAX_ARRAY_COUNT, crate::LIMITS.redis_array_items);
     }
 
     // -- RESP round-trip via raw bytes ---------------------------------------
@@ -1532,5 +1608,227 @@ mod tests {
         let expected = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n\
                          *3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n";
         assert_eq!(buf, expected.to_vec());
+    }
+
+    // -- is_pubsub_delivery ---------------------------------------------------
+
+    #[test]
+    fn pubsub_delivery_message() {
+        let reply = RedisReply::Array(Some(vec![
+            RedisReply::Bulk(Some(b"message".to_vec())),
+            RedisReply::Bulk(Some(b"chan".to_vec())),
+            RedisReply::Bulk(Some(b"payload".to_vec())),
+        ]));
+        assert!(is_pubsub_delivery(&reply));
+    }
+
+    #[test]
+    fn pubsub_delivery_pmessage() {
+        let reply = RedisReply::Array(Some(vec![
+            RedisReply::Bulk(Some(b"pmessage".to_vec())),
+            RedisReply::Bulk(Some(b"pattern*".to_vec())),
+            RedisReply::Bulk(Some(b"chan".to_vec())),
+            RedisReply::Bulk(Some(b"data".to_vec())),
+        ]));
+        assert!(is_pubsub_delivery(&reply));
+    }
+
+    #[test]
+    fn pubsub_delivery_subscribe_is_not_delivery() {
+        let reply = RedisReply::Array(Some(vec![
+            RedisReply::Bulk(Some(b"subscribe".to_vec())),
+            RedisReply::Bulk(Some(b"chan".to_vec())),
+            RedisReply::Integer(1),
+        ]));
+        assert!(!is_pubsub_delivery(&reply));
+    }
+
+    #[test]
+    fn pubsub_delivery_non_array() {
+        assert!(!is_pubsub_delivery(&RedisReply::Status("OK".into())));
+        assert!(!is_pubsub_delivery(&RedisReply::Integer(42)));
+        assert!(!is_pubsub_delivery(&RedisReply::Bulk(None)));
+    }
+
+    #[test]
+    fn pubsub_delivery_empty_array() {
+        assert!(!is_pubsub_delivery(&RedisReply::Array(Some(vec![]))));
+        assert!(!is_pubsub_delivery(&RedisReply::Array(None)));
+    }
+
+    #[test]
+    fn pubsub_delivery_first_element_integer_not_delivery() {
+        let reply = RedisReply::Array(Some(vec![
+            RedisReply::Integer(1),
+            RedisReply::Bulk(Some(b"message".to_vec())),
+        ]));
+        assert!(!is_pubsub_delivery(&reply));
+    }
+
+    // -- Pool dispatch round-robin --------------------------------------------
+
+    #[test]
+    fn pool_dispatch_round_robin() {
+        let mut workers = Vec::new();
+        let mut _receivers = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::channel::<RedisMessage>(8);
+            _receivers.push(rx);
+            workers.push(WorkerHandle::new(tx, PendingCounter::new()));
+        }
+        let pool = RedisPool {
+            inner: Arc::new(WorkerSet::new("test".into(), workers)),
+        };
+
+        for i in 0..9 {
+            pool.dispatch(1, i as i64, vec![0], 1).unwrap();
+        }
+
+        // Each worker should have received 3 requests
+        for w in pool.inner.workers() {
+            assert_eq!(w.counter().load(), 3);
+        }
+    }
+
+    #[test]
+    fn pool_dispatch_closed_worker_returns_error() {
+        let (tx, rx) = mpsc::channel::<RedisMessage>(1);
+        drop(rx); // close the receiver
+        let workers = vec![WorkerHandle::new(tx, PendingCounter::new())];
+        let pool = RedisPool {
+            inner: Arc::new(WorkerSet::new("dead".into(), workers)),
+        };
+
+        let result = pool.dispatch(1, 1, vec![0], 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pool_pending_sums_all_workers() {
+        let mut workers = Vec::new();
+        for i in 0..4 {
+            let (tx, _rx) = mpsc::channel::<RedisMessage>(1);
+            workers.push(WorkerHandle::new(tx, PendingCounter::with_value(i * 10)));
+        }
+        let pool = RedisPool {
+            inner: Arc::new(WorkerSet::new("test".into(), workers)),
+        };
+        // 0 + 10 + 20 + 30 = 60
+        assert_eq!(pool.pending(), 60);
+    }
+
+    // -- find_crlf edge cases -------------------------------------------------
+
+    #[test]
+    fn find_crlf_at_very_start() {
+        assert_eq!(find_crlf(b"\r\n", 0), Ok(0));
+    }
+
+    #[test]
+    fn find_crlf_first_cr_not_followed_by_lf() {
+        // First \r at pos 1, next byte is 'x', so not CRLF.
+        // memchr only finds the first \r, so even though \r\n exists later, it fails.
+        assert!(find_crlf(b"+\rxOK\r\n", 1).is_err());
+    }
+
+    #[test]
+    fn find_crlf_at_boundary() {
+        // \r is at end of buffer with no following \n
+        assert!(find_crlf(b"+OK\r", 1).is_err());
+    }
+
+    // -- RESP encoding edge cases ---------------------------------------------
+
+    #[test]
+    fn encode_resp_strings_empty_args() {
+        let mut buf = Vec::new();
+        encode_resp_strings(&mut buf, &[]);
+        assert_eq!(buf, b"*0\r\n");
+    }
+
+    #[test]
+    fn encode_resp_strings_large_arg_count() {
+        let args: Vec<&str> = (0..256).map(|_| "x").collect();
+        let mut buf = Vec::new();
+        encode_resp_strings(&mut buf, &args);
+        assert!(buf.starts_with(b"*256\r\n"));
+    }
+
+    #[test]
+    fn bulk_bytes_with_crlf_in_data() {
+        let mut buf = Vec::new();
+        write_bulk_bytes(&mut buf, b"a\r\nb");
+        // Binary-safe: length=4, data contains \r\n
+        assert_eq!(buf, b"$4\r\na\r\nb\r\n");
+    }
+
+    // -- RESP raw parsing edge cases ------------------------------------------
+
+    #[test]
+    fn resp_empty_bulk_string() {
+        let raw = b"$0\r\n\r\n";
+        let end = find_crlf(raw, 1).unwrap();
+        let len = lexical_core::parse::<i64>(&raw[1..end]).unwrap() as usize;
+        let data_start = end + 2;
+        assert_eq!(len, 0);
+        assert_eq!(&raw[data_start..data_start + len], b"");
+    }
+
+    #[test]
+    fn resp_null_array() {
+        let raw = b"*-1\r\n";
+        let end = find_crlf(raw, 1).unwrap();
+        let count = lexical_core::parse::<i64>(&raw[1..end]).unwrap();
+        assert_eq!(count, -1);
+    }
+
+    #[test]
+    fn resp_empty_array() {
+        let raw = b"*0\r\n";
+        let end = find_crlf(raw, 1).unwrap();
+        let count = lexical_core::parse::<i64>(&raw[1..end]).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn resp_large_integer() {
+        let raw = b":9223372036854775807\r\n"; // i64::MAX
+        let end = find_crlf(raw, 1).unwrap();
+        let val = lexical_core::parse::<i64>(&raw[1..end]).unwrap();
+        assert_eq!(val, i64::MAX);
+    }
+
+    #[test]
+    fn resp_large_bulk_string_length() {
+        // Build a bulk string with 1024 bytes
+        let payload = vec![b'x'; 1024];
+        let mut raw = format!("${}\r\n", payload.len()).into_bytes();
+        raw.extend_from_slice(&payload);
+        raw.extend_from_slice(b"\r\n");
+        let end = find_crlf(&raw, 1).unwrap();
+        let len = lexical_core::parse::<i64>(&raw[1..end]).unwrap() as usize;
+        assert_eq!(len, 1024);
+        let data_start = end + 2;
+        assert_eq!(&raw[data_start..data_start + len], payload.as_slice());
+    }
+
+    // -- ConnParams field coverage --------------------------------------------
+
+    #[test]
+    fn conn_params_with_auth_and_db() {
+        let p = ConnParams {
+            host: "redis.example.com".into(),
+            port: 6380,
+            username: "user".into(),
+            password: "pass123".into(),
+            db: 5,
+            read_timeout_ms: 5_000,
+        };
+        assert_eq!(p.host, "redis.example.com");
+        assert_eq!(p.port, 6380);
+        assert_eq!(p.username, "user");
+        assert_eq!(p.password, "pass123");
+        assert_eq!(p.db, 5);
+        assert_eq!(p.read_timeout_ms, 5_000);
     }
 }

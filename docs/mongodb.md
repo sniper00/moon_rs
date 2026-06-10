@@ -13,7 +13,7 @@ Native MongoDB driver using the official `mongodb` Rust crate.
 │    → send DatabaseRequest to worker via mpsc                │
 │    → moon.wait(session) — coroutine yields                  │
 │                                                             │
-│  PTYPE_MONGODB message arrives → c.decode(raw)              │
+│  PTYPE_MONGODB message arrives → moon.core.decode_message(m)│
 │    → parse BSON documents into Lua tables                   │
 │    → coroutine resumes with result                          │
 └─────────────┬───────────────────────────────────────────────┘
@@ -34,6 +34,7 @@ local mongodb = require("moon.db.mongodb")
 
 -- Connect (async)
 local db = mongodb.connect("mongodb://127.0.0.1:27017", "main")
+-- Optional third argument: queue_capacity (default 1024)
 
 -- Or find existing connection
 local db = mongodb.find_connection("main")

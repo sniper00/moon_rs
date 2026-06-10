@@ -7,14 +7,15 @@ moon.register_protocol {
     name = "websocket",
     PTYPE = protocol_type,
     pack = function(...) return ... end,
-    unpack = function(val)
-        return c.decode(val)
-    end
 }
 
 ---@class websocket.Options
 ---@field max_message_size? integer Max WebSocket message size in bytes (default 64MB)
 ---@field max_frame_size? integer Max WebSocket frame size in bytes (default 16MB)
+---@field write_buffer_size? integer Target outbound write buffer size in bytes (default 128KB)
+---@field max_write_buffer_size? integer Hard cap on the outbound write buffer in bytes; bounds memory when a peer reads slowly (default: max_message_size + write_buffer_size, instead of unbounded)
+---@field max_connections? integer (listen only) Max concurrently accepted connections (default 100000)
+---@field origins? string[] (listen only) Allow-list of exact `Origin` header values; when set, handshakes with a missing or unlisted Origin are rejected (prevents cross-site WebSocket hijacking). Omit to disable the check (non-browser/trusted clients).
 
 ---@class websocket.ConnectResponse
 ---@field fd integer Connection file descriptor
@@ -39,11 +40,15 @@ local M = {}
 function M.connect(url, timeout, opts)
     local t = {
         url = url,
-        connect_timeout = timeout or 5000,
     }
+    if timeout ~= nil then
+        t.connect_timeout = timeout
+    end
     if opts then
         t.max_message_size = opts.max_message_size
         t.max_frame_size = opts.max_frame_size
+        t.write_buffer_size = opts.write_buffer_size
+        t.max_write_buffer_size = opts.max_write_buffer_size
     end
 
     local response, err = moon.wait(c.connect(t))
@@ -63,7 +68,7 @@ end
 ---@param opts? websocket.Options
 ---@return integer listener_fd
 function M.listen(addr, opts)
-    return c.listen(addr, opts or {})
+    return c.listen(addr, opts)
 end
 
 ---@async
@@ -100,7 +105,7 @@ end
 ---@param timeout? integer Timeout in milliseconds. Default 5000ms
 ---@return string data, string kind  kind: "t"=text, "b"=binary, "p"=ping, "o"=pong, "c"=close
 function M:read(timeout)
-    return moon.wait(self.obj:read(timeout or 5000))
+    return moon.wait(self.obj:read(timeout))
 end
 
 ---@param data string|lightuserdata Binary data

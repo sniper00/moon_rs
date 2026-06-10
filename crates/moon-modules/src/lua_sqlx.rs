@@ -1,27 +1,26 @@
 use crate::lua_json::{JsonOptions, encode_table};
+use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests};
 use dashmap::DashMap;
 use futures::TryStreamExt;
 use lazy_static::lazy_static;
-use moon_runtime::actor::LuaActor;
-use moon_runtime::context::{self, ActorId, CONTEXT};
 use moon_lua::laux::LuaState;
 use moon_lua::{
     cstr, ffi, laux,
-    laux::{LuaArgs, LuaTable, LuaValue, lua_into_userdata},
+    laux::{LuaArgs, LuaTable, LuaValue},
     lreg, lreg_null, luaL_newlib, push_lua_table,
 };
+use moon_runtime::actor::LuaActor;
+use moon_runtime::context::{self, ActorId, CONTEXT};
 use phf::phf_map;
 use sqlx::{
     self, Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite,
-    SqlitePool, TypeInfo, ValueRef, migrate::MigrateDatabase,
-    mysql::{MySqlPoolOptions, MySqlRow}, postgres::{PgPoolOptions, PgRow},
+    SqlitePool, TypeInfo, ValueRef,
+    migrate::MigrateDatabase,
+    mysql::{MySqlPoolOptions, MySqlRow},
+    postgres::{PgPoolOptions, PgRow},
     sqlite::{SqlitePoolOptions, SqliteRow},
 };
-use std::{
-    ffi::c_int,
-    sync::{Arc, atomic::AtomicI64},
-    time::Duration,
-};
+use std::{ffi::c_int, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -260,7 +259,9 @@ impl DatabasePool {
             )
             .await?;
             Ok(DatabasePool::MySql(pool))
-        } else if database_url.starts_with("postgres://") {
+        } else if database_url.starts_with("postgres://")
+            || database_url.starts_with("postgresql://")
+        {
             let pool = connect_with_timeout(
                 timeout_duration,
                 PgPoolOptions::new()
@@ -290,6 +291,11 @@ impl DatabasePool {
         }
     }
 
+    /// Build a parameterized query. **Trust requirement:** the `sql` string is
+    /// passed to the driver verbatim via `sqlx::AssertSqlSafe` — only the `binds`
+    /// are parameterized. The caller (Lua) is responsible for ensuring `sql` is a
+    /// trusted, statically-known statement; never build it by concatenating
+    /// untrusted input. Use `$1`/`?` placeholders + binds for all values.
     fn make_query<DB: sqlx::Database>(
         sql: String,
         binds: &[QueryParams],
@@ -320,17 +326,17 @@ impl DatabasePool {
         match self {
             DatabasePool::MySql(pool) => {
                 let query = Self::make_query(request.sql.clone(), &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
+                let rows = collect_capped(query.fetch(pool)).await?;
                 Ok(DatabaseResponse::MysqlRows(rows))
             }
             DatabasePool::Postgres(pool) => {
                 let query = Self::make_query(request.sql.clone(), &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
+                let rows = collect_capped(query.fetch(pool)).await?;
                 Ok(DatabaseResponse::PgRows(rows))
             }
             DatabasePool::Sqlite(pool) => {
                 let query = Self::make_query(request.sql.clone(), &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
+                let rows = collect_capped(query.fetch(pool)).await?;
                 Ok(DatabaseResponse::SqliteRows(rows))
             }
         }
@@ -359,6 +365,26 @@ impl DatabasePool {
     }
 }
 
+/// Drain a row stream into a `Vec`, failing fast once it would exceed
+/// `crate::LIMITS.db_query_rows`. This bounds the memory a single non-streaming
+/// `query` can buffer; large result sets must use the streaming cursor API.
+async fn collect_capped<S, R>(mut stream: S) -> Result<Vec<R>, sqlx::Error>
+where
+    S: futures::Stream<Item = Result<R, sqlx::Error>> + Unpin,
+{
+    let mut rows = Vec::new();
+    while let Some(row) = stream.try_next().await? {
+        if rows.len() >= crate::LIMITS.db_query_rows {
+            return Err(sqlx::Error::Protocol(format!(
+                "query returned more than {} rows; use query_stream for large result sets",
+                crate::LIMITS.db_query_rows
+            )));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------------
 // Request / Response / Connection types
 // ---------------------------------------------------------------------------
@@ -385,10 +411,29 @@ enum DatabaseRequest {
     Close(),
 }
 
+impl DatabaseRequest {
+    /// `(owner, session)` for requests that the handler increments the
+    /// backpressure counter for and may reply to; `None` for `Close`.
+    fn owner_session(&self) -> Option<(ActorId, i64)> {
+        match self {
+            DatabaseRequest::Query(owner, session, _)
+            | DatabaseRequest::QueryStream(owner, session, _, _)
+            | DatabaseRequest::Transaction(owner, session, _) => Some((*owner, *session)),
+            DatabaseRequest::Close() => None,
+        }
+    }
+}
+
+impl QueuedRequest for DatabaseRequest {
+    fn owner_session(&self) -> Option<(ActorId, i64)> {
+        DatabaseRequest::owner_session(self)
+    }
+}
+
 #[derive(Clone)]
 struct DatabaseConnection {
     tx: mpsc::Sender<DatabaseRequest>,
-    counter: Arc<AtomicI64>,
+    counter: PendingCounter,
 }
 
 enum DatabaseResponse {
@@ -428,10 +473,26 @@ struct TransactionQueries {
 // Async handler
 // ---------------------------------------------------------------------------
 
+/// Whether a `sqlx::Error` is a transient connection/IO failure worth retrying,
+/// as opposed to a logical error (bad SQL, constraint violation, decode error)
+/// that will fail identically on every retry. Used to gate the fire-and-forget
+/// (`session == 0`) self-heal retry so a permanent error can't wedge the
+/// single-threaded handler in an infinite loop.
+fn is_transient_sqlx_error(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed
+    )
+}
+
 async fn handle_result(
     database_url: &str,
     failed_times: &mut i32,
-    counter: &Arc<AtomicI64>,
+    counter: &PendingCounter,
     protocol_type: u8,
     owner: ActorId,
     session: i64,
@@ -448,20 +509,37 @@ async fn handle_result(
                     line!()
                 );
             }
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            counter.dec();
             false
         }
         Err(err) => {
             if session != 0 {
-                let _ = CONTEXT.send_value(protocol_type, owner, session, DatabaseResponse::Error(err));
-                counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                let _ =
+                    CONTEXT.send_value(protocol_type, owner, session, DatabaseResponse::Error(err));
+                counter.dec();
                 false
             } else {
+                // Fire-and-forget (session == 0): there is no caller to receive
+                // the error. Only self-heal on transient connection errors; a
+                // logical error (bad SQL, constraint violation, ...) fails the
+                // same way on every retry, so drop it instead of looping forever
+                // and wedging this single-threaded handler.
+                if !is_transient_sqlx_error(&err) {
+                    log::error!(
+                        "Database '{}' permanent error: '{}'. Dropped (fire-and-forget, no retry). ({}:{})",
+                        database_url,
+                        err,
+                        file!(),
+                        line!()
+                    );
+                    counter.dec();
+                    return false;
+                }
                 if *failed_times > 0 {
                     log::error!(
-                        "Database '{}' error: '{:?}'. Will retry. ({}:{})",
+                        "Database '{}' transient error: '{}'. Will retry. ({}:{})",
                         database_url,
-                        err.to_string(),
+                        err,
                         file!(),
                         line!()
                     );
@@ -480,7 +558,7 @@ async fn database_handler(
     pool: &DatabasePool,
     mut rx: mpsc::Receiver<DatabaseRequest>,
     database_url: &str,
-    counter: Arc<AtomicI64>,
+    counter: PendingCounter,
 ) {
     while let Some(op) = rx.recv().await {
         let mut failed_times = 0;
@@ -512,14 +590,14 @@ async fn database_handler(
                 {}
             }
             DatabaseRequest::QueryStream(owner, session, query_op, batch_size) => {
-                counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
                 let batch_size = *batch_size;
                 let mut current_owner = *owner;
                 let mut current_session = *session;
 
                 macro_rules! do_stream {
                     ($pool:expr, $variant:ident) => {{
-                        let query_result = DatabasePool::make_query(query_op.sql.clone(), &query_op.binds);
+                        let query_result =
+                            DatabasePool::make_query(query_op.sql.clone(), &query_op.binds);
                         match query_result {
                             Ok(q) => {
                                 let mut stream = q.fetch($pool);
@@ -531,13 +609,20 @@ async fn database_handler(
                                             Ok(Some(row)) => batch.push(row),
                                             Ok(None) => break,
                                             Err(err) => {
-                                                CONTEXT.response_error(0, current_owner, -current_session, err.to_string());
+                                                CONTEXT.response_error(
+                                                    0,
+                                                    current_owner,
+                                                    -current_session,
+                                                    err.to_string(),
+                                                );
                                                 errored = true;
                                                 break;
                                             }
                                         }
                                     }
-                                    if errored { break; }
+                                    if errored {
+                                        break;
+                                    }
 
                                     let cursor_exhausted = batch.len() < batch_size;
                                     let (next_tx, next_rx) = if !cursor_exhausted {
@@ -554,9 +639,9 @@ async fn database_handler(
                                         DatabaseResponse::$variant(batch, next_tx),
                                     );
 
-                                    if cursor_exhausted { break; }
-
-                                    match next_rx.unwrap().await {
+                                    // `next_rx` is `Some` iff the cursor isn't exhausted.
+                                    let Some(next_rx) = next_rx else { break };
+                                    match next_rx.await {
                                         Ok(CursorSignal::Next(new_owner, new_session)) => {
                                             current_owner = new_owner;
                                             current_session = new_session;
@@ -566,7 +651,12 @@ async fn database_handler(
                                 }
                             }
                             Err(err) => {
-                                CONTEXT.response_error(0, current_owner, -current_session, err.to_string());
+                                CONTEXT.response_error(
+                                    0,
+                                    current_owner,
+                                    -current_session,
+                                    err.to_string(),
+                                );
                             }
                         }
                     }};
@@ -577,13 +667,29 @@ async fn database_handler(
                     DatabasePool::Postgres(p) => do_stream!(p, PgBatch),
                     DatabasePool::Sqlite(p) => do_stream!(p, SqliteBatch),
                 }
+                // The stream is fully drained / errored / cancelled above; the
+                // operation only stops being in-flight now, so `stats()` reflects
+                // an active stream for its whole lifetime (decrement at the end,
+                // not at entry).
+                counter.dec();
             }
             DatabaseRequest::Close() => {
+                drain_queued_requests(&mut rx, &counter, |owner, session| {
+                    CONTEXT.response_error(
+                        0,
+                        owner,
+                        -session,
+                        "sqlx connection closed".to_string(),
+                    );
+                });
                 break;
             }
         }
     }
-    DATABASE_CONNECTIONS.remove(&name);
+    // Only remove our own registry entry. If this handler is being superseded by
+    // a `connect()` of the same name, the new entry is already in place and must
+    // not be deleted — match on our own pending counter to identify ourselves.
+    DATABASE_CONNECTIONS.remove_if(&name, |_, v| v.counter.ptr_eq(&counter));
     log::info!("Database connection '{}' closed and removed.", name);
 }
 
@@ -595,7 +701,10 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let database_url = unsafe { laux::lua_check_str(state, 1) };
     let name = unsafe { laux::lua_check_str(state, 2) };
     let connect_timeout: u64 = laux::lua_opt(state, 3).unwrap_or(5000);
-    let max_connections: u32 = laux::lua_opt(state, 4).unwrap_or(5);
+    let max_connections: u32 = laux::lua_opt(state, 4).unwrap_or(crate::LIMITS.db_pool_size);
+    let queue_capacity: usize =
+        laux::lua_opt(state, 5).unwrap_or(crate::LIMITS.request_queue_capacity);
+    let queue_capacity = queue_capacity.max(1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -614,16 +723,27 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
         .await
         {
             Ok(pool) => {
-                let (tx, rx) = mpsc::channel(100);
-                let counter = Arc::new(AtomicI64::new(0));
-                DATABASE_CONNECTIONS.insert(
+                let (tx, rx) = mpsc::channel(queue_capacity);
+                let counter = PendingCounter::new();
+                // Replacing an existing connection of the same name: tell the
+                // previous handler to close so its task and pool don't leak. Its
+                // exit removal is guarded (see `database_handler`) so it won't
+                // delete the entry we insert here.
+                if let Some(old) = DATABASE_CONNECTIONS.insert(
                     name.to_string(),
                     DatabaseConnection {
                         tx: tx.clone(),
                         counter: counter.clone(),
                     },
-                );
-                let _ = CONTEXT.send_value(protocol_type, owner, session, DatabaseResponse::Connect);
+                ) {
+                    log::warn!(
+                        "sqlx '{}' reconnected with the same name; closing the previous connection",
+                        name
+                    );
+                    let _ = old.tx.send(DatabaseRequest::Close()).await;
+                }
+                let _ =
+                    CONTEXT.send_value(protocol_type, owner, session, DatabaseResponse::Connect);
                 database_handler(name, protocol_type, &pool, rx, &database_url, counter).await;
             }
             Err(err) => {
@@ -668,12 +788,10 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
         LuaValue::Boolean(val) => QueryParams::Bool(val),
         LuaValue::Number(val) => QueryParams::Float(val),
         LuaValue::Integer(val) => QueryParams::Int(val),
-        LuaValue::String(val) => {
-            match String::from_utf8(val.to_vec()) {
-                Ok(s) => QueryParams::Text(s),
-                Err(e) => QueryParams::Bytes(e.into_bytes()),
-            }
-        }
+        LuaValue::String(val) => match String::from_utf8(val.to_vec()) {
+            Ok(s) => QueryParams::Text(s),
+            Err(e) => QueryParams::Bytes(e.into_bytes()),
+        },
         LuaValue::Table(val) => {
             let mut buffer = Vec::new();
             if let Err(err) = encode_table(&mut buffer, &val, 0, false, &options) {
@@ -700,13 +818,19 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
     Ok(res)
 }
 
-extern "C-unwind" fn query(state: LuaState) -> c_int { query_impl(state, false) }
-extern "C-unwind" fn exec_query(state: LuaState) -> c_int { query_impl(state, true) }
+extern "C-unwind" fn query(state: LuaState) -> c_int {
+    query_impl(state, false)
+}
+extern "C-unwind" fn exec_query(state: LuaState) -> c_int {
+    query_impl(state, true)
+}
 
 fn query_impl(state: LuaState, forget: bool) -> c_int {
     let mut args = LuaArgs::new(1);
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
-        .expect("invalid database connection pointer");
+    let conn =
+        laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg()).unwrap_or_else(|| {
+            laux::lua_error(state, "invalid database connection pointer".to_string())
+        });
 
     let sql = unsafe { laux::lua_check_str(state, args.iter_arg()) };
     let mut params = Vec::new();
@@ -723,7 +847,11 @@ fn query_impl(state: LuaState, forget: bool) -> c_int {
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
-    let session: i64 = if forget { 0 } else { unsafe { (*actor).next_session() } };
+    let session: i64 = if forget {
+        0
+    } else {
+        unsafe { (*actor).next_session() }
+    };
 
     match conn.tx.try_send(DatabaseRequest::Query(
         owner,
@@ -734,9 +862,12 @@ fn query_impl(state: LuaState, forget: bool) -> c_int {
         },
     )) {
         Ok(_) => {
-            conn.counter
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            if forget { laux::lua_push(state, true); } else { laux::lua_push(state, session); }
+            conn.counter.inc();
+            if forget {
+                laux::lua_push(state, true);
+            } else {
+                laux::lua_push(state, session);
+            }
             1
         }
         Err(err) => {
@@ -748,10 +879,28 @@ fn query_impl(state: LuaState, forget: bool) -> c_int {
 
 extern "C-unwind" fn query_stream(state: LuaState) -> c_int {
     let mut args = LuaArgs::new(1);
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
-        .expect("invalid database connection pointer");
+    let conn =
+        laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg()).unwrap_or_else(|| {
+            laux::lua_error(state, "invalid database connection pointer".to_string())
+        });
 
-    let batch_size: usize = laux::lua_opt(state, args.iter_arg()).unwrap_or(100);
+    // Parse as i64 so a negative Lua integer is rejected rather than wrapping
+    // to a huge `usize`. `batch_size == 0` would make the stream handler emit
+    // empty batches forever, so require >= 1.
+    let batch_size: i64 =
+        laux::lua_opt(state, args.iter_arg()).unwrap_or(crate::LIMITS.db_stream_batch_rows);
+    if batch_size < 1 || batch_size as u64 > crate::LIMITS.db_query_rows as u64 {
+        push_lua_table!(
+            state,
+            "kind" => "ERROR",
+            "message" => format!(
+                "query_stream: batch_size must be between 1 and {}",
+                crate::LIMITS.db_query_rows
+            )
+        );
+        return 1;
+    }
+    let batch_size = batch_size as usize;
     let sql = unsafe { laux::lua_check_str(state, args.iter_arg()) };
     let mut params = Vec::new();
     let top = laux::lua_top(state);
@@ -779,8 +928,7 @@ extern "C-unwind" fn query_stream(state: LuaState) -> c_int {
         batch_size,
     )) {
         Ok(_) => {
-            conn.counter
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            conn.counter.inc();
             laux::lua_push(state, session);
             1
         }
@@ -792,8 +940,9 @@ extern "C-unwind" fn query_stream(state: LuaState) -> c_int {
 }
 
 extern "C-unwind" fn push_transaction_query(state: LuaState) -> c_int {
-    let queries = laux::lua_touserdata::<TransactionQueries>(state, 1)
-        .expect("invalid transaction queries pointer");
+    let queries = laux::lua_touserdata::<TransactionQueries>(state, 1).unwrap_or_else(|| {
+        laux::lua_error(state, "invalid transaction queries pointer".to_string())
+    });
 
     let sql = unsafe { laux::lua_check_str(state, 2) };
     let mut params = Vec::new();
@@ -828,20 +977,32 @@ extern "C-unwind" fn make_transaction(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn transaction(state: LuaState) -> c_int { transaction_impl(state, false) }
-extern "C-unwind" fn exec_transaction(state: LuaState) -> c_int { transaction_impl(state, true) }
+extern "C-unwind" fn transaction(state: LuaState) -> c_int {
+    transaction_impl(state, false)
+}
+extern "C-unwind" fn exec_transaction(state: LuaState) -> c_int {
+    transaction_impl(state, true)
+}
 
 fn transaction_impl(state: LuaState, forget: bool) -> c_int {
     let mut args = LuaArgs::new(1);
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
-        .expect("invalid database connection pointer");
+    let conn =
+        laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg()).unwrap_or_else(|| {
+            laux::lua_error(state, "invalid database connection pointer".to_string())
+        });
 
     let queries = laux::lua_touserdata::<TransactionQueries>(state, args.iter_arg())
-        .expect("invalid transaction queries pointer");
+        .unwrap_or_else(|| {
+            laux::lua_error(state, "invalid transaction queries pointer".to_string())
+        });
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
-    let session: i64 = if forget { 0 } else { unsafe { (*actor).next_session() } };
+    let session: i64 = if forget {
+        0
+    } else {
+        unsafe { (*actor).next_session() }
+    };
 
     match conn.tx.try_send(DatabaseRequest::Transaction(
         owner,
@@ -849,9 +1010,12 @@ fn transaction_impl(state: LuaState, forget: bool) -> c_int {
         std::mem::take(&mut queries.queries),
     )) {
         Ok(_) => {
-            conn.counter
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            if forget { laux::lua_push(state, true); } else { laux::lua_push(state, session); }
+            conn.counter.inc();
+            if forget {
+                laux::lua_push(state, true);
+            } else {
+                laux::lua_push(state, session);
+            }
             1
         }
         Err(err) => {
@@ -862,8 +1026,9 @@ fn transaction_impl(state: LuaState, forget: bool) -> c_int {
 }
 
 extern "C-unwind" fn close(state: LuaState) -> c_int {
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1)
-        .expect("invalid database connection pointer");
+    let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1).unwrap_or_else(|| {
+        laux::lua_error(state, "invalid database connection pointer".to_string())
+    });
 
     match conn.tx.try_send(DatabaseRequest::Close()) {
         Ok(_) => {
@@ -911,12 +1076,17 @@ extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
 
 extern "C-unwind" fn sqlx_cursor_next(state: LuaState) -> c_int {
     let handle = laux::lua_touserdata::<SqlxCursorHandle>(state, 1)
-        .expect("invalid sqlx cursor handle");
+        .unwrap_or_else(|| laux::lua_error(state, "invalid sqlx cursor handle".to_string()));
     if let Some(tx) = handle.0.take() {
         let actor = LuaActor::from_lua_state(state);
         let owner = unsafe { (*actor).id };
         let session = unsafe { (*actor).next_session() };
-        let _ = tx.send(CursorSignal::Next(owner, session));
+        // If the stream handler has already exited, its receiver is gone and the
+        // send fails. Surface that as an error rather than pushing a session that
+        // would never be answered (which would hang the awaiting coroutine).
+        if tx.send(CursorSignal::Next(owner, session)).is_err() {
+            return crate::lua_push_error(state, "sqlx cursor: stream handler is gone");
+        }
         laux::lua_push(state, session);
         1
     } else {
@@ -926,7 +1096,7 @@ extern "C-unwind" fn sqlx_cursor_next(state: LuaState) -> c_int {
 
 extern "C-unwind" fn sqlx_cursor_close(state: LuaState) -> c_int {
     let handle = laux::lua_touserdata::<SqlxCursorHandle>(state, 1)
-        .expect("invalid sqlx cursor handle");
+        .unwrap_or_else(|| laux::lua_error(state, "invalid sqlx cursor handle".to_string()));
     if let Some(tx) = handle.0.take() {
         let _ = tx.send(CursorSignal::Close);
     }
@@ -951,14 +1121,9 @@ fn push_cursor_handle(state: LuaState, next_tx: Option<oneshot::Sender<CursorSig
     }
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> c_int {
-    laux::lua_checkstack(state, 6, std::ptr::null());
-    let result = lua_into_userdata::<DatabaseResponse>(state, 1);
-
-    match *result {
-        DatabaseResponse::PgRows(rows) => {
-            process_rows::<Postgres>(state, &rows)
-        }
+fn push_sqlx_response(state: LuaState, result: DatabaseResponse) -> c_int {
+    match result {
+        DatabaseResponse::PgRows(rows) => process_rows::<Postgres>(state, &rows),
         DatabaseResponse::MysqlRows(rows) => process_rows::<MySql>(state, &rows),
         DatabaseResponse::SqliteRows(rows) => process_rows::<Sqlite>(state, &rows),
         DatabaseResponse::PgBatch(rows, next_tx) => {
@@ -1004,21 +1169,25 @@ extern "C-unwind" fn decode(state: LuaState) -> c_int {
 extern "C-unwind" fn stats(state: LuaState) -> c_int {
     let table = LuaTable::new(state, 0, DATABASE_CONNECTIONS.len());
     DATABASE_CONNECTIONS.iter().for_each(|pair| {
-        table.insert(
-            pair.key().as_str(),
-            pair.value()
-                .counter
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
+        table.insert(pair.key().as_str(), pair.value().counter.load());
     });
     1
+}
+
+pub unsafe extern "C-unwind" fn decode_sqlx_message(
+    state: LuaState,
+    m: *mut moon_runtime::context::Message,
+) -> c_int {
+    match unsafe { crate::message_decode::take_boxed::<DatabaseResponse>(m) } {
+        Ok(response) => push_sqlx_response(state, response),
+        Err(e) => crate::lua_push_error(state, &e),
+    }
 }
 
 pub extern "C-unwind" fn luaopen_sqlx(state: LuaState) -> c_int {
     let l = [
         lreg!("connect", connect),
         lreg!("find_connection", find_connection),
-        lreg!("decode", decode),
         lreg!("stats", stats),
         lreg!("make_transaction", make_transaction),
         lreg!("json_param", make_json_param),

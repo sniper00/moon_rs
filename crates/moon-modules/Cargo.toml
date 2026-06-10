@@ -76,3 +76,6 @@ httpdate = { workspace = true, optional = true }
 # Optional: WebSocket
 tokio-tungstenite = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+
+[dev-dependencies]
+serial_test = "3.5.0"

@@ -1,21 +1,19 @@
 use moon_lua::laux::{LuaState, LuaTable};
 use moon_lua::luaL_newlib;
-use moon_lua::{laux, ffi, cstr, lreg, lreg_null};
+use moon_lua::{cstr, ffi, laux, lreg, lreg_null};
 use std::ffi::c_int;
 use std::{
     env, fs,
     path::{Path, PathBuf},
 };
 
-fn listdir(res: &LuaTable, path: &Path, idx: &mut usize, ext: Option<&str>) {
+fn listdir_push(res: &LuaTable, idx: &mut usize, path: &Path, ext: Option<&str>) {
     if let Some(strpath) = path.to_str() {
-        if let Some(ext) = ext {
-            if strpath.ends_with(ext) {
-                laux::lua_push(res.lua_state(), strpath);
-                *idx += 1;
-                res.rawseti(*idx);
-            }
-        } else {
+        let matches = match ext {
+            Some(ext) => strpath.ends_with(ext),
+            None => true,
+        };
+        if matches {
             laux::lua_push(res.lua_state(), strpath);
             *idx += 1;
             res.rawseti(*idx);
@@ -25,24 +23,48 @@ fn listdir(res: &LuaTable, path: &Path, idx: &mut usize, ext: Option<&str>) {
 
 extern "C-unwind" fn lfs_listdir(state: LuaState) -> c_int {
     let path = unsafe { laux::lua_check_str(state, 1) };
-    let ext = unsafe { laux::lua_opt_str(state, 2) };
-    
-    match fs::read_dir(path) {
-        Ok(dir) => {
-            let table = laux::LuaTable::new(state, 16, 0);
+    // Optional max recursion depth: 0 (or absent) means unlimited; 1 lists only
+    // the immediate children. An optional extension/suffix filter may be passed
+    // as the third argument.
+    let max_depth: usize = laux::lua_opt(state, 2).unwrap_or(0);
+    let ext = unsafe { laux::lua_opt_str(state, 3) };
 
-            let mut idx: usize = 0;
-            for entry in dir.flatten() {
-                if let Ok(path) = fs::canonicalize(entry.path()) {
-                    listdir(&table, &path, &mut idx, ext);
-                }
-            }
-            1
-        }
-        Err(err) => {
-            laux::lua_error(state, format!("listdir '{}' error: {}", path, err));
-        },
+    // Surface an error for an unreadable root (matches prior behavior); deeper
+    // unreadable subdirectories are skipped silently during the walk.
+    if let Err(err) = fs::read_dir(path) {
+        laux::lua_error(state, format!("listdir '{}' error: {}", path, err));
     }
+
+    let table = laux::LuaTable::new(state, 16, 0);
+    let mut idx: usize = 0;
+
+    // Iterative DFS so deep trees can't overflow the Rust stack, and only one
+    // directory handle is open at a time. Entry paths are built directly from
+    // the caller-supplied `path` (no per-entry canonicalize).
+    let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from(path), 1)];
+    while let Some((dir, depth)) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            listdir_push(&table, &mut idx, &entry_path, ext);
+            // Only recurse into *real* directories, never symlinks: a symlink
+            // such as `child -> ..` (or `child -> /`) would otherwise let the
+            // walk loop forever / escape the tree. `DirEntry::file_type` does
+            // not follow symlinks, so checking `is_symlink()` here is an
+            // explicit, refactor-proof guard against that cycle.
+            let recurse_into_dir = entry
+                .file_type()
+                .map(|t| t.is_dir() && !t.is_symlink())
+                .unwrap_or(false);
+            if recurse_into_dir && (max_depth == 0 || depth < max_depth) {
+                stack.push((entry_path, depth + 1));
+            }
+        }
+    }
+    1
 }
 
 extern "C-unwind" fn lfs_mkdir(state: LuaState) -> c_int {
@@ -52,7 +74,9 @@ extern "C-unwind" fn lfs_mkdir(state: LuaState) -> c_int {
     } else {
         laux::lua_error(state, format!("mkdir '{}' error", path));
     }
-    0
+    // Return the pushed boolean: returning 0 here would discard it, so the
+    // documented `fs.mkdir(path) -> boolean` contract would yield `nil`.
+    1
 }
 
 extern "C-unwind" fn lfs_exists(state: LuaState) -> c_int {
@@ -121,6 +145,33 @@ extern "C-unwind" fn lfs_stem(state: LuaState) -> c_int {
     1
 }
 
+/// Lexically clean a path (no filesystem access), like Go's `filepath.Clean`:
+/// drop `.` components and resolve `..` against a preceding *normal* component.
+/// A `..` that has nothing to pop is preserved for a relative path (a leading
+/// `..` can't be resolved without a base) and dropped at the root (`/.. == /`).
+fn lexical_clean(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
 extern "C-unwind" fn lfs_join(state: LuaState) -> c_int {
     let mut path = PathBuf::new();
 
@@ -130,6 +181,11 @@ extern "C-unwind" fn lfs_join(state: LuaState) -> c_int {
         let s = unsafe { laux::lua_check_str(state, i) };
         path.push(Path::new(s));
     }
+
+    // Normalize the joined result so callers can't accidentally end up with a
+    // traversal path (e.g. `join(base, "../../etc/passwd")` still containing
+    // `..`). This mirrors Go's `filepath.Join`, which cleans its output.
+    let path = lexical_clean(&path);
 
     laux::lua_push(state, path.to_string_lossy().as_ref());
 

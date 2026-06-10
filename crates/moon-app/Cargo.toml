@@ -14,4 +14,5 @@ moon-lua = { workspace = true }
 mimalloc = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
+rustls = { workspace = true }
 

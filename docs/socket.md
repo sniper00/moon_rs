@@ -13,7 +13,8 @@ Low-level async TCP socket API for custom protocol implementations.
 │  socket.write(fd, data)   — non-blocking                    │
 │  socket.listen(addr, on_accept)                             │
 │                                                             │
-│  Dispatched via PTYPE_SOCKET_TCP and PTYPE_SOCKET_EVENT     │
+│  Dispatched via PTYPE_SOCKET_TCP / PTYPE_SOCKET_EVENT       │
+│    → moon.core.decode_message(m) on actor thread              │
 └─────────────┬───────────────────────────────────────────────┘
               │ NetOp commands via mpsc
               ▼

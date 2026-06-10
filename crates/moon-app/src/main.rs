@@ -1,13 +1,13 @@
-use moon_runtime::{
-    context::{self, LuaActorParam, CONTEXT, LOGGER},
-    error::{Error, Result},
-};
+use mimalloc::MiMalloc;
 use moon_lua::{
     self, cstr, ffi,
     laux::{self, LuaState},
 };
 use moon_modules::{lua_actor, not_null_wrapper};
-use mimalloc::MiMalloc;
+use moon_runtime::{
+    context::{self, CONTEXT, LOGGER, LuaActorParam},
+    error::{Error, Result},
+};
 use std::{
     env,
     ffi::CString,
@@ -115,6 +115,10 @@ fn setup_signal() {
 }
 
 fn main() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Could not install default TLS provider");
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_time()
         .build()
@@ -160,6 +164,8 @@ async fn async_main() -> Result<()> {
         )));
     }
 
+    let bootstrap_path = path.canonicalize()?;
+
     argn += 1;
 
     let mut arg = String::new();
@@ -169,8 +175,8 @@ async fn async_main() -> Result<()> {
     }
     arg.push('}');
 
-    let contents = fs::read_to_string(&bootstrap)?;
-    if contents.starts_with("---__init__---") {
+    let contents = fs::read_to_string(&bootstrap_path)?;
+    if contents.contains("_G[\"__init__\"]") {
         //has init options
         unsafe {
             let lua = LuaState::new(ffi::luaL_newstate());
@@ -183,13 +189,13 @@ async fn async_main() -> Result<()> {
             assert_eq!(ffi::lua_gettop(lua_state.as_ptr()), 1);
 
             if ffi::LUA_OK
-                != ffi::luaL_loadfile(
+                != ffi::luaL_loadstring(
                     lua_state.as_ptr(),
-                    CString::new(bootstrap.as_str())?.as_ptr(),
+                    CString::new(contents.as_str())?.as_ptr(),
                 )
             {
                 return Err(Error::Custom(format!(
-                    "loadfile {}",
+                    "loadstring {}",
                     laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string())
                 )));
             }
@@ -247,11 +253,11 @@ async fn async_main() -> Result<()> {
         CONTEXT.set_env("PATH", package_path.as_ref());
     }
 
-    let cwd = path.parent().unwrap_or(Path::new("./"));
+    let cwd = bootstrap_path.parent().unwrap_or(Path::new("./"));
     //Change the working directory to the directory where the opened file is located.
     env::set_current_dir(cwd)?;
 
-    bootstrap = path
+    bootstrap = bootstrap_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
@@ -273,10 +279,13 @@ async fn async_main() -> Result<()> {
 
     context::run_timer();
 
+    // Build the message-decoder dispatch table once, before any actor spawns.
+    moon_modules::init_message_decoders();
+
     log::info!("system start. ({}:{})", file!(), line!());
 
     lua_actor::new_actor(LuaActorParam {
-        id: CONTEXT.next_actor_id(),
+        id: context::BOOTSTRAP_ACTOR_ADDR,
         unique: true,
         creator: 0,
         session: 0,

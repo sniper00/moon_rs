@@ -1,4 +1,5 @@
 ---@meta
+-- IDE annotation file only. Do not require this file at runtime.
 ---@class json
 local json = {}
 
@@ -6,22 +7,26 @@ local json = {}
 ---@type lightuserdata
 json.null = nil
 
---- Decode a JSON string (or file) into a Lua value.
+--- Decode a JSON string into a Lua value.
 ---
---- If `str` starts with `@`, the remainder is treated as a **file path** and
---- the JSON content is read from that file. For example:
---- ```lua
---- local cfg = json.decode("@config.json")
---- ```
+--- This only ever parses the in-memory string argument; it never reads files.
+--- To decode from a file, use `json.decode_file`.
 ---
---- **Security note**: The `@path` feature performs no path sanitization.
---- It can read any file the process has access to. Only use with trusted
---- Lua scripts; do not pass untrusted user input as the argument.
----
----@param str string JSON string, or `@<filepath>` to read from file
+---@param str string JSON string
 ---@return any value Decoded Lua value (table, string, number, boolean, or `json.null`)
 ---@return string? err Error message if decoding failed (first return is `nil`)
 function json.decode(str) end
+
+--- Read the file at `path` and decode its contents as JSON.
+---
+--- **Security note**: This performs no path sanitization and can read any file
+--- the process has access to. Only call it with a trusted, caller-controlled
+--- path — never with a path derived from untrusted/network input.
+---
+---@param path string Filesystem path to a JSON file
+---@return any value Decoded Lua value (table, string, number, boolean, or `json.null`)
+---@return string? err Error message if reading/decoding failed (first return is `nil`)
+function json.decode_file(path) end
 
 --- Encode a Lua value into a JSON string.
 ---@param value any Lua value to encode (table, string, number, boolean, or `json.null`)

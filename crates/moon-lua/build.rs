@@ -26,5 +26,11 @@ fn main() {
         .std("c11")
         .compile("lua_json_decode");
 
+    cc::Build::new()
+        .file("lualib-src/lua_sharetable.c")
+        .include("./lua55")
+        .std("c11")
+        .compile("lua_sharetable");
+
     println!("cargo:rerun-if-changed=lualib-src");
 }

@@ -3,23 +3,27 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use std::{
     collections::BTreeSet,
-    ptr,
+    ffi::c_void,
     sync::{
-        Arc,
-        atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
-use tokio::{
-    runtime::Builder,
-    sync::{Mutex, mpsc},
-    time::timeout,
-};
+use tokio::{runtime::Builder, sync::mpsc, time::timeout};
 
 use crate::escape_print;
 
 use super::{actor::LuaActor, buffer::Buffer, log::Logger};
+
+use moon_lua::ffi as lua_ffi;
+
+// Defined in `moon-modules/src/lua_coroutine.rs`. The monitor installs this
+// hook on the active lua_State when a timeout is detected.
+unsafe extern "C-unwind" {
+    pub fn moon_signal_hook(l: *mut lua_ffi::lua_State, ar: *mut lua_ffi::lua_Debug);
+}
 
 pub const PTYPE_SYSTEM: u8 = 1;
 pub const PTYPE_TEXT: u8 = 2;
@@ -48,8 +52,6 @@ const ACTOR_ID_WRAP_START: u32 = 1000;
 
 lazy_static! {
     pub static ref CONTEXT: LuaActorServer = {
-        let (timer_tx, timer_rx) = mpsc::unbounded_channel();
-
         let io_runtime = Builder::new_multi_thread()
             .worker_threads(num_cpus::get().min(4))
             .enable_time()
@@ -65,8 +67,7 @@ lazy_static! {
             unique_actors: DashMap::new(),
             clock: Instant::now(),
             env: DashMap::new(),
-            timer_tx,
-            timer_rx: Mutex::new(timer_rx),
+            timer_tx: OnceLock::new(),
             now: Utc::now(),
             time_offset: AtomicU64::new(0),
             io_runtime,
@@ -164,6 +165,11 @@ impl Message {
     pub fn ptype(&self) -> u8 {
         self.data.ptype()
     }
+
+    /// Move the message payload out, leaving `MessageBody::None(0)`.
+    pub fn take_body(&mut self) -> MessageBody {
+        std::mem::replace(&mut self.data, MessageBody::None(0))
+    }
 }
 
 impl std::fmt::Display for Message {
@@ -183,42 +189,73 @@ impl std::fmt::Display for Message {
 pub struct Watchdog {
     /// Dispatch start time in milliseconds (from CONTEXT.clock), 0 = idle.
     heartbeat_ms: AtomicU64,
-    /// Raw pointer to the Message currently being processed.
-    /// Valid only when heartbeat_ms != 0 (actor is inside handle()).
-    msg_ptr: AtomicPtr<Message>,
+    /// Diagnostic scalars copied out of the in-flight Message at `begin`, so the
+    /// monitor thread can describe a blocked actor *without ever touching the
+    /// actor's mutable Message memory* (no shared `&Message` / raw deref, hence
+    /// no data race with the actor mutating it). Only meaningful while
+    /// `heartbeat_ms != 0`.
+    ptype: AtomicU8,
+    from: AtomicU32,
+    to: AtomicU32,
+    session: AtomicI64,
+    /// The currently executing lua_State pointer. Updated by the actor thread
+    /// in handle_message (set to callback_state) and switchL (set to the
+    /// coroutine being entered). The monitor reads this to install lua_sethook.
+    pub active_l: AtomicPtr<c_void>,
+    /// Interrupt protocol (3-state):
+    ///   0 = idle
+    ///   1 = monitor has set trap, sethook pending
+    ///  -1 = monitor has completed sethook
+    /// Actor thread's switchL re-installs hook when trap != 0.
+    /// signal_hook resets to 0 after raising the Lua error.
+    pub trap: AtomicI32,
+    /// Number of consecutive timeout detections. Interrupt only fires after 3.
+    pub timeout_count: AtomicU32,
 }
-
-unsafe impl Send for Watchdog {}
-unsafe impl Sync for Watchdog {}
 
 impl Watchdog {
     pub fn new() -> Self {
         Watchdog {
             heartbeat_ms: AtomicU64::new(0),
-            msg_ptr: AtomicPtr::new(ptr::null_mut()),
+            ptype: AtomicU8::new(0),
+            from: AtomicU32::new(0),
+            to: AtomicU32::new(0),
+            session: AtomicI64::new(0),
+            active_l: AtomicPtr::new(std::ptr::null_mut()),
+            trap: AtomicI32::new(0),
+            timeout_count: AtomicU32::new(0),
         }
     }
 
     /// Ordering contract (paired with `check_watchdogs`):
     ///
-    /// `begin`: store msg_ptr BEFORE heartbeat_ms.
-    /// `end`:   store heartbeat_ms=0 BEFORE clearing msg_ptr.
+    /// `begin`: store the diagnostic scalars BEFORE heartbeat_ms.
+    /// `end`:   store heartbeat_ms = 0.
     ///
     /// The monitor reads heartbeat_ms first (Acquire). If it sees a non-zero
     /// value written by `begin`, the Release/Acquire pair guarantees the
-    /// preceding msg_ptr store is also visible, so the pointer is valid.
-    /// If it sees 0 (written by `end`), it skips the entry entirely --
-    /// msg_ptr may still be non-null momentarily, but is never read.
+    /// preceding scalar stores are visible, so they describe this dispatch.
+    /// If it sees 0 (written by `end`), it skips the entry and reads nothing.
+    /// All published state is plain scalars, so even a benign race with the
+    /// next `begin` only yields valid (if slightly newer) values — never UB.
     #[inline]
-    pub fn begin(&self, clock_ms: u64, m: *const Message) {
-        self.msg_ptr.store(m as *mut Message, Ordering::Release);
+    pub fn begin(&self, clock_ms: u64, ptype: u8, from: ActorId, to: ActorId, session: i64) {
+        self.ptype.store(ptype, Ordering::Relaxed);
+        self.from.store(from, Ordering::Relaxed);
+        self.to.store(to, Ordering::Relaxed);
+        self.session.store(session, Ordering::Relaxed);
+        self.timeout_count.store(0, Ordering::Relaxed);
         self.heartbeat_ms.store(clock_ms, Ordering::Release);
     }
 
     #[inline]
     pub fn end(&self) {
         self.heartbeat_ms.store(0, Ordering::Release);
-        self.msg_ptr.store(ptr::null_mut(), Ordering::Release);
+    }
+
+    #[inline]
+    pub fn set_active_l(&self, l: *mut c_void) {
+        self.active_l.store(l, Ordering::Release);
     }
 }
 
@@ -241,8 +278,11 @@ pub struct LuaActorServer {
     unique_actors: DashMap<String, ActorId>,
     clock: Instant,
     env: DashMap<String, Arc<String>>,
-    timer_tx: mpsc::UnboundedSender<Timer>,
-    timer_rx: Mutex<mpsc::UnboundedReceiver<Timer>>,
+    /// The timer channel is created in `run_timer`, which keeps the receiver in
+    /// its task and publishes the sender here. Only the sender lives in the
+    /// global, and `send` needs just `&self`, so `OnceLock` fits exactly. The
+    /// receiver is never stored globally (no `Mutex`/`&mut` juggling needed).
+    timer_tx: OnceLock<mpsc::UnboundedSender<Timer>>,
     now: DateTime<Utc>,
     time_offset: AtomicU64,
     io_runtime: tokio::runtime::Runtime,
@@ -274,13 +314,13 @@ impl LuaActorServer {
         Ok(watchdog)
     }
 
+    /// Register a non-Lua "actor" (e.g. the cluster endpoint) for message
+    /// routing. Intentionally does NOT bump `actor_counter`: pseudo-actors must
+    /// not keep `stopped()` from becoming true, and they are never torn down via
+    /// `remove_actor` (whose counter decrement is guarded on real registration).
     pub fn register_pseudo_actor(&self, id: ActorId, tx: mpsc::UnboundedSender<Message>) {
         let watchdog = Arc::new(Watchdog::new());
         self.actors.insert(id, ActorEntry { tx, watchdog });
-    }
-
-    pub fn remove(&self, id: ActorId) -> Option<mpsc::UnboundedSender<Message>> {
-        self.actors.remove(&id).map(|(_, entry)| entry.tx)
     }
 
     pub fn query(&self, name: &str) -> Option<dashmap::mapref::one::Ref<'_, String, ActorId>> {
@@ -288,7 +328,21 @@ impl LuaActorServer {
     }
 
     pub fn remove_actor(&self, id: ActorId, name: &str) {
-        self.actors.remove(&id);
+        // Only run registry-dependent cleanup when this actor was actually
+        // registered. `add_actor` can fail *before* registering (e.g. a duplicate
+        // unique name) yet the spawned task still calls `remove_actor` on exit. In
+        // that case nothing was inserted and `actor_counter` was never bumped, so
+        // we must NOT decrement the counter (it would underflow `AtomicU32` and
+        // make `stopped()` never true, hanging shutdown) nor evict the *existing*
+        // owner of `name` from `unique_actors`.
+        if self.actors.remove(&id).is_none() {
+            // A failed bootstrap must still bring the process down.
+            if id == BOOTSTRAP_ACTOR_ADDR {
+                self.shutdown(-1);
+            }
+            return;
+        }
+
         if !name.is_empty() {
             self.unique_actors.remove(name);
         }
@@ -298,7 +352,9 @@ impl LuaActorServer {
             self.shutdown(-1);
         }
 
-        //notify actor exit to unique actors
+        // Notify unique actors that this actor exited. This matches Moon's
+        // `broadcast`: PTYPE_SYSTEM messages are delivered only to unique
+        // services, whose Lua `_service_exit` handler releases watched calls.
         self.unique_actors.iter().for_each(|v| {
             let _ = self.send(Message {
                 from: id,
@@ -311,6 +367,22 @@ impl LuaActorServer {
                             .into_bytes()
                             .into(),
                     ),
+                ),
+            });
+        });
+    }
+
+    /// Broadcast a PTYPE_SYSTEM message to all unique actors (same scope as
+    /// `_service_exit`). Used by subsystems like cluster to deliver events.
+    pub fn broadcast_system(&self, sender: ActorId, payload: &str) {
+        self.unique_actors.iter().for_each(|v| {
+            let _ = self.send(Message {
+                from: sender,
+                to: *v.value(),
+                session: 0,
+                data: MessageBody::Buffer(
+                    PTYPE_SYSTEM,
+                    Box::new(payload.to_string().into_bytes().into()),
                 ),
             });
         });
@@ -334,9 +406,11 @@ impl LuaActorServer {
     }
 
     pub fn shutdown(&self, exit_code: i32) {
+        // Publish `exit_code` exactly once: the CAS success ordering is AcqRel
+        // so the value is visible to other threads that observe the transition.
         if self
             .exit_code
-            .compare_exchange(i32::MAX, exit_code, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(i32::MAX, exit_code, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
             return;
@@ -348,7 +422,6 @@ impl LuaActorServer {
             file!(),
             line!()
         );
-        self.exit_code.store(exit_code, Ordering::Release);
         self.actors.iter().for_each(|v| {
             let _ = v.value().tx.send(Message {
                 from: 0,
@@ -414,14 +487,16 @@ impl LuaActorServer {
     }
 
     pub fn now_clock(&self) -> Duration {
-        self.clock.elapsed() + Duration::from_millis(self.time_offset.load(Ordering::Acquire))
+        self.clock.elapsed()
     }
 
     pub fn now(&self) -> DateTime<Utc> {
-        self.now + self.now_clock()
+        self.now + self.now_clock() + Duration::from_millis(self.time_offset.load(Ordering::Acquire))
     }
 
-    pub fn set_time_offset(&self, offset: u64) {
+    /// Advance the simulated clock by `offset` milliseconds. The offset is
+    /// cumulative (each call adds to the running total), hence `add_*`.
+    pub fn add_time_offset(&self, offset: u64) {
         self.time_offset.fetch_add(offset, Ordering::Release);
     }
 
@@ -450,14 +525,15 @@ impl LuaActorServer {
             let hb = wd.heartbeat_ms.load(Ordering::Acquire);
             if hb > 0 && now_ms.saturating_sub(hb) >= 10_000 {
                 let elapsed_s = (now_ms - hb) / 1000;
-                let msg_info = unsafe {
-                    let p = wd.msg_ptr.load(Ordering::Acquire);
-                    if !p.is_null() {
-                        format!("{}", &*p)
-                    } else {
-                        "unknown".to_string()
-                    }
-                };
+                // Read only the published scalars (paired Acquire above via `hb`);
+                // never touch the actor's live Message.
+                let msg_info = format!(
+                    "Message {{ ptype: {}, from: 0x{:08x}, to: 0x{:08x}, session: {} }}",
+                    wd.ptype.load(Ordering::Relaxed),
+                    wd.from.load(Ordering::Relaxed),
+                    wd.to.load(Ordering::Relaxed),
+                    wd.session.load(Ordering::Relaxed),
+                );
                 let s = format!(
                     "slow_message,Actor 0x{:08X} blocked for {}s, msg: {}",
                     id, elapsed_s, msg_info
@@ -470,6 +546,31 @@ impl LuaActorServer {
                     data: MessageBody::Buffer(PTYPE_SYSTEM, Box::new(s.into())),
                 });
                 wd.heartbeat_ms.store(now_ms, Ordering::Release);
+
+                // Only interrupt after 3 consecutive timeout detections (~30s).
+                let count = wd.timeout_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= 3 {
+                    // Interrupt: CAS(0→1), install hook on active_l, CAS(1→-1).
+                    // If trap is already non-zero a previous interrupt is in flight.
+                    if wd
+                        .trap
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let active = wd.active_l.load(Ordering::Acquire);
+                        if !active.is_null() {
+                            unsafe {
+                                lua_ffi::lua_sethook(
+                                    active as *mut lua_ffi::lua_State,
+                                    Some(moon_signal_hook),
+                                    lua_ffi::LUA_MASKCOUNT,
+                                    1,
+                                );
+                            }
+                        }
+                        wd.trap.store(-1, Ordering::Release);
+                    }
+                }
             }
         });
     }
@@ -510,7 +611,11 @@ struct Timer {
 
 pub fn insert_timer(owner: ActorId, timer_id: i64, interval: u64) {
     let expiry_clock = CONTEXT.now_clock() + Duration::from_millis(interval);
-    let _ = CONTEXT.timer_tx.send(Timer {
+    let Some(timer_tx) = CONTEXT.timer_tx.get() else {
+        log::error!("insert_timer called before run_timer started");
+        return;
+    };
+    let _ = timer_tx.send(Timer {
         timer_id,
         expiry_clock: expiry_clock.as_millis() as i64,
         owner,
@@ -518,11 +623,26 @@ pub fn insert_timer(owner: ActorId, timer_id: i64, interval: u64) {
 }
 
 pub fn run_timer() {
+    // Create the channel here so the receiver can be moved straight into the
+    // single timer task. Only the sender is published globally; this must be
+    // called exactly once and before any `insert_timer`.
+    let (timer_tx, mut rc) = mpsc::unbounded_channel();
+    CONTEXT
+        .timer_tx
+        .set(timer_tx)
+        .unwrap_or_else(|_| panic!("run_timer called more than once"));
     tokio::spawn(async move {
         let mut btree_map = BTreeSet::new();
-        let mut rc = CONTEXT.timer_rx.lock().await;
         let mut wait_time = 1000;
         loop {
+            // Terminate cooperatively once shutdown has been requested. The
+            // global `timer_tx` sender lives in `CONTEXT` and never drops, so
+            // `rc.recv()` alone would never return `None` and this task would
+            // otherwise keep the IO runtime alive forever. The ≤1s `wait_time`
+            // bounds how long after shutdown we take to notice.
+            if CONTEXT.exit_code() != i32::MAX {
+                break;
+            }
             match timeout(Duration::from_millis(wait_time), rc.recv()).await {
                 Ok(Some(timer)) => {
                     //println!("insert timer: {:?} {:?}", timer, CONTEXT.now_clock());
@@ -566,4 +686,78 @@ pub struct LuaActorParam {
     pub source: String,
     pub params: String,
     pub block: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor_param(id: ActorId, name: &str, unique: bool) -> LuaActorParam {
+        LuaActorParam {
+            id,
+            unique,
+            creator: 0,
+            session: 0,
+            memlimit: 0,
+            name: name.to_string(),
+            source: String::new(),
+            params: String::new(),
+            block: false,
+        }
+    }
+
+    #[test]
+    fn remove_actor_sends_service_exit_only_to_unique_actors() {
+        let target_id = 0x7100_0001;
+        let unique_watcher_id = 0x7100_0002;
+        let normal_watcher_id = 0x7100_0003;
+
+        let (target_tx, _target_rx) = mpsc::unbounded_channel();
+        let (unique_watcher_tx, mut unique_watcher_rx) = mpsc::unbounded_channel();
+        let (normal_watcher_tx, mut normal_watcher_rx) = mpsc::unbounded_channel();
+
+        let mut target = LuaActor::new(&actor_param(target_id, "exit-target", false));
+        let mut unique_watcher =
+            LuaActor::new(&actor_param(unique_watcher_id, "exit-unique-watcher", true));
+        let mut normal_watcher = LuaActor::new(&actor_param(
+            normal_watcher_id,
+            "exit-normal-watcher",
+            false,
+        ));
+
+        CONTEXT.add_actor(&mut target, target_tx).unwrap();
+        CONTEXT
+            .add_actor(&mut unique_watcher, unique_watcher_tx)
+            .unwrap();
+        CONTEXT
+            .add_actor(&mut normal_watcher, normal_watcher_tx)
+            .unwrap();
+
+        CONTEXT.remove_actor(target_id, &target.name);
+
+        let msg = unique_watcher_rx
+            .try_recv()
+            .expect("unique watcher should receive service-exit notice");
+        assert_eq!(msg.from, target_id);
+        assert_eq!(msg.to, unique_watcher_id);
+        assert_eq!(msg.session, 0);
+        assert_eq!(msg.ptype(), PTYPE_SYSTEM);
+
+        match msg.data {
+            MessageBody::Buffer(_, data) => {
+                let text = std::str::from_utf8(data.as_slice()).unwrap();
+                assert!(text.starts_with("_service_exit,"));
+                assert!(text.contains(&format!("Actor id:{} quited", target_id)));
+            }
+            other => panic!("unexpected service-exit payload: {}", other),
+        }
+
+        assert!(
+            normal_watcher_rx.try_recv().is_err(),
+            "non-unique watcher should match Moon and skip PTYPE_SYSTEM broadcast"
+        );
+
+        CONTEXT.remove_actor(unique_watcher_id, &unique_watcher.name);
+        CONTEXT.remove_actor(normal_watcher_id, &normal_watcher.name);
+    }
 }

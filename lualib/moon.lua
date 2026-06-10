@@ -311,9 +311,8 @@ end
 --- @async
 --- @param session? integer @ An optional session ID used to map the coroutine for wakeup.
 --- @param receiver? integer @ An optional receiver's service ID.
---- @param is_raw? boolean @ Whether to return raw message data instead of unpacked data.
---- @return any ... @ Returns the unpacked message if the coroutine is resumed by a message. If the coroutine is resumed by `moon.wakeup`, it returns the additional parameters passed by `moon.wakeup`. If the coroutine is broken, it returns `false` and "BREAK".
-function moon.wait(session, receiver, is_raw)
+--- @return any ... @ Decoded message values from `core.decode_message`, or wakeup/break returns.
+function moon.wait(session, receiver)
     if session then
         session_id_coroutine[session] = co_running()
         if receiver then
@@ -325,34 +324,19 @@ function moon.wait(session, receiver, is_raw)
         end
     end
 
-    -- co_yield() suspends this coroutine until resumed by the dispatcher.
-    -- When resumed by a message: a = data_ptr, b = data_len, c = protocol_type (PTYPE_*)
-    -- When resumed by wakeup/break: a = false, b = "BREAK" or nil, c = extra args table or nil
-    local a, b, c = co_yield()
-    if a then
-        -- Received a message response.
-        -- If is_raw mode, return raw (ptr, len) directly — except for errors which
-        -- must always be decoded so callers get the standard (false, err_msg) return.
-        -- For non-raw mode (and errors), delegate to protocol[c].unpack:
-        --   normal type  → unpacks into typed return values
-        --   PTYPE_ERROR  → returns (false, error_string)
-        if is_raw and c ~= moon.PTYPE_ERROR then
-            return a, b
-        end
-        return protocol[c].unpack(a, b)
+    local m, reason, extras = co_yield()
+    if m then
+        return core.decode_message(m)
     else
-        -- Resumed without a message (wakeup or break).
         if session then
             ---@diagnostic disable-next-line: assign-type-mismatch
             session_id_coroutine[session] = false
         end
 
-        if c then
-            -- c is a table of extra args passed by moon.wakeup(co, ...)
-            return table.unpack(c)
+        if extras then
+            return table.unpack(extras)
         else
-            -- a=false, b="BREAK" (coroutine was broken)
-            return a, b
+            return m, reason
         end
     end
 end
@@ -408,7 +392,7 @@ function moon.call(PTYPE, receiver, ...)
         error("moon call receiver == 0")
     end
 
-    return moon.wait(_send(p.PTYPE, receiver, p.pack(...)))
+    return moon.wait(_send(p.PTYPE, receiver, p.pack(...)), receiver)
 end
 
 --- Responds to a request from `moon.call`.
@@ -433,7 +417,7 @@ end
 ------------------------------------
 ---@param m message_ptr
 ---@param PTYPE string
-local function _dispatch(PTYPE, sender, session, sz, len, m)
+local function _dispatch(PTYPE, sender, session, m)
     local p = protocol[PTYPE]
     if not p then
         error(string.format("handle unknown PTYPE: %s. sender %u", PTYPE, sender))
@@ -443,9 +427,7 @@ local function _dispatch(PTYPE, sender, session, sz, len, m)
         local co = session_id_coroutine[session]
         session_id_coroutine[session] = nil
         if co then
-            --print(coroutine.status(co))
-            coresume(co, sz, len, PTYPE)
-            --print(coroutine.status(co))
+            coresume(co, m)
             return
         end
         if co ~= false then
@@ -458,14 +440,15 @@ local function _dispatch(PTYPE, sender, session, sz, len, m)
             return
         end
 
-        if not p.israw then
-            local co = tremove(co_pool) or co_create(routine)
-            if not p.unpack then
-                error(string.format("PTYPE %s has no unpack function.", p.PTYPE))
-            end
-            coresume(co, dispatch, sender, session, p.unpack(sz, len))
-        else
+        if p.israw then
             dispatch(m)
+        else
+            local co = tremove(co_pool) or co_create(routine)
+            if p.unpack then
+                coresume(co, dispatch, sender, session, p.unpack(_decode(m, "C")))
+            else
+                coresume(co, dispatch, sender, session, core.decode_message(m))
+            end
         end
     end
 end
@@ -486,7 +469,7 @@ end
 local reg_protocol = moon.register_protocol
 
 --- Sets the message handler for the specified protocol type.
---- @param PTYPE PTYPE @ The protocol type.
+--- @param PTYPE PTYPE|string @ The protocol type.
 --- @param fn fun(sender: integer, session: integer, ...: any) @ The message handler function.
 function moon.dispatch(PTYPE, fn)
     local p = protocol[PTYPE]
@@ -510,7 +493,6 @@ reg_protocol {
     name = "lua",
     PTYPE = moon.PTYPE_LUA,
     pack = moon.pack,
-    unpack = moon.unpack,
     dispatch = function()
         error("PTYPE_LUA dispatch not implemented")
     end
@@ -522,7 +504,6 @@ reg_protocol {
     pack = function(...)
         return ...
     end,
-    unpack = moon.tostring,
     dispatch = function()
         error("PTYPE_TEXT dispatch not implemented")
     end
@@ -534,9 +515,6 @@ reg_protocol {
     pack = function(...)
         return ...
     end,
-    unpack = function(val)
-        return val
-    end,
     dispatch = function()
         error("PTYPE_INTEGER dispatch not implemented")
     end
@@ -547,10 +525,6 @@ reg_protocol {
     PTYPE = moon.PTYPE_ERROR,
     pack = function(...)
         return ...
-    end,
-    unpack = function(sz, len)
-        ---@diagnostic disable-next-line: param-type-mismatch
-        return false, moon.tostring(sz, len) or "unknown error"
     end,
     dispatch = function(_, _, ...)
         moon.error(...)
@@ -636,7 +610,6 @@ end
 reg_protocol {
     name = "timer",
     PTYPE = moon.PTYPE_TIMER,
-    unpack = function(sz, len) return sz end,
     dispatch = function(sender, session, timerid)
         local v = timer_routine[timerid]
         timer_routine[timerid] = nil
@@ -721,7 +694,6 @@ reg_protocol {
     name = "debug",
     PTYPE = moon.PTYPE_DEBUG,
     pack = moon.pack,
-    unpack = moon.unpack,
     dispatch = function(sender, session, cmd, ...)
         local func = debug_command[cmd]
         if func then

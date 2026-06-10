@@ -12,7 +12,7 @@ Async HTTP client built on `reqwest` with connection pooling and proxy support.
 │    → core.request(opts) returns session                     │
 │    → moon.wait(session) — coroutine yields                  │
 │                                                             │
-│  PTYPE_HTTPC message arrives → core.decode(raw)             │
+│  PTYPE_HTTPC message arrives → moon.core.decode_message(m)  │
 │    → parse status, headers, body into Lua table             │
 │    → coroutine resumes with HttpResponse                    │
 └─────────────┬───────────────────────────────────────────────┘
@@ -116,9 +116,7 @@ local session = core.request({
     proxy = "",
 })
 local response = moon.wait(session)
-
--- Decode raw response (used by protocol handler)
-local decoded = core.decode(raw_response)
+-- response is already decoded: { version, status_code, headers, body }
 
 -- URL encoding utilities
 local encoded = core.form_urlencode({ key = "hello world" })

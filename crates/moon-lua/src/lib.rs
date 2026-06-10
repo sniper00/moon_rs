@@ -10,16 +10,9 @@ use std::os::raw::c_int;
 #[cfg(any(feature = "lua55", doc))]
 pub use lua55::*;
 
-#[cfg(any(feature = "luau", doc))]
-pub use luau::*;
-
 #[cfg(feature = "lua55")]
 #[doc(hidden)]
 pub const LUA_MAX_UPVALUES: c_int = 255;
-
-#[cfg(feature = "luau")]
-#[doc(hidden)]
-pub const LUA_MAX_UPVALUES: c_int = 200;
 
 // I believe `luaL_traceback` < 5.4 requires this much free stack to not error.
 // 5.4 uses `luaL_Buffer`
@@ -70,9 +63,5 @@ mod macros;
 pub mod lua55;
 
 pub use lua55 as ffi;
-
-#[cfg(any(feature = "luau", doc))]
-#[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
-pub mod luau;
 
 pub mod laux;

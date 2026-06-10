@@ -155,32 +155,44 @@ fn write_table_metapairs(table: LuaTable, buf: &mut Vec<u8>, depth: i32) -> Resu
     let n = combine_type!(TYPE_TABLE, 0);
     buf.push(n);
 
+    let state = table.lua_state();
     unsafe {
-        ffi::lua_pushvalue(table.lua_state().as_ptr(), table.index());
-        if ffi::lua_pcall(table.lua_state().as_ptr(), 1, 3, 0) != ffi::LUA_OK {
-            return Ok(1);
+        ffi::lua_pushvalue(state.as_ptr(), table.index());
+        if ffi::lua_pcall(state.as_ptr(), 1, 3, 0) != ffi::LUA_OK {
+            return Err(take_pcall_error(state, "__pairs"));
         }
         loop {
-            ffi::lua_pushvalue(table.lua_state().as_ptr(), -2);
-            ffi::lua_pushvalue(table.lua_state().as_ptr(), -2);
-            ffi::lua_copy(table.lua_state().as_ptr(), -5, -3);
-            if ffi::lua_pcall(table.lua_state().as_ptr(), 2, 2, 0) != ffi::LUA_OK {
-                return Ok(1);
+            ffi::lua_pushvalue(state.as_ptr(), -2);
+            ffi::lua_pushvalue(state.as_ptr(), -2);
+            ffi::lua_copy(state.as_ptr(), -5, -3);
+            if ffi::lua_pcall(state.as_ptr(), 2, 2, 0) != ffi::LUA_OK {
+                return Err(take_pcall_error(state, "__pairs iterator"));
             }
 
-            if laux::lua_type(table.lua_state(), -2) == LuaType::Nil {
-                laux::lua_pop(table.lua_state(), 4);
+            if laux::lua_type(state, -2) == LuaType::Nil {
+                laux::lua_pop(state, 4);
                 break;
             }
-            pack_one(LuaValue::from_stack(table.lua_state(), -2), buf, depth)?;
-            pack_one(LuaValue::from_stack(table.lua_state(), -1), buf, depth)?;
-            laux::lua_pop(table.lua_state(), 1);
+            pack_one(LuaValue::from_stack(state, -2), buf, depth)?;
+            pack_one(LuaValue::from_stack(state, -1), buf, depth)?;
+            laux::lua_pop(state, 1);
         }
     }
 
     write_nil(buf);
 
     Ok(0)
+}
+
+/// Pop and format the error object left on top of the stack by a failed
+/// `lua_pcall`, so the failure can be surfaced as an encoder `Err` instead of
+/// being silently swallowed.
+fn take_pcall_error(state: LuaState, what: &str) -> String {
+    let msg = unsafe { laux::lua_opt_str(state, -1) }
+        .unwrap_or("unknown error")
+        .to_string();
+    laux::lua_pop(state, 1);
+    format!("serialize {} error: {}", what, msg)
 }
 
 fn write_table(table: LuaTable, buf: &mut Vec<u8>, depth: i32) -> Result<i32, String> {
@@ -242,7 +254,7 @@ fn invalid_stream_line(state: LuaState, rb: &mut ReadBlock, line: i32) {
     let len = rb.len();
     laux::lua_error(
         state,
-        format!("Invalid serialize stream {} (line:{})", len, line)
+        format!("Invalid serialize stream {} (line:{})", len, line),
     );
 }
 
@@ -530,7 +542,16 @@ extern "C-unwind" fn unpack(state: LuaState) -> c_int {
             data = ffi::lua_tolstring(state.as_ptr(), 1, &mut len) as *const u8;
         } else {
             data = ffi::lua_touserdata(state.as_ptr(), 1) as *const u8;
-            len = ffi::luaL_checkinteger(state.as_ptr(), 2) as usize;
+            // The pointer/length pair is a trusted contract with the C dispatch
+            // layer (the runtime hands the protocol unpacker the real message
+            // length). The one value we can still sanity-check cheaply is the
+            // sign: a negative integer would wrap to a huge `usize` and turn the
+            // `from_raw_parts` below into a wild out-of-bounds read.
+            let raw_len = ffi::luaL_checkinteger(state.as_ptr(), 2);
+            if raw_len < 0 {
+                ffi::luaL_error(state.as_ptr(), cstr!("deserialize negative length"));
+            }
+            len = raw_len as usize;
         }
 
         if len == 0 {
@@ -541,31 +562,57 @@ extern "C-unwind" fn unpack(state: LuaState) -> c_int {
             ffi::luaL_error(state.as_ptr(), cstr!("deserialize null pointer"));
         }
 
-        laux::lua_settop(state, 1);
-
-        let br = &mut ReadBlock {
-            buf: std::slice::from_raw_parts(data, len),
-            pos: 0,
-            state,
-        };
-
-        let mut i = 0;
-        loop {
-            if i % 8 == 7 {
-                laux::lua_checkstack(state, 8, std::ptr::null());
-            }
-            i += 1;
-
-            if let Some(type_) = br.try_read_byte() {
-                let cookie = type_ >> 3;
-                push_value(state, br, type_ & 0x7, cookie, 0);
-            } else {
-                break;
-            }
-        }
-
-        laux::lua_top(state) - 1
+        decode_bytes(state, std::slice::from_raw_parts(data, len))
     }
+}
+
+/// Decode a serialized Lua payload from a runtime message (`PTYPE_LUA` / `PTYPE_DEBUG`).
+///
+/// The buffer is *borrowed* from the message, never taken: `decode_bytes` can
+/// `longjmp` (via `lua_error`/`luaL_checkstack`) on a malformed or over-deep
+/// stream, which would skip the `Drop` of any owned `Box<Buffer>` held here and
+/// leak it. Leaving the buffer inside the `Message` means the actor frame that
+/// owns the `Message` (and is *not* unwound by the longjmp back to the enclosing
+/// `pcall`) frees it normally on both the success and error paths.
+pub unsafe extern "C-unwind" fn decode_buffer_message(
+    state: LuaState,
+    m: *mut moon_runtime::context::Message,
+) -> c_int {
+    match unsafe { crate::message_decode::borrow_buffer(m) } {
+        Ok(buf) => unsafe { decode_bytes(state, buf.as_slice()) },
+        Err(e) => crate::lua_push_error(state, &e),
+    }
+}
+
+unsafe fn decode_bytes(state: LuaState, data: &[u8]) -> c_int {
+    if data.is_empty() {
+        return 0;
+    }
+
+    laux::lua_settop(state, 0);
+
+    let br = &mut ReadBlock {
+        buf: data,
+        pos: 0,
+        state,
+    };
+
+    let mut i = 0;
+    loop {
+        if i % 8 == 7 {
+            laux::lua_checkstack(state, 8, std::ptr::null());
+        }
+        i += 1;
+
+        if let Some(type_) = br.try_read_byte() {
+            let cookie = type_ >> 3;
+            push_value(state, br, type_ & 0x7, cookie, 0);
+        } else {
+            break;
+        }
+    }
+
+    laux::lua_top(state) as c_int
 }
 
 extern "C-unwind" fn peek_one(state: LuaState) -> c_int {

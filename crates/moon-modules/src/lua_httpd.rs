@@ -30,13 +30,13 @@ use moon_lua::{
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
 
+use crate::LIMITS;
 use crate::next_net_fd;
 
-const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
-const DEFAULT_MAX_CONNECTIONS: usize = 10000;
-const STREAM_THRESHOLD: u64 = 1024 * 1024; // files > 1 MB are streamed
-const CACHE_TTL: Duration = Duration::from_secs(5);
-const MAX_CACHE_ENTRIES: usize = 10000;
+const DEFAULT_MAX_BODY_SIZE: usize = LIMITS.http_body_bytes;
+const STREAM_THRESHOLD: u64 = LIMITS.http_static_stream_threshold_bytes;
+const CACHE_TTL: Duration = Duration::from_secs(LIMITS.http_static_cache_ttl_secs);
+const MAX_CACHE_ENTRIES: usize = LIMITS.http_static_cache_entries;
 
 type HttpBody = BoxBody<Bytes, std::io::Error>;
 
@@ -109,6 +109,11 @@ fn etag_matches(header_value: &str, etag: &str) -> bool {
 /// Parse a single-range `Range: bytes=start-end` header.
 /// Returns `(start, end_inclusive)` or `None` for invalid/unsupported ranges.
 fn parse_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
+    // No byte range is satisfiable on an empty file, and the `file_size - 1`
+    // computations below would underflow when `file_size == 0`. Bail out early.
+    if file_size == 0 {
+        return None;
+    }
     let s = header.strip_prefix("bytes=")?;
     let s = s.split(',').next()?.trim();
     let (start_s, end_s) = s.split_once('-')?;
@@ -172,6 +177,13 @@ async fn resolve_file_meta(root: &Path, file_path: &Path) -> Option<CachedFileMe
         file_path.to_path_buf()
     };
 
+    // `canonicalize` resolves all symlinks, so `starts_with(root)` rejects any
+    // path (including `..` and symlinked) that escapes the served root. NOTE:
+    // a TOCTOU window remains — the file is later re-opened by this canonical
+    // path, so an attacker who can swap the path for an out-of-root symlink
+    // *after* this check could escape. That requires write access to the served
+    // directory tree, at which point content is already attacker-controlled;
+    // closing it fully needs openat/O_NOFOLLOW (not portably exposed here).
     let canonical = tokio::fs::canonicalize(&resolved).await.ok()?;
     if !canonical.starts_with(root) {
         return None;
@@ -183,10 +195,7 @@ async fn resolve_file_meta(root: &Path, file_path: &Path) -> Option<CachedFileMe
     }
 
     let file_size = metadata.len();
-    let ext = canonical
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
     let content_type = mime_from_ext(ext);
     let etag = generate_etag(&metadata);
     let mtime_secs = metadata
@@ -283,6 +292,7 @@ async fn serve_static_file(
     root: &Path,
     req_path: &str,
     req_headers: &HeaderMap,
+    is_head: bool,
 ) -> Option<Response<HttpBody>> {
     let decoded = percent_decode(req_path.trim_start_matches('/'));
     if decoded.contains("..") {
@@ -318,8 +328,7 @@ async fn serve_static_file(
                     .unwrap_or_default()
                     .as_secs();
                 if meta.mtime_secs <= ims_secs {
-                    let mut b =
-                        Response::builder().status(304).header("etag", &meta.etag);
+                    let mut b = Response::builder().status(304).header("etag", &meta.etag);
                     if let Some(ref lm) = meta.last_modified {
                         b = b.header("last-modified", lm.as_str());
                     }
@@ -353,9 +362,7 @@ async fn serve_static_file(
             if let Some(ref lm) = meta.last_modified {
                 b = b.header("last-modified", lm.as_str());
             }
-            return Some(
-                b.body(BodyExt::boxed(StreamBody::new(mapped))).unwrap(),
-            );
+            return Some(b.body(BodyExt::boxed(StreamBody::new(mapped))).unwrap());
         } else {
             return Some(
                 Response::builder()
@@ -376,6 +383,13 @@ async fn serve_static_file(
         .header("etag", &meta.etag);
     if let Some(ref lm) = meta.last_modified {
         b = b.header("last-modified", lm.as_str());
+    }
+
+    if is_head {
+        // HEAD: keep the (already-set) Content-Length but never read/stream the
+        // body. The dispatcher also strips bodies defensively, but skipping the
+        // read here avoids loading small files into memory for nothing.
+        return Some(b.body(full_body(Bytes::new())).unwrap());
     }
 
     if meta.file_size <= STREAM_THRESHOLD {
@@ -450,7 +464,14 @@ async fn handle_request(
 
     if let Some(ref root) = static_dir {
         if method == "GET" || method == "HEAD" {
-            if let Some(resp) = serve_static_file(root, &path, req.headers()).await {
+            let is_head = method == "HEAD";
+            if let Some(resp) = serve_static_file(root, &path, req.headers(), is_head).await {
+                if is_head {
+                    // RFC 9110: a HEAD response must carry the same headers as the
+                    // equivalent GET but no body. Drop the body, keep the headers.
+                    let (parts, _body) = resp.into_parts();
+                    return Ok(Response::from_parts(parts, full_body(Bytes::new())));
+                }
                 return Ok(resp);
             }
         }
@@ -513,18 +534,24 @@ extern "C-unwind" fn listen(state: LuaState) -> c_int {
         DEFAULT_MAX_BODY_SIZE
     };
     let max_connections: usize = if has_opts {
-        laux::opt_field(state, 2, "max_connections").unwrap_or(DEFAULT_MAX_CONNECTIONS)
+        laux::opt_field(state, 2, "max_connections").unwrap_or(LIMITS.listener_connections)
     } else {
-        DEFAULT_MAX_CONNECTIONS
+        LIMITS.listener_connections
     };
     let static_dir: Option<Arc<PathBuf>> = if has_opts {
-        laux::opt_field::<String>(state, 2, "static_dir").map(|s| {
-            let p = PathBuf::from(&s);
-            let canonical = p.canonicalize().unwrap_or_else(|e| {
-                laux::lua_error(state, format!("httpd static_dir '{}' invalid: {}", s, e));
-            });
-            Arc::new(canonical)
-        })
+        match laux::opt_field::<String>(state, 2, "static_dir") {
+            Some(s) => match PathBuf::from(&s).canonicalize() {
+                Ok(canonical) => Some(Arc::new(canonical)),
+                Err(e) => {
+                    // Drop the owned path string before the longjmp (`lua_error`
+                    // never returns, so its `Drop` would otherwise be skipped).
+                    let msg = format!("httpd static_dir '{}' invalid: {}", s, e);
+                    drop(s);
+                    laux::lua_error(state, msg);
+                }
+            },
+            None => None,
+        }
     } else {
         None
     };
@@ -543,7 +570,11 @@ extern "C-unwind" fn listen(state: LuaState) -> c_int {
         }
     };
     if let Err(e) = listener.set_nonblocking(true) {
-        laux::lua_error(state, format!("httpd listen '{}' failed: {}", addr, e));
+        // Release the bound socket before the longjmp; otherwise `lua_error`
+        // skips the listener's `Drop` and leaks the file descriptor.
+        let msg = format!("httpd listen '{}' failed: {}", addr, e);
+        drop(listener);
+        laux::lua_error(state, msg);
     }
     let listener = match TcpListener::from_std(listener) {
         Ok(l) => l,
@@ -608,11 +639,7 @@ extern "C-unwind" fn listen(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> c_int {
-    laux::lua_checkstack(state, 6, std::ptr::null());
-    let p_as_isize: isize = laux::lua_get(state, 1);
-    let req = unsafe { Box::from_raw(p_as_isize as *mut HttpSrvRequest) };
-
+fn push_httpd_request(state: LuaState, req: HttpSrvRequest) -> c_int {
     LuaTable::new(state, 0, 5)
         .insert("method", req.method.as_str())
         .insert("path", req.path.as_str())
@@ -666,15 +693,34 @@ extern "C-unwind" fn response(state: LuaState) -> c_int {
         LuaValue::String(s) => s.to_vec(),
         _ => Vec::new(),
     };
+    if body.len() > LIMITS.network_read_bytes {
+        return crate::lua_push_error(
+            state,
+            &format!(
+                "httpd response: body of {} bytes exceeds limit of {} bytes",
+                body.len(),
+                LIMITS.network_read_bytes
+            ),
+        );
+    }
 
-    let _ = tx.send(HttpSrvResponse {
+    // Report delivery failure to Lua instead of silently claiming success: the
+    // receiver may already be gone (handler timed out, client disconnected),
+    // in which case the response never reaches the wire.
+    match tx.send(HttpSrvResponse {
         status,
         headers,
         body,
-    });
-
-    laux::lua_push(state, true);
-    1
+    }) {
+        Ok(_) => {
+            laux::lua_push(state, true);
+            1
+        }
+        Err(_) => crate::lua_push_error(
+            state,
+            "httpd response: request already completed (client disconnected or timed out)",
+        ),
+    }
 }
 
 extern "C-unwind" fn close(state: LuaState) -> c_int {
@@ -688,10 +734,19 @@ extern "C-unwind" fn close(state: LuaState) -> c_int {
     1
 }
 
+pub unsafe extern "C-unwind" fn decode_httpd_message(
+    state: LuaState,
+    m: *mut moon_runtime::context::Message,
+) -> c_int {
+    match unsafe { crate::message_decode::take_boxed::<HttpSrvRequest>(m) } {
+        Ok(req) => push_httpd_request(state, req),
+        Err(e) => crate::lua_push_error(state, &e),
+    }
+}
+
 pub extern "C-unwind" fn luaopen_httpd(state: LuaState) -> c_int {
     let l = [
         lreg!("listen", listen),
-        lreg!("decode", decode),
         lreg!("response", response),
         lreg!("close", close),
         lreg_null!(),

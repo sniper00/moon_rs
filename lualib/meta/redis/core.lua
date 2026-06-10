@@ -1,0 +1,106 @@
+---@meta
+-- IDE annotation file only. Do not require this file at runtime.
+
+--- Redis connection pool userdata.
+---@class redis_pool
+
+--- Redis pub/sub watch session userdata.
+---@class redis_watch
+
+--- Native Redis driver (`require("redis.core")`).
+---@class redis.core
+local redis = {}
+
+--- Connect and register a named connection pool asynchronously.
+---@param opts table @ `{ host?, port?, auth?, db? }`
+---@param name? string @ Pool name (default `"default"`)
+---@param timeout? integer @ Connect timeout in ms (default 5000)
+---@param pool_size? integer @ Pool size (default 1)
+---@param queue_capacity? integer @ Per-worker request queue capacity (default 1024)
+---@return integer session
+function redis.connect(opts, name, timeout, pool_size, queue_capacity) end
+
+--- Look up a registered pool by name.
+---@param name string
+---@return redis_pool? pool
+function redis.find_connection(name) end
+
+--- Open a dedicated pub/sub connection asynchronously.
+---@param opts table @ `{ host?, port?, auth?, db?, timeout? }`
+---@return integer session
+function redis.watch(opts) end
+
+--- Pending request counts per named pool.
+---@return table<string, integer>
+function redis.stats() end
+
+--- Execute a Redis command asynchronously.
+---@param pool redis_pool
+---@param cmd string
+---@vararg string|number
+---@return integer session
+function redis_pool:command(cmd, ...) end
+
+--- Execute a Redis pipeline asynchronously.
+---@param pool redis_pool
+---@vararg table @ Each element is `{ cmd, ...args }`
+---@return integer session
+function redis_pool:pipeline(...) end
+
+--- Fire-and-forget command (no response).
+---@param pool redis_pool
+---@param cmd string
+---@vararg string|number
+---@return boolean
+function redis_pool:exec_command(cmd, ...) end
+
+--- Fire-and-forget pipeline.
+---@param pool redis_pool
+---@vararg table
+---@return boolean
+function redis_pool:exec_pipeline(...) end
+
+--- Pending request counts per pool worker.
+---@param pool redis_pool
+---@return integer[]
+function redis_pool:len() end
+
+--- Close and unregister the pool.
+---@param pool redis_pool
+function redis_pool:close() end
+
+--- Subscribe to channels.
+---@param watch redis_watch
+---@vararg string channel
+---@return boolean|table @ `true` or `{ code, message }`
+function redis_watch:subscribe(...) end
+
+--- Pattern-subscribe.
+---@param watch redis_watch
+---@vararg string pattern
+---@return boolean|table
+function redis_watch:psubscribe(...) end
+
+--- Unsubscribe from channels.
+---@param watch redis_watch
+---@vararg string channel
+---@return boolean|table
+function redis_watch:unsubscribe(...) end
+
+--- Pattern-unsubscribe.
+---@param watch redis_watch
+---@vararg string pattern
+---@return boolean|table
+function redis_watch:punsubscribe(...) end
+
+--- Wait for the next pub/sub message asynchronously.
+---@param watch redis_watch
+---@return integer session|table @ Session id or error table
+function redis_watch:message() end
+
+--- Close the watch connection.
+---@param watch redis_watch
+---@return boolean
+function redis_watch:close() end
+
+return redis

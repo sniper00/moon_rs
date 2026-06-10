@@ -1,29 +1,42 @@
+use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests};
 use dashmap::DashMap;
 use futures::stream::TryStreamExt;
 use lazy_static::lazy_static;
-use moon_runtime::actor::LuaActor;
-use moon_runtime::context::{self, ActorId, CONTEXT};
+use mongodb::{
+    Client, Collection, IndexModel,
+    bson::{Bson, Document, doc, oid},
+    error::{Error, ErrorKind},
+    options::{ClientOptions, CreateIndexOptions, FindOptions, IndexOptions, ReadConcern},
+    results,
+};
 use moon_lua::{
     cstr, ffi,
     laux::{self, LuaArgs, LuaState, LuaTable, LuaValue},
     lreg, lreg_null, luaL_newlib, push_lua_table,
 };
-use mongodb::{
-    bson::{doc, oid, Bson, Document},
-    error::Error,
-    options::{ClientOptions, CreateIndexOptions, FindOptions, IndexOptions, ReadConcern},
-    results, Client, Collection, IndexModel,
-};
-use std::{
-    ffi::c_int,
-    str::FromStr,
-    sync::{atomic::AtomicI64, Arc},
-    time::Duration,
-};
+use moon_runtime::actor::LuaActor;
+use moon_runtime::context::{self, ActorId, CONTEXT};
+use std::{ffi::c_int, str::FromStr, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 lazy_static! {
     static ref DATABASE_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
+}
+
+/// Drain a find cursor into a `Vec`, failing fast once it would exceed
+/// `crate::LIMITS.db_query_rows`.
+async fn collect_docs_capped(mut cur: mongodb::Cursor<Document>) -> Result<Vec<Document>, Error> {
+    let mut docs = Vec::new();
+    while let Some(doc) = cur.try_next().await? {
+        if docs.len() >= crate::LIMITS.db_query_rows {
+            return Err(Error::from(std::io::Error::other(format!(
+                "find returned more than {} documents; use find_stream for large result sets",
+                crate::LIMITS.db_query_rows
+            ))));
+        }
+        docs.push(doc);
+    }
+    Ok(docs)
 }
 
 enum DatabaseRequest {
@@ -35,7 +48,14 @@ enum DatabaseRequest {
     UpdateOne(ActorId, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, update
     UpdateMany(ActorId, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, update
     FindOne(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, filter
-    Find(ActorId, i64, String, String, Document, Box<Option<FindOptions>>), // owner, session, db_name, collection_name, filter
+    Find(
+        ActorId,
+        i64,
+        String,
+        String,
+        Document,
+        Box<Option<FindOptions>>,
+    ), // owner, session, db_name, collection_name, filter
     ReplacOne(ActorId, i64, String, String, Document, Document), // owner, session, db_name, collection_name, filter, replacement
     Count(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, filter
     Exists(ActorId, i64, String, String, Document), // owner, session, db_name, collection_name, filter,
@@ -47,8 +67,47 @@ enum DatabaseRequest {
         Box<IndexModel>,
         Box<Option<CreateIndexOptions>>,
     ), // owner, session, db_name, collection_name, keys, options
-    FindStream(ActorId, i64, String, String, Document, Box<Option<FindOptions>>, usize),
+    FindStream(
+        ActorId,
+        i64,
+        String,
+        String,
+        Document,
+        Box<Option<FindOptions>>,
+        usize,
+    ),
     Close(),
+}
+
+impl DatabaseRequest {
+    /// `(owner, session)` for a request that expects a reply, or `None` for
+    /// control messages (`Close`). Used to fail requests that are still queued
+    /// when the handler shuts down so their callers don't hang forever.
+    fn owner_session(&self) -> Option<(ActorId, i64)> {
+        match self {
+            DatabaseRequest::CreateCollection(o, s, ..)
+            | DatabaseRequest::InsertOne(o, s, ..)
+            | DatabaseRequest::InsertMany(o, s, ..)
+            | DatabaseRequest::DeleteOne(o, s, ..)
+            | DatabaseRequest::DeleteMany(o, s, ..)
+            | DatabaseRequest::UpdateOne(o, s, ..)
+            | DatabaseRequest::UpdateMany(o, s, ..)
+            | DatabaseRequest::FindOne(o, s, ..)
+            | DatabaseRequest::Find(o, s, ..)
+            | DatabaseRequest::ReplacOne(o, s, ..)
+            | DatabaseRequest::Count(o, s, ..)
+            | DatabaseRequest::Exists(o, s, ..)
+            | DatabaseRequest::CreateIndex(o, s, ..)
+            | DatabaseRequest::FindStream(o, s, ..) => Some((*o, *s)),
+            DatabaseRequest::Close() => None,
+        }
+    }
+}
+
+impl QueuedRequest for DatabaseRequest {
+    fn owner_session(&self) -> Option<(ActorId, i64)> {
+        DatabaseRequest::owner_session(self)
+    }
 }
 
 enum CursorSignal {
@@ -94,8 +153,9 @@ enum DatabaseResponse {
 
 #[derive(Clone)]
 struct DatabaseConnection {
-    tx: mpsc::UnboundedSender<DatabaseRequest>,
-    counter: Arc<AtomicI64>,
+    name: String,
+    tx: mpsc::Sender<DatabaseRequest>,
+    counter: PendingCounter,
 }
 
 struct DatabaseState {
@@ -135,8 +195,11 @@ impl DatabaseState {
                         DatabaseResponse::Error(err),
                     );
                 } else {
+                    // Fire-and-forget request (session == 0): there is no caller
+                    // to receive the error and the handler does not retry, so the
+                    // failure is dropped after logging.
                     log::error!(
-                        "Database '{}' error: '{:?}'. Will retry. ({}:{})",
+                        "Database '{}' error: '{:?}'. Dropped (fire-and-forget, no retry). ({}:{})",
                         self.database_url,
                         err.to_string(),
                         file!(),
@@ -148,65 +211,144 @@ impl DatabaseState {
     }
 }
 
+/// Whether an error is a transient network/connectivity failure that is worth
+/// retrying (as opposed to a logical error like a duplicate key or bad filter,
+/// which will keep failing). The `mongodb` driver already retries reads/writes
+/// internally; this gates the additional fire-and-forget self-heal retry.
+fn is_transient_network_error(err: &Error) -> bool {
+    if matches!(
+        *err.kind,
+        ErrorKind::Io(_)
+            | ErrorKind::ServerSelection { .. }
+            | ErrorKind::ConnectionPoolCleared { .. }
+            | ErrorKind::DnsResolve { .. }
+    ) {
+        return true;
+    }
+    err.contains_label("RetryableWriteError")
+}
+
+/// Run a MongoDB operation, mirroring the pg/redis worker retry convention:
+///
+/// - **Awaited** requests (`session != 0`) get the result or error exactly once
+///   — the caller is responsible for handling/retrying.
+/// - **Fire-and-forget** requests (`session == 0`) self-heal: a *transient
+///   network* error is retried with a fixed backoff until it succeeds; any
+///   non-network (logical) error is returned so it is logged and dropped rather
+///   than retried forever.
+///
+/// `make_fut` rebuilds the operation future on each attempt (futures are
+/// single-use), so callers clone any owned inputs inside the closure.
+async fn run_with_retry<F, Fut>(
+    database_url: &str,
+    session: i64,
+    mut make_fut: F,
+) -> Result<DatabaseResponse, Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<DatabaseResponse, Error>>,
+{
+    let mut failed_times: u32 = 0;
+    loop {
+        match make_fut().await {
+            Ok(v) => return Ok(v),
+            Err(err) => {
+                if session != 0 || !is_transient_network_error(&err) {
+                    return Err(err);
+                }
+                if failed_times == 0 {
+                    log::error!(
+                        "mongodb '{}' network error: {}. retrying. ({}:{})",
+                        database_url,
+                        err,
+                        file!(),
+                        line!()
+                    );
+                }
+                failed_times += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 async fn database_handler(
     state: DatabaseState,
-    mut rx: mpsc::UnboundedReceiver<DatabaseRequest>,
-    counter: Arc<AtomicI64>,
+    mut rx: mpsc::Receiver<DatabaseRequest>,
+    counter: PendingCounter,
 ) {
     while let Some(op) = rx.recv().await {
         // let mut failed_times = 0;
         match op {
             DatabaseRequest::CreateCollection(owner, session, db_name, collection_name) => {
-                let db = state.client.database(&db_name);
-                state.send_result(
-                    owner,
-                    session,
-                    db.create_collection(collection_name)
-                        .await
-                        .map(|_| DatabaseResponse::CreateCollection),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let db = client.database(&db_name);
+                    let collection_name = collection_name.clone();
+                    async move {
+                        db.create_collection(collection_name)
+                            .await
+                            .map(|_| DatabaseResponse::CreateCollection)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::InsertOne(owner, session, db_name, collection_name, doc) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.insert_one(doc).await.map(DatabaseResponse::InsertOne),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let doc = doc.clone();
+                    async move { coll.insert_one(doc).await.map(DatabaseResponse::InsertOne) }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::InsertMany(owner, session, db_name, collection_name, docs) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.insert_many(docs)
-                        .await
-                        .map(DatabaseResponse::InsertMany),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let docs = docs.clone();
+                    async move {
+                        coll.insert_many(docs)
+                            .await
+                            .map(DatabaseResponse::InsertMany)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::DeleteOne(owner, session, db_name, collection_name, filter) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.delete_one(filter.clone())
-                        .await
-                        .map(DatabaseResponse::DeleteOne),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    async move {
+                        coll.delete_one(filter)
+                            .await
+                            .map(DatabaseResponse::DeleteOne)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::DeleteMany(owner, session, db_name, collection_name, filter) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.delete_many(filter.clone())
-                        .await
-                        .map(DatabaseResponse::DeleteMany),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    async move {
+                        coll.delete_many(filter)
+                            .await
+                            .map(DatabaseResponse::DeleteMany)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::UpdateOne(
                 owner,
@@ -216,15 +358,20 @@ async fn database_handler(
                 filter,
                 update,
             ) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.update_one(filter.clone(), update.clone())
-                        .await
-                        .map(DatabaseResponse::UpdateOne),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    let update = update.clone();
+                    async move {
+                        coll.update_one(filter, update)
+                            .await
+                            .map(DatabaseResponse::UpdateOne)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::UpdateMany(
                 owner,
@@ -234,43 +381,50 @@ async fn database_handler(
                 filter,
                 update,
             ) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.update_many(filter.clone(), update.clone())
-                        .await
-                        .map(DatabaseResponse::UpdateMany),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    let update = update.clone();
+                    async move {
+                        coll.update_many(filter, update)
+                            .await
+                            .map(DatabaseResponse::UpdateMany)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::FindOne(owner, session, db_name, collection_name, filter) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.find_one(filter.clone())
-                        .await
-                        .map(|doc: Option<Document>| DatabaseResponse::FindOne(doc)),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    async move {
+                        coll.find_one(filter)
+                            .await
+                            .map(|doc: Option<Document>| DatabaseResponse::FindOne(doc))
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::Find(owner, session, db_name, collection_name, filter, options) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                let result = coll.find(filter.clone()).with_options(*options).await;
-                match result {
-                    Ok(cur) => {
-                        state.send_result(
-                            owner,
-                            session,
-                            cur.try_collect().await.map(DatabaseResponse::Find),
-                        );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    let options = options.clone();
+                    async move {
+                        let cur = coll.find(filter).with_options(*options).await?;
+                        collect_docs_capped(cur).await.map(DatabaseResponse::Find)
                     }
-                    Err(err) => {
-                        state.send_result(owner, session, Err(err));
-                    }
-                }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::ReplacOne(
                 owner,
@@ -280,43 +434,50 @@ async fn database_handler(
                 filter,
                 replacement,
             ) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.replace_one(filter.clone(), replacement.clone())
-                        .await
-                        .map(DatabaseResponse::ReplacOne),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    let replacement = replacement.clone();
+                    async move {
+                        coll.replace_one(filter, replacement)
+                            .await
+                            .map(DatabaseResponse::ReplacOne)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::Count(owner, session, db_name, collection_name, filter) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.count_documents(filter.clone())
-                        .await
-                        .map(DatabaseResponse::Count),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    async move {
+                        coll.count_documents(filter)
+                            .await
+                            .map(DatabaseResponse::Count)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::Exists(owner, session, db_name, collection_name, filter) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.find_one(filter.clone())
-                        .await
-                        .map(|doc: Option<Document>| {
-                            if doc.is_some() {
-                                DatabaseResponse::Exists(true)
-                            } else {
-                                DatabaseResponse::Exists(false)
-                            }
-                        }),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let filter = filter.clone();
+                    async move {
+                        coll.find_one(filter)
+                            .await
+                            .map(|doc: Option<Document>| DatabaseResponse::Exists(doc.is_some()))
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
             DatabaseRequest::CreateIndex(
                 owner,
@@ -326,19 +487,32 @@ async fn database_handler(
                 index,
                 options,
             ) => {
-                let db = state.client.database(&db_name);
-                let coll: Collection<Document> = db.collection(&collection_name);
-                state.send_result(
-                    owner,
-                    session,
-                    coll.create_index(*index)
-                        .with_options(*options)
-                        .await
-                        .map(DatabaseResponse::CreateIndex),
-                );
+                let client = state.client.clone();
+                let res = run_with_retry(&state.database_url, session, move || {
+                    let coll: Collection<Document> =
+                        client.database(&db_name).collection(&collection_name);
+                    let index = index.clone();
+                    let options = options.clone();
+                    async move {
+                        coll.create_index(*index)
+                            .with_options(*options)
+                            .await
+                            .map(DatabaseResponse::CreateIndex)
+                    }
+                })
+                .await;
+                state.send_result(owner, session, res);
             }
 
-            DatabaseRequest::FindStream(owner, session, db_name, collection_name, filter, options, batch_size) => {
+            DatabaseRequest::FindStream(
+                owner,
+                session,
+                db_name,
+                collection_name,
+                filter,
+                options,
+                batch_size,
+            ) => {
                 let db = state.client.database(&db_name);
                 let coll: Collection<Document> = db.collection(&collection_name);
                 match coll.find(filter.clone()).with_options(*options).await {
@@ -353,13 +527,20 @@ async fn database_handler(
                                     Ok(Some(doc)) => batch.push(doc),
                                     Ok(None) => break,
                                     Err(err) => {
-                                        CONTEXT.response_error(0, current_owner, -current_session, err.to_string());
+                                        CONTEXT.response_error(
+                                            0,
+                                            current_owner,
+                                            -current_session,
+                                            err.to_string(),
+                                        );
                                         errored = true;
                                         break;
                                     }
                                 }
                             }
-                            if errored { break; }
+                            if errored {
+                                break;
+                            }
 
                             let cursor_exhausted = batch.len() < batch_size;
                             let (next_tx, next_rx) = if !cursor_exhausted {
@@ -373,12 +554,15 @@ async fn database_handler(
                                 state.protocol_type,
                                 current_owner,
                                 current_session,
-                                DatabaseResponse::FindBatch(CursorBatch { docs: batch, next_tx }),
+                                DatabaseResponse::FindBatch(CursorBatch {
+                                    docs: batch,
+                                    next_tx,
+                                }),
                             );
 
-                            if cursor_exhausted { break; }
-
-                            match next_rx.unwrap().await {
+                            // `next_rx` is `Some` iff the cursor isn't exhausted.
+                            let Some(next_rx) = next_rx else { break };
+                            match next_rx.await {
                                 Ok(CursorSignal::Next(new_owner, new_session)) => {
                                     current_owner = new_owner;
                                     current_session = new_session;
@@ -394,10 +578,18 @@ async fn database_handler(
             }
 
             DatabaseRequest::Close() => {
+                drain_queued_requests(&mut rx, &counter, |owner, session| {
+                    CONTEXT.response_error(
+                        0,
+                        owner,
+                        -session,
+                        "mongodb connection closed".to_string(),
+                    );
+                });
                 break;
             }
         }
-        counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        counter.dec();
     }
 }
 
@@ -405,6 +597,9 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let mut args = LuaArgs::new(1);
     let database_url = unsafe { laux::lua_check_str(state, args.iter_arg()) };
     let name = unsafe { laux::lua_check_str(state, args.iter_arg()) };
+    let queue_capacity: usize =
+        laux::lua_opt(state, args.iter_arg()).unwrap_or(crate::LIMITS.request_queue_capacity);
+    let queue_capacity = queue_capacity.max(1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -413,15 +608,25 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     CONTEXT.io_runtime().spawn(async move {
         match DatabaseState::connect(context::PTYPE_MONGODB, database_url.to_string()).await {
             Ok(state) => {
-                let (tx, rx) = mpsc::unbounded_channel();
-                let counter = Arc::new(AtomicI64::new(0));
-                DATABASE_CONNECTIONSS.insert(
+                let (tx, rx) = mpsc::channel(queue_capacity);
+                let counter = PendingCounter::new();
+                // Replacing an existing connection of the same name: tell the
+                // previous handler to close so its task and mongodb Client don't
+                // leak (it drains and fails any queued requests, then exits).
+                if let Some(old) = DATABASE_CONNECTIONSS.insert(
                     name.to_string(),
                     DatabaseConnection {
+                        name: name.to_string(),
                         tx: tx.clone(),
                         counter: counter.clone(),
                     },
-                );
+                ) {
+                    log::warn!(
+                        "mongodb '{}' reconnected with the same name; closing the previous connection",
+                        old.name
+                    );
+                    let _ = old.tx.send(DatabaseRequest::Close()).await;
+                }
 
                 let _ = CONTEXT.send_value(
                     context::PTYPE_MONGODB,
@@ -792,7 +997,18 @@ fn make_request(
                 } else {
                     None
                 };
-            let batch_size: usize = laux::lua_opt(state, args.iter_arg()).unwrap_or(100);
+            // Parse as i64 so a negative Lua integer is rejected rather than
+            // wrapping to a huge `usize`. `batch_size == 0` would make the
+            // handler loop emit empty batches forever, so require >= 1.
+            let batch_size: i64 =
+                laux::lua_opt(state, args.iter_arg()).unwrap_or(crate::LIMITS.db_stream_batch_rows);
+            if batch_size < 1 || batch_size as u64 > crate::LIMITS.db_query_rows as u64 {
+                return Err(format!(
+                    "find_stream: batch_size must be between 1 and {}",
+                    crate::LIMITS.db_query_rows
+                ));
+            }
+            let batch_size = batch_size as usize;
 
             DatabaseRequest::FindStream(
                 owner,
@@ -816,18 +1032,32 @@ fn make_request(
 extern "C-unwind" fn lua_mongodb_close(state: LuaState) -> c_int {
     let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1)
         .expect("Invalid database connect pointer");
-    let _ = conn.tx.send(DatabaseRequest::Close());
+    // Stop the handler task (drops the mongodb Client) and drop the registry
+    // entry so a later reconnect with the same name doesn't collide with a
+    // stale, dead handle.
+    let tx = conn.tx.clone();
+    CONTEXT.io_runtime().spawn(async move {
+        let _ = tx.send(DatabaseRequest::Close()).await;
+    });
+    // Only remove our own entry: if a `connect()` with the same name has already
+    // replaced this connection, closing through this (now stale) handle must not
+    // delete the newer entry. Match on our own pending counter to identify it.
+    DATABASE_CONNECTIONSS.remove_if(&conn.name, |_, v| v.counter.ptr_eq(&conn.counter));
     0
 }
 
 extern "C-unwind" fn cursor_next(state: LuaState) -> c_int {
-    let handle = laux::lua_touserdata::<CursorHandle>(state, 1)
-        .expect("invalid cursor handle");
+    let handle = laux::lua_touserdata::<CursorHandle>(state, 1).expect("invalid cursor handle");
     if let Some(tx) = handle.0.take() {
         let actor = LuaActor::from_lua_state(state);
         let owner = unsafe { (*actor).id };
         let session = unsafe { (*actor).next_session() };
-        let _ = tx.send(CursorSignal::Next(owner, session));
+        // If the stream handler has already exited, its receiver is gone and the
+        // send fails. Surface that as an error rather than pushing a session that
+        // would never be answered (which would hang the awaiting coroutine).
+        if tx.send(CursorSignal::Next(owner, session)).is_err() {
+            return crate::lua_push_error(state, "cursor: stream handler is gone");
+        }
         laux::lua_push(state, session);
         1
     } else {
@@ -836,8 +1066,7 @@ extern "C-unwind" fn cursor_next(state: LuaState) -> c_int {
 }
 
 extern "C-unwind" fn cursor_close(state: LuaState) -> c_int {
-    let handle = laux::lua_touserdata::<CursorHandle>(state, 1)
-        .expect("invalid cursor handle");
+    let handle = laux::lua_touserdata::<CursorHandle>(state, 1).expect("invalid cursor handle");
     if let Some(tx) = handle.0.take() {
         let _ = tx.send(CursorSignal::Close);
     }
@@ -878,28 +1107,42 @@ extern "C-unwind" fn operators(state: LuaState) -> c_int {
         }
     };
 
-    match conn.tx.send(request) {
-        Ok(_) => {
-            conn.counter
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            laux::lua_push(state, session);
-            1
+    if matches!(request, DatabaseRequest::Close()) {
+        match conn.tx.try_send(request) {
+            Ok(()) => {
+                laux::lua_push(state, true);
+                1
+            }
+            Err(err) => {
+                push_lua_table!(
+                    state,
+                    "kind" => "ERROR",
+                    "message" => err.to_string()
+                );
+                1
+            }
         }
-        Err(err) => {
-            push_lua_table!(
-                state,
-                "kind" => "ERROR",
-                "message" => err.to_string()
-            );
-            1
+    } else {
+        match conn.tx.try_send(request) {
+            Ok(_) => {
+                conn.counter.inc();
+                laux::lua_push(state, session);
+                1
+            }
+            Err(err) => {
+                push_lua_table!(
+                    state,
+                    "kind" => "ERROR",
+                    "message" => err.to_string()
+                );
+                1
+            }
         }
     }
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> c_int {
-    laux::lua_checkstack(state, 6, std::ptr::null());
-    let result = laux::lua_into_userdata::<DatabaseResponse>(state, 1);
-    match *result {
+fn push_mongodb_response(state: LuaState, result: DatabaseResponse) -> c_int {
+    match result {
         DatabaseResponse::Connect => {
             push_lua_table!(
                 state,
@@ -1082,7 +1325,11 @@ extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
     let name = unsafe { laux::lua_check_str(state, 1) };
     match DATABASE_CONNECTIONSS.get(name) {
         Some(pair) => {
-            let l = [lreg!("operators", operators), lreg!("close", lua_mongodb_close), lreg_null!()];
+            let l = [
+                lreg!("operators", operators),
+                lreg!("close", lua_mongodb_close),
+                lreg_null!(),
+            ];
             if laux::lua_newuserdata(
                 state,
                 pair.value().clone(),
@@ -1113,7 +1360,8 @@ fn table_to_doc(table: LuaTable) -> Result<Document, String> {
     let mut doc = Document::new();
     for (key, value) in table.iter() {
         let key = match key {
-            LuaValue::String(val) => String::from_utf8(val.to_vec()).unwrap(),
+            LuaValue::String(val) => String::from_utf8(val.to_vec())
+                .map_err(|_| "Invalid document key: not valid UTF-8".to_string())?,
             LuaValue::Number(val) => val.to_string(),
             LuaValue::Integer(val) => val.to_string(),
             val => return Err(format!("Invalid key type: {}", val.name())),
@@ -1148,8 +1396,8 @@ fn lua_to_bson(value: LuaValue, is_object_id: bool) -> Result<Bson, String> {
         LuaValue::Number(val) => Ok(Bson::Double(val)),
         LuaValue::Integer(val) => Ok(Bson::Int64(val)),
         LuaValue::String(val) => {
-            let s = std::str::from_utf8(val)
-                .map_err(|e| format!("Invalid UTF-8 in string: {}", e))?;
+            let s =
+                std::str::from_utf8(val).map_err(|e| format!("Invalid UTF-8 in string: {}", e))?;
             if is_object_id {
                 Ok(Bson::ObjectId(
                     oid::ObjectId::from_str(s).map_err(|e| e.to_string())?,
@@ -1205,11 +1453,20 @@ extern "C-unwind" fn tt(state: LuaState) -> c_int {
     1
 }
 
+pub unsafe extern "C-unwind" fn decode_mongodb_message(
+    state: LuaState,
+    m: *mut moon_runtime::context::Message,
+) -> c_int {
+    match unsafe { crate::message_decode::take_boxed::<DatabaseResponse>(m) } {
+        Ok(response) => push_mongodb_response(state, response),
+        Err(e) => crate::lua_push_error(state, &e),
+    }
+}
+
 pub extern "C-unwind" fn luaopen_mongodb(state: LuaState) -> c_int {
     let l = [
         lreg!("connect", connect),
         lreg!("find_connection", find_connection),
-        lreg!("decode", decode),
         lreg!("tt", tt),
         lreg_null!(),
     ];

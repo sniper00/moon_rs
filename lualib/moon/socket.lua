@@ -34,7 +34,6 @@ moon.register_protocol {
     name = "tcp",
     PTYPE = moon.PTYPE_SOCKET_TCP,
     pack = function(...) return ... end,
-    unpack = moon.tostring,
     dispatch = function() end
 }
 
@@ -42,9 +41,6 @@ moon.register_protocol {
     name = "socket_event",
     PTYPE = moon.PTYPE_SOCKET_EVENT,
     pack = function(...) return ... end,
-    unpack = function(val)
-        return core.decode_socket_event(val)
-    end,
     dispatch = function(_, _, first, event_type, val, ...)
         if event_type == ACCEPT_EVENT then
             -- first = listen_fd, val = conn_fd, ... = remote_addr
@@ -107,9 +103,10 @@ end
 --- Multiple listeners can coexist, each with its own callback.
 --- @param addr string @ The address to listen on (e.g. "0.0.0.0:8080").
 --- @param on_accept fun(fd: integer, addr: string) @ Callback invoked for each accepted connection.
+--- @param opts? table @ `{ max_connections? }` cap on concurrently accepted connections (default 100000).
 ---@return integer|false, string? @ Returns the listen fd if successful, or `false` and an error message.
-function socket.listen(addr, on_accept)
-    local fd, err = core.listen(addr)
+function socket.listen(addr, on_accept, opts)
+    local fd, err = core.listen(addr, opts)
     if not fd then
         return fd, err
     end
@@ -124,7 +121,7 @@ end
 --- @param timeout? integer @ Optional. The connect timeout in milliseconds. Default is 5000ms.
 ---@return integer|false, string? @ Returns the file descriptor of the new connection if successful, or `false` and an error message if failed.
 function socket.connect(addr, timeout)
-    local fd, err = moon.wait(core.connect(addr, timeout or 5000))
+    local fd, err = moon.wait(core.connect(addr, timeout))
     if fd then
         socket_pool[fd] = true
     end
@@ -141,9 +138,9 @@ end
 ---@return string|false, string? @ Returns the read data if successful, or `false` and an error message if failed.
 function socket.read(fd, delim, maxcount, timeout)
     if type(delim) == "number" then
-        return moon.wait(core.read(fd, delim, maxcount or 0))
+        return moon.wait(core.read(fd, delim, maxcount))
     else
-        return moon.wait(core.read(fd, delim, maxcount, timeout or 0))
+        return moon.wait(core.read(fd, delim, maxcount, timeout))
     end
 end
 
@@ -155,7 +152,7 @@ end
 --- @param timeout? integer @ Optional. Read timeout in milliseconds. 0 means no timeout.
 ---@return buffer_ptr|false, string? @ Returns buffer pointer if successful, or `false` and an error message if failed.
 function socket.read_frame(fd, timeout)
-    return moon.wait(core.read_frame(fd, timeout or 0), nil, true)
+    return moon.wait(core.read_frame(fd, timeout))
 end
 
 ---Register a callback for socket events.

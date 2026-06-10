@@ -7,9 +7,6 @@ moon.register_protocol {
     name = "httpd",
     PTYPE = protocol_type,
     pack = function(...) return ... end,
-    unpack = function(val)
-        return c.decode(val)
-    end
 }
 
 ---@class httpd
@@ -24,14 +21,14 @@ local M = {}
 
 ---@class httpd.ListenOptions
 ---@field max_body_size? integer Max request body in bytes (default 10MB)
----@field max_connections? integer Max concurrent connections (default 10000)
+---@field max_connections? integer Max concurrent connections (default 100000)
 ---@field static_dir? string Directory path for serving static files. GET/HEAD requests matching files under this directory are served directly without dispatching to the Lua handler. Supports index.html for directory requests. Path traversal is blocked.
 
 ---@param addr string Listen address e.g. "0.0.0.0:8080"
 ---@param opts? httpd.ListenOptions
 ---@return integer listener_fd
 function M.listen(addr, opts)
-    return c.listen(addr, opts or {})
+    return c.listen(addr, opts)
 end
 
 ---Register a request handler. The handler receives an `httpd.Request` and
@@ -41,7 +38,8 @@ function M.dispatch(fn)
     moon.dispatch("httpd", function(sender, session, req, handle)
         local ok, status, headers, body = pcall(fn, req)
         if ok then
-            c.response(handle, status or 200, headers or {}, body or "")
+            ---@cast status integer?
+            c.response(handle, status, headers, body)
         else
             c.response(handle, 500, {}, tostring(status))
         end

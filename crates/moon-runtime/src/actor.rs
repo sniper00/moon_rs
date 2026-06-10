@@ -1,5 +1,5 @@
-use crate::context::{ActorId, LuaActorParam};
-use moon_lua::laux::{LuaState, LuaGlobalState, LuaThread};
+use crate::context::{ActorId, LuaActorParam, Watchdog};
+use moon_lua::laux::{LuaGlobalState, LuaState, LuaThread};
 
 pub use moon_lua as ffi;
 
@@ -14,7 +14,13 @@ pub struct LuaActor {
     pub mem: isize,
     pub mem_limit: isize,
     pub mem_warning: isize,
+    /// Raw pointer to the per-actor Watchdog (kept alive by Arc<Watchdog> in
+    /// ActorEntry). Used by lua_coroutine.rs switchL and signal_hook via
+    /// extraspace chain.
+    pub watchdog: *const Watchdog,
 }
+
+unsafe impl Send for LuaActor {}
 
 impl LuaActor {
     pub fn new(params: &LuaActorParam) -> Self {
@@ -29,6 +35,7 @@ impl LuaActor {
             mem: 0,
             mem_limit: params.memlimit as isize,
             mem_warning: 8 * 1024 * 1024,
+            watchdog: std::ptr::null(),
         }
     }
 

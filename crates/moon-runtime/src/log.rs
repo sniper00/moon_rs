@@ -7,11 +7,11 @@ use std::{
     io::prelude::*,
     path::Path,
     sync::{
+        Arc,
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         mpsc::{self, Sender},
-        Arc,
     },
-    thread
+    thread,
 };
 
 use crate::{buffer::Buffer, context::CONTEXT};

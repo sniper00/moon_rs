@@ -18,24 +18,20 @@
 //!  - Async delivery via `PTYPE_PG` + `moon.wait(session)`.
 
 use crate::lua_json::{JsonOptions, encode_table};
+use crate::request_pool::{
+    PendingCounter, QueuedRequest, WorkerHandle, WorkerSet, drain_queued_requests,
+};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use moon_lua::laux::LuaState;
 use moon_lua::{
     cstr, ffi, laux,
-    laux::{LuaTable, LuaValue, lua_into_userdata},
+    laux::{LuaTable, LuaValue},
     lreg, lreg_null, luaL_newlib, push_lua_table,
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
-use std::{
-    ffi::c_int,
-    sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{ffi::c_int, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -61,8 +57,8 @@ struct ConnParams {
 
 impl ConnParams {
     fn parse(database_url: &str) -> Result<Self, String> {
-        let url = url::Url::parse(database_url)
-            .map_err(|e| format!("invalid connection url: {}", e))?;
+        let url =
+            url::Url::parse(database_url).map_err(|e| format!("invalid connection url: {}", e))?;
         match url.scheme() {
             "postgres" | "postgresql" => {}
             other => return Err(format!("unsupported scheme '{}', expected postgres", other)),
@@ -124,46 +120,30 @@ fn percent_decode(s: &str) -> String {
 // Pool
 // ---------------------------------------------------------------------------
 
-struct PgWorker {
-    tx: mpsc::UnboundedSender<PgRequest>,
-    counter: Arc<AtomicI64>,
-}
-
-struct PgPoolInner {
-    name: String,
-    workers: Vec<PgWorker>,
-    next: AtomicUsize,
+/// A message delivered to a worker: either a query request or a graceful
+/// shutdown signal (sent by `close()` so the worker exits and drops its
+/// connection even while the Lua-side pool handle keeps the pool `Arc` alive).
+enum PgMessage {
+    Request(PgRequest),
+    Shutdown,
 }
 
 #[derive(Clone)]
 struct PgPool {
-    inner: Arc<PgPoolInner>,
+    inner: Arc<WorkerSet<PgMessage>>,
 }
 
 impl PgPool {
     fn dispatch(&self, owner: ActorId, session: i64, data: Vec<u8>) -> Result<(), String> {
-        let n = self.inner.workers.len();
-        let idx = self.inner.next.fetch_add(1, Ordering::Relaxed) % n;
-        let worker = &self.inner.workers[idx];
-        match worker.tx.send(PgRequest {
+        self.inner.dispatch(PgMessage::Request(PgRequest {
             owner,
             session,
             data,
-        }) {
-            Ok(_) => {
-                worker.counter.fetch_add(1, Ordering::Release);
-                Ok(())
-            }
-            Err(err) => Err(err.to_string()),
-        }
+        }))
     }
 
     fn pending(&self) -> i64 {
-        self.inner
-            .workers
-            .iter()
-            .map(|w| w.counter.load(Ordering::Acquire))
-            .sum()
+        self.inner.pending()
     }
 }
 
@@ -171,6 +151,15 @@ struct PgRequest {
     owner: ActorId,
     session: i64,
     data: Vec<u8>,
+}
+
+impl QueuedRequest for PgMessage {
+    fn owner_session(&self) -> Option<(ActorId, i64)> {
+        match self {
+            PgMessage::Request(req) => Some((req.owner, req.session)),
+            PgMessage::Shutdown => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +227,11 @@ const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
 
 impl PgConn {
-    async fn connect(params: &ConnParams, timeout_ms: u64, read_timeout_ms: u64) -> Result<Self, String> {
+    async fn connect(
+        params: &ConnParams,
+        timeout_ms: u64,
+        read_timeout_ms: u64,
+    ) -> Result<Self, String> {
         let fut = Self::connect_inner(params, read_timeout_ms);
         match timeout(Duration::from_millis(timeout_ms), fut).await {
             Ok(res) => res,
@@ -308,10 +301,7 @@ impl PgConn {
                 }
                 b'E' => return Err(parse_error_string(&body)),
                 other => {
-                    return Err(format!(
-                        "unexpected message during auth: {}",
-                        other as char
-                    ));
+                    return Err(format!("unexpected message during auth: {}", other as char));
                 }
             }
         }
@@ -369,7 +359,7 @@ impl PgConn {
         if t == b'E' {
             return Err(parse_error_string(&body));
         }
-        if t != b'R' || read_i32(&body, 0) != AUTH_SASL_CONTINUE {
+        if t != b'R' || body.len() < 4 || read_i32(&body, 0) != AUTH_SASL_CONTINUE {
             return Err("unexpected message during SCRAM continue".to_string());
         }
         client.process_server_first(&String::from_utf8_lossy(&body[4..]))?;
@@ -383,7 +373,7 @@ impl PgConn {
         if t == b'E' {
             return Err(parse_error_string(&body));
         }
-        if t != b'R' || read_i32(&body, 0) != AUTH_SASL_FINAL {
+        if t != b'R' || body.len() < 4 || read_i32(&body, 0) != AUTH_SASL_FINAL {
             return Err("unexpected message during SCRAM final".to_string());
         }
         client.process_server_final(&String::from_utf8_lossy(&body[4..]))?;
@@ -396,7 +386,7 @@ impl PgConn {
         if t == b'E' {
             return Err(parse_error_string(&body));
         }
-        if t != b'R' || read_i32(&body, 0) != AUTH_OK {
+        if t != b'R' || body.len() < 4 || read_i32(&body, 0) != AUTH_OK {
             return Err("expected AuthenticationOk after SCRAM".to_string());
         }
         Ok(())
@@ -489,11 +479,22 @@ impl PgConn {
         let mut cur_row_desc: Option<Vec<u8>> = None;
         let mut cur_rows: Vec<Vec<u8>> = Vec::new();
         let mut txn_status = b'I';
+        // Total DataRow messages accumulated across all statements in this reply.
+        let mut total_rows: usize = 0;
 
         loop {
             let (t, body) = self.read_message().await?;
             match t {
-                b'D' => cur_rows.push(body),
+                b'D' => {
+                    total_rows += 1;
+                    if total_rows > crate::LIMITS.db_query_rows {
+                        return Err(format!(
+                            "query returned more than {} rows; use a streaming/paginated query for large result sets",
+                            crate::LIMITS.db_query_rows
+                        ));
+                    }
+                    cur_rows.push(body);
+                }
                 b'T' => cur_row_desc = Some(body),
                 b'E' => error = Some(Box::new(parse_error(&body))),
                 b'C' => {
@@ -637,12 +638,26 @@ async fn worker_loop(
     params: ConnParams,
     timeout_ms: u64,
     read_timeout_ms: u64,
-    mut rx: mpsc::UnboundedReceiver<PgRequest>,
-    counter: Arc<AtomicI64>,
+    mut rx: mpsc::Receiver<PgMessage>,
+    counter: PendingCounter,
     initial_conn: Option<PgConn>,
 ) {
     let mut conn: Option<PgConn> = initial_conn;
-    while let Some(req) = rx.recv().await {
+    while let Some(msg) = rx.recv().await {
+        let req = match msg {
+            PgMessage::Request(req) => req,
+            PgMessage::Shutdown => {
+                drain_queued_requests(&mut rx, &counter, |owner, session| {
+                    let _ = CONTEXT.send_value(
+                        context::PTYPE_PG,
+                        owner,
+                        session,
+                        PgResponse::Socket("pg connection closed".to_string()),
+                    );
+                });
+                break;
+            }
+        };
         let mut failed_times = 0;
         loop {
             // Ensure a live connection.
@@ -657,7 +672,7 @@ async fn worker_loop(
                                 req.session,
                                 PgResponse::Socket(e),
                             );
-                            counter.fetch_sub(1, Ordering::Release);
+                            counter.dec();
                             break;
                         } else {
                             if failed_times == 0 {
@@ -701,7 +716,7 @@ async fn worker_loop(
                             line!()
                         );
                     }
-                    counter.fetch_sub(1, Ordering::Release);
+                    counter.dec();
                     break;
                 }
                 Err(e) => {
@@ -714,7 +729,7 @@ async fn worker_loop(
                             req.session,
                             PgResponse::Socket(e),
                         );
-                        counter.fetch_sub(1, Ordering::Release);
+                        counter.dec();
                         break;
                     } else {
                         if failed_times == 0 {
@@ -812,6 +827,16 @@ fn append_statement(
     end_message(buf, stub);
 
     // Bind
+    // The PG v3 Bind message encodes the parameter count as an i16, so a
+    // statement can carry at most 65535 parameters. Reject overflow instead of
+    // silently truncating the count (which would desync the wire protocol).
+    if param_indices.len() > u16::MAX as usize {
+        return Err(format!(
+            "too many bind parameters: {} (max {})",
+            param_indices.len(),
+            u16::MAX
+        ));
+    }
     let stub = start_message(buf, PQ_BIND);
     write_cstr(buf, b""); // portal
     write_cstr(buf, b""); // statement
@@ -856,7 +881,7 @@ fn append_parse_unnamed(buf: &mut Vec<u8>, sql: &[u8]) {
 
 /// PostgreSQL caps the bound-parameter count of one message at 65535 (u16).
 const MAX_BIND_PARAMS: usize = u16::MAX as usize;
-const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024; // 64 MB
+const MAX_MESSAGE_LEN: usize = crate::LIMITS.db_wire_message_bytes;
 
 /// Encode a set-based bulk write: one statement Parsed once per distinct tuple
 /// count, then Bound/Executed for chunks of `rows`. `cols_per_tuple` parameters
@@ -985,6 +1010,131 @@ fn validate_type_name(t: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("invalid type name: {:?}", t))
+    }
+}
+
+/// Validate an optional `ON CONFLICT ...` clause that `insert_many` appends to
+/// the generated SQL verbatim (it cannot be parameterized). This is a
+/// defense-in-depth check, not a full parser: it enforces the expected
+/// `ON CONFLICT` prefix and rejects statement chaining / comment-out tokens
+/// (`;`, `--`, `/*`). The clause is still caller-controlled SQL — do not build
+/// it from untrusted input.
+fn validate_conflict_clause(clause: &str) -> Result<(), String> {
+    let trimmed = clause.trim();
+    let has_prefix = trimmed
+        .get(..11)
+        .map(|p| p.eq_ignore_ascii_case("ON CONFLICT"))
+        .unwrap_or(false);
+    if !has_prefix {
+        return Err("conflict clause must start with 'ON CONFLICT'".to_string());
+    }
+    if trimmed.contains(';') || trimmed.contains("--") || trimmed.contains("/*") {
+        return Err("conflict clause contains a disallowed token (';', '--', or '/*')".to_string());
+    }
+    Ok(())
+}
+
+/// Build an `ON CONFLICT ...` clause from a structured Lua table, quoting every
+/// identifier via [`quote_ident`]. Because no caller text is ever interpolated
+/// (only validated/quoted identifiers), this form is safe to build from
+/// untrusted input — unlike the raw string form. Accepted fields:
+/// * `columns` — array of conflict-target column names (`ON CONFLICT (c1,c2)`), or
+/// * `constraint` — a constraint name (`ON CONFLICT ON CONSTRAINT name`)
+///   (mutually exclusive with `columns`);
+/// * `update` — array of columns for `DO UPDATE SET c = EXCLUDED.c, ...`;
+///   omit (or leave empty) for `DO NOTHING`.
+fn build_conflict_from_table(state: LuaState, idx: i32) -> Result<String, String> {
+    let mut clause = String::from("ON CONFLICT");
+
+    // --- conflict target: `constraint` name or `columns` list (not both) ---
+    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("constraint")) };
+    let constraint = if laux::lua_type(state, -1) == laux::LuaType::String {
+        Some(unsafe { laux::lua_check_str(state, -1) }.to_string())
+    } else {
+        None
+    };
+    laux::lua_pop(state, 1);
+
+    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("columns")) };
+    let target_cols = if laux::lua_type(state, -1) == laux::LuaType::Table {
+        let r = read_string_array(state, laux::lua_top(state), "conflict.columns");
+        laux::lua_pop(state, 1);
+        Some(r?)
+    } else {
+        laux::lua_pop(state, 1);
+        None
+    };
+
+    match (constraint, target_cols) {
+        (Some(_), Some(_)) => {
+            return Err("conflict: specify either `columns` or `constraint`, not both".to_string());
+        }
+        (Some(name), None) => {
+            clause.push_str(" ON CONSTRAINT ");
+            clause.push_str(&quote_ident(&name));
+        }
+        (None, Some(cols)) => {
+            clause.push_str(" (");
+            for (i, c) in cols.iter().enumerate() {
+                if i > 0 {
+                    clause.push(',');
+                }
+                clause.push_str(&quote_ident(c));
+            }
+            clause.push(')');
+        }
+        // No explicit target — only meaningful with `DO NOTHING`.
+        (None, None) => {}
+    }
+
+    // --- action: `update` columns → DO UPDATE SET, otherwise DO NOTHING ---
+    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("update")) };
+    let update_cols = if laux::lua_type(state, -1) == laux::LuaType::Table {
+        let r = read_string_array(state, laux::lua_top(state), "conflict.update");
+        laux::lua_pop(state, 1);
+        Some(r?)
+    } else {
+        laux::lua_pop(state, 1);
+        None
+    };
+
+    match update_cols {
+        Some(cols) => {
+            clause.push_str(" DO UPDATE SET ");
+            for (i, c) in cols.iter().enumerate() {
+                if i > 0 {
+                    clause.push(',');
+                }
+                let q = quote_ident(c);
+                clause.push_str(&q);
+                clause.push_str("=EXCLUDED.");
+                clause.push_str(&q);
+            }
+        }
+        None => clause.push_str(" DO NOTHING"),
+    }
+
+    Ok(clause)
+}
+
+/// Parse the optional `conflict` argument of `insert_many` at stack `idx`.
+///
+/// * A **table** builds the clause from validated/quoted identifiers and is
+///   safe to construct from untrusted input (see [`build_conflict_from_table`]).
+/// * A **string** is treated as trusted, caller-authored SQL appended verbatim
+///   (only a defense-in-depth [`validate_conflict_clause`] check is applied) —
+///   do **not** build the string form from untrusted input.
+/// * `nil`/absent yields `None`; any other type is an error.
+fn parse_conflict(state: LuaState, idx: i32) -> Result<Option<String>, String> {
+    match laux::lua_type(state, idx) {
+        laux::LuaType::None | laux::LuaType::Nil => Ok(None),
+        laux::LuaType::Table => Ok(Some(build_conflict_from_table(state, idx)?)),
+        laux::LuaType::String => {
+            let cf = unsafe { laux::lua_check_str(state, idx) }.to_string();
+            validate_conflict_clause(&cf)?;
+            Ok(Some(cf))
+        }
+        _ => Err("conflict must be a table (recommended) or a string".to_string()),
     }
 }
 
@@ -1135,9 +1285,13 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let database_url = unsafe { laux::lua_check_str(state, 1) }.to_string();
     let name = unsafe { laux::lua_check_str(state, 2) }.to_string();
     let timeout_ms: u64 = laux::lua_opt(state, 3).unwrap_or(5000);
-    let max_connections: usize = laux::lua_opt(state, 4).unwrap_or(5);
+    let max_connections: usize =
+        laux::lua_opt(state, 4).unwrap_or(crate::LIMITS.db_pool_size as usize);
     let max_connections = max_connections.max(1);
-    let read_timeout_ms: u64 = laux::lua_opt(state, 5).unwrap_or(10_000);
+    let read_timeout_ms: u64 = laux::lua_opt(state, 5).unwrap_or(crate::LIMITS.db_read_timeout_ms);
+    let queue_capacity: usize =
+        laux::lua_opt(state, 6).unwrap_or(crate::LIMITS.request_queue_capacity);
+    let queue_capacity = queue_capacity.max(1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -1147,12 +1301,8 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
         let params = match ConnParams::parse(&database_url) {
             Ok(p) => p,
             Err(e) => {
-                let _ = CONTEXT.send_value(
-                    context::PTYPE_PG,
-                    owner,
-                    session,
-                    PgResponse::Config(e),
-                );
+                let _ =
+                    CONTEXT.send_value(context::PTYPE_PG, owner, session, PgResponse::Config(e));
                 return;
             }
         };
@@ -1171,8 +1321,8 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
         let mut workers = Vec::with_capacity(max_connections);
         let mut seed_conn = Some(first_conn);
         for _ in 0..max_connections {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let counter = Arc::new(AtomicI64::new(0));
+            let (tx, rx) = mpsc::channel(queue_capacity);
+            let counter = PendingCounter::new();
             CONTEXT.io_runtime().spawn(worker_loop(
                 name.clone(),
                 params.clone(),
@@ -1182,17 +1332,24 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
                 counter.clone(),
                 seed_conn.take(),
             ));
-            workers.push(PgWorker { tx, counter });
+            workers.push(WorkerHandle::new(tx, counter));
         }
 
         let pool = PgPool {
-            inner: Arc::new(PgPoolInner {
-                name: name.clone(),
-                workers,
-                next: AtomicUsize::new(0),
-            }),
+            inner: Arc::new(WorkerSet::new(name.clone(), workers)),
         };
-        PG_CONNECTIONS.insert(name, pool);
+        // Replacing an existing pool of the same name: shut down the previous
+        // pool's workers so their tasks/connections don't leak (the old workers
+        // drain their queued requests, then exit on `Shutdown`).
+        if let Some(old) = PG_CONNECTIONS.insert(name, pool) {
+            log::warn!(
+                "pg '{}' reconnected with the same name; shutting down the previous pool",
+                old.inner.name()
+            );
+            for w in old.inner.workers() {
+                let _ = w.tx().send(PgMessage::Shutdown).await;
+            }
+        }
         let _ = CONTEXT.send_value(context::PTYPE_PG, owner, session, PgResponse::Connect);
     });
 
@@ -1261,8 +1418,18 @@ fn dispatch_forget(state: LuaState, pool: &PgPool, data: Vec<u8>) -> c_int {
 }
 
 /// `handle:query(sql)` — simple query protocol (multi-statement).
-extern "C-unwind" fn query(state: LuaState) -> c_int { query_impl(state, false) }
-extern "C-unwind" fn exec_query(state: LuaState) -> c_int { query_impl(state, true) }
+///
+/// **Trust requirement:** `sql` is sent on the wire verbatim with no parameter
+/// binding (the simple-query protocol has no placeholders), so it is fully
+/// caller-controlled SQL. Never build it from untrusted input — use the
+/// extended-protocol helpers (`query_params`, `insert_many`, ...) with bound
+/// parameters for anything that includes user data.
+extern "C-unwind" fn query(state: LuaState) -> c_int {
+    query_impl(state, false)
+}
+extern "C-unwind" fn exec_query(state: LuaState) -> c_int {
+    query_impl(state, true)
+}
 
 fn query_impl(state: LuaState, forget: bool) -> c_int {
     let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
@@ -1274,12 +1441,20 @@ fn query_impl(state: LuaState, forget: bool) -> c_int {
     data.extend_from_slice(sql);
     data.push(0);
 
-    if forget { dispatch_forget(state, pool, data) } else { dispatch_async(state, pool, data) }
+    if forget {
+        dispatch_forget(state, pool, data)
+    } else {
+        dispatch_async(state, pool, data)
+    }
 }
 
 /// `handle:query_params(sql, ...)` — extended protocol with binds.
-extern "C-unwind" fn query_params(state: LuaState) -> c_int { query_params_impl(state, false) }
-extern "C-unwind" fn exec_query_params(state: LuaState) -> c_int { query_params_impl(state, true) }
+extern "C-unwind" fn query_params(state: LuaState) -> c_int {
+    query_params_impl(state, false)
+}
+extern "C-unwind" fn exec_query_params(state: LuaState) -> c_int {
+    query_params_impl(state, true)
+}
 
 fn query_params_impl(state: LuaState, forget: bool) -> c_int {
     let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
@@ -1297,12 +1472,20 @@ fn query_params_impl(state: LuaState, forget: bool) -> c_int {
     }
     append_sync(&mut data);
 
-    if forget { dispatch_forget(state, pool, data) } else { dispatch_async(state, pool, data) }
+    if forget {
+        dispatch_forget(state, pool, data)
+    } else {
+        dispatch_async(state, pool, data)
+    }
 }
 
 /// `handle:pipe({ {sql, p1, ...}, ... })` — pipelined transaction.
-extern "C-unwind" fn pipe(state: LuaState) -> c_int { pipe_impl(state, false) }
-extern "C-unwind" fn exec_pipe(state: LuaState) -> c_int { pipe_impl(state, true) }
+extern "C-unwind" fn pipe(state: LuaState) -> c_int {
+    pipe_impl(state, false)
+}
+extern "C-unwind" fn exec_pipe(state: LuaState) -> c_int {
+    pipe_impl(state, true)
+}
 
 fn pipe_impl(state: LuaState, forget: bool) -> c_int {
     let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
@@ -1353,7 +1536,11 @@ fn pipe_impl(state: LuaState, forget: bool) -> c_int {
     }
     append_sync(&mut data);
 
-    if forget { dispatch_forget(state, pool, data) } else { dispatch_async(state, pool, data) }
+    if forget {
+        dispatch_forget(state, pool, data)
+    } else {
+        dispatch_async(state, pool, data)
+    }
 }
 
 /// `handle:insert_many(session, table, columns, rows, conflict?)` — bulk
@@ -1362,13 +1549,25 @@ fn pipe_impl(state: LuaState, forget: bool) -> c_int {
 /// parameter limit and wrapped in a transaction when more than one chunk.
 ///
 /// `columns` is an array of column names; `rows` is an array of value arrays
-/// (each with one value per column). `conflict` is an optional clause appended
-/// verbatim, e.g. "ON CONFLICT (uid,key) DO UPDATE SET value = EXCLUDED.value".
+/// (each with one value per column). `conflict` is optional and may be either:
+///   * a **table** (recommended, injection-safe), e.g.
+///     `{ columns = {"uid","key"}, update = {"value"} }` →
+///     `ON CONFLICT ("uid","key") DO UPDATE SET "value"=EXCLUDED."value"`, or
+///     `{ constraint = "pk", }` → `ON CONFLICT ON CONSTRAINT "pk" DO NOTHING`;
+///   * a **string** (legacy, trusted SQL) appended verbatim, e.g.
+///     "ON CONFLICT (uid,key) DO UPDATE SET value = EXCLUDED.value" — it must
+///     begin with `ON CONFLICT` and may not contain `;`, `--`, or `/*`
+///     (`validate_conflict_clause`). Do not build the string form from
+///     untrusted input; use the table form instead.
 ///
 /// Note: a single multi-row UPSERT cannot touch the same conflict key twice —
 /// de-duplicate keys (keep the latest) before calling.
-extern "C-unwind" fn insert_many(state: LuaState) -> c_int { insert_many_impl(state, false) }
-extern "C-unwind" fn exec_insert_many(state: LuaState) -> c_int { insert_many_impl(state, true) }
+extern "C-unwind" fn insert_many(state: LuaState) -> c_int {
+    insert_many_impl(state, false)
+}
+extern "C-unwind" fn exec_insert_many(state: LuaState) -> c_int {
+    insert_many_impl(state, true)
+}
 
 fn insert_many_impl(state: LuaState, forget: bool) -> c_int {
     let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
@@ -1388,22 +1587,37 @@ fn insert_many_impl(state: LuaState, forget: bool) -> c_int {
         push_lua_table!(state, "code" => "ENCODE", "message" => "insert_many: rows is empty");
         return 1;
     }
-    let conflict: Option<String> = if laux::lua_type(state, 5) == laux::LuaType::String {
-        Some(unsafe { laux::lua_check_str(state, 5) }.to_string())
-    } else {
-        None
+    let conflict: Option<String> = match parse_conflict(state, 5) {
+        Ok(c) => c,
+        Err(e) => {
+            push_lua_table!(state, "code" => "ENCODE", "message" => format!("insert_many: {}", e));
+            return 1;
+        }
     };
 
     laux::lua_checkstack(state, 4, std::ptr::null());
     let options = JsonOptions::default();
     let mut data = Vec::with_capacity(128 + table.len() + nrows * columns.len() * 8);
-    let build = |tuple_count: usize| build_insert_sql(&table, &columns, tuple_count, conflict.as_deref());
-    if let Err(err) = encode_many(state, &mut data, rows_idx, nrows, columns.len(), &options, &build) {
+    let build =
+        |tuple_count: usize| build_insert_sql(&table, &columns, tuple_count, conflict.as_deref());
+    if let Err(err) = encode_many(
+        state,
+        &mut data,
+        rows_idx,
+        nrows,
+        columns.len(),
+        &options,
+        &build,
+    ) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
         return 1;
     }
 
-    if forget { dispatch_forget(state, pool, data) } else { dispatch_async(state, pool, data) }
+    if forget {
+        dispatch_forget(state, pool, data)
+    } else {
+        dispatch_async(state, pool, data)
+    }
 }
 
 /// `handle:update_many(session, table, key_column, set_columns, rows, key_type?)`
@@ -1414,8 +1628,12 @@ fn insert_many_impl(state: LuaState, forget: bool) -> c_int {
 /// `key_type` (e.g. "bigint") casts the join key param so the table's index on
 /// `key_column` stays usable; omit it and the key column is compared as text
 /// (works for any type, but no index).
-extern "C-unwind" fn update_many(state: LuaState) -> c_int { update_many_impl(state, false) }
-extern "C-unwind" fn exec_update_many(state: LuaState) -> c_int { update_many_impl(state, true) }
+extern "C-unwind" fn update_many(state: LuaState) -> c_int {
+    update_many_impl(state, false)
+}
+extern "C-unwind" fn exec_update_many(state: LuaState) -> c_int {
+    update_many_impl(state, true)
+}
 
 fn update_many_impl(state: LuaState, forget: bool) -> c_int {
     let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
@@ -1451,27 +1669,53 @@ fn update_many_impl(state: LuaState, forget: bool) -> c_int {
     let options = JsonOptions::default();
     let cols_per_tuple = 1 + set_cols.len();
     let mut data = Vec::with_capacity(128 + table.len() + nrows * cols_per_tuple * 8);
-    let build = |tuple_count: usize| build_update_sql(&table, &key, &set_cols, tuple_count, key_type.as_deref());
-    if let Err(err) = encode_many(state, &mut data, rows_idx, nrows, cols_per_tuple, &options, &build) {
+    let build = |tuple_count: usize| {
+        build_update_sql(&table, &key, &set_cols, tuple_count, key_type.as_deref())
+    };
+    if let Err(err) = encode_many(
+        state,
+        &mut data,
+        rows_idx,
+        nrows,
+        cols_per_tuple,
+        &options,
+        &build,
+    ) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
         return 1;
     }
 
-    if forget { dispatch_forget(state, pool, data) } else { dispatch_async(state, pool, data) }
+    if forget {
+        dispatch_forget(state, pool, data)
+    } else {
+        dispatch_async(state, pool, data)
+    }
 }
 
 extern "C-unwind" fn pool_len(state: LuaState) -> c_int {
     let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
-    let table = LuaTable::new(state, pool.inner.workers.len(), 0);
-    for w in &pool.inner.workers {
-        table.push(w.counter.load(Ordering::Acquire));
+    let table = LuaTable::new(state, pool.inner.workers().len(), 0);
+    for w in pool.inner.workers() {
+        table.push(w.counter().load());
     }
     1
 }
 
 extern "C-unwind" fn close(state: LuaState) -> c_int {
     let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
-    PG_CONNECTIONS.remove(&pool.inner.name);
+    // Only remove our own entry: if a `connect()` with the same name has already
+    // replaced this pool, closing through this (now stale) handle must not evict
+    // the newer pool. Identify ourselves by the `inner` Arc.
+    PG_CONNECTIONS.remove_if(pool.inner.name(), |_, v| Arc::ptr_eq(&v.inner, &pool.inner));
+    // Signal every worker to finish any queued requests and then exit, so its
+    // task ends and the TCP connection is dropped. Removing the registry entry
+    // alone is not enough because the Lua handle still holds a pool `Arc`.
+    for worker in pool.inner.workers() {
+        let tx = worker.tx().clone();
+        CONTEXT.io_runtime().spawn(async move {
+            let _ = tx.send(PgMessage::Shutdown).await;
+        });
+    }
     laux::lua_push(state, true);
     1
 }
@@ -1560,6 +1804,16 @@ fn push_statement_result(state: LuaState, stmt: &Statement) {
                 let mut offset = 2;
                 for ci in 0..ncols {
                     if offset + 4 > row.len() {
+                        // Truncated DataRow: the server response is shorter than
+                        // its own column count claims. Don't silently drop the
+                        // rest — log it so the malformed reply is diagnosable.
+                        log::warn!(
+                            "pg: truncated DataRow (row {}, got {}/{} columns, len {})",
+                            ri,
+                            ci,
+                            ncols,
+                            row.len()
+                        );
                         break;
                     }
                     let len = read_i32(row, offset);
@@ -1656,11 +1910,8 @@ fn push_db_error(state: LuaState, err: &DbError) {
     }
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> c_int {
-    laux::lua_checkstack(state, 8, std::ptr::null());
-    let response = lua_into_userdata::<PgResponse>(state, 1);
-
-    match *response {
+fn push_pg_response(state: LuaState, response: PgResponse) -> c_int {
+    match response {
         PgResponse::Connect => {
             // Empty table => no `.code`, signalling success to pg.lua.
             LuaTable::new(state, 0, 0);
@@ -1716,11 +1967,20 @@ extern "C-unwind" fn decode(state: LuaState) -> c_int {
     }
 }
 
+pub unsafe extern "C-unwind" fn decode_pg_message(
+    state: LuaState,
+    m: *mut moon_runtime::context::Message,
+) -> c_int {
+    match unsafe { crate::message_decode::take_boxed::<PgResponse>(m) } {
+        Ok(response) => push_pg_response(state, response),
+        Err(e) => crate::lua_push_error(state, &e),
+    }
+}
+
 pub extern "C-unwind" fn luaopen_pg(state: LuaState) -> c_int {
     let l = [
         lreg!("connect", connect),
         lreg!("find_connection", find_connection),
-        lreg!("decode", decode),
         lreg!("stats", stats),
         lreg_null!(),
     ];
@@ -1862,8 +2122,7 @@ mod scram {
                 return Err("Invalid state for preparing first message.".into());
             }
             self.client_nonce = generate_nonce(24);
-            self.client_first_message_bare =
-                format!("n={},r={}", self.username, self.client_nonce);
+            self.client_first_message_bare = format!("n={},r={}", self.username, self.client_nonce);
             self.state = State::FirstSent;
             Ok(self.client_first_message_bare.clone())
         }
@@ -1916,16 +2175,16 @@ mod scram {
                 }
             };
 
-            self.salted_password = pbkdf2_hmac_sha256_one_block(
-                self.password.as_bytes(),
-                &self.salt,
-                self.iterations,
-            );
+            self.salted_password =
+                pbkdf2_hmac_sha256_one_block(self.password.as_bytes(), &self.salt, self.iterations);
             self.client_key = hmac_sha256(&self.salted_password, b"Client Key");
-            self.stored_key.copy_from_slice(&Sha256::digest(self.client_key));
+            self.stored_key
+                .copy_from_slice(&Sha256::digest(self.client_key));
 
-            self.auth_message =
-                format!("{},{}", self.client_first_message_bare, server_first_message);
+            self.auth_message = format!(
+                "{},{}",
+                self.client_first_message_bare, server_first_message
+            );
             Ok(())
         }
 
@@ -1943,8 +2202,7 @@ mod scram {
                 self.auth_message, self.client_final_message_without_proof
             );
 
-            let client_signature =
-                hmac_sha256(&self.stored_key, full_auth_message.as_bytes());
+            let client_signature = hmac_sha256(&self.stored_key, full_auth_message.as_bytes());
             let mut client_proof = [0u8; SHA256_SIZE];
             for i in 0..SHA256_SIZE {
                 client_proof[i] = self.client_key[i] ^ client_signature[i];
@@ -1988,8 +2246,7 @@ mod scram {
                 "{},{}",
                 self.auth_message, self.client_final_message_without_proof
             );
-            let expected_server_signature =
-                hmac_sha256(&server_key, full_auth_message.as_bytes());
+            let expected_server_signature = hmac_sha256(&server_key, full_auth_message.as_bytes());
 
             if server_signature.as_slice() == expected_server_signature.as_slice() {
                 self.state = State::Authenticated;
@@ -2105,7 +2362,10 @@ mod tests {
 
     #[test]
     fn command_tag_parsing() {
-        assert_eq!(parse_command_tag(b"INSERT 0 5\0"), ("INSERT".into(), Some(5)));
+        assert_eq!(
+            parse_command_tag(b"INSERT 0 5\0"),
+            ("INSERT".into(), Some(5))
+        );
         assert_eq!(parse_command_tag(b"UPDATE 2\0"), ("UPDATE".into(), Some(2)));
         assert_eq!(parse_command_tag(b"SELECT 3\0"), ("SELECT".into(), Some(3)));
         assert_eq!(parse_command_tag(b"BEGIN\0"), ("BEGIN".into(), None));
@@ -2147,5 +2407,411 @@ mod tests {
         assert_eq!(n.pid, 42);
         assert_eq!(n.channel, "chan");
         assert_eq!(n.payload, "payload");
+    }
+
+    #[test]
+    fn conflict_clause_accepts_valid() {
+        assert!(
+            validate_conflict_clause("ON CONFLICT (uid,key) DO UPDATE SET value = EXCLUDED.value")
+                .is_ok()
+        );
+        // Case-insensitive prefix and surrounding whitespace are allowed.
+        assert!(validate_conflict_clause("  on conflict do nothing  ").is_ok());
+        assert!(validate_conflict_clause("ON CONFLICT ON CONSTRAINT pk DO NOTHING").is_ok());
+    }
+
+    #[test]
+    fn conflict_clause_rejects_bad_prefix() {
+        assert!(validate_conflict_clause("").is_err());
+        assert!(validate_conflict_clause("DO NOTHING").is_err());
+        assert!(validate_conflict_clause("ON CONF").is_err()); // shorter than prefix
+        // A whole injected statement that doesn't start with ON CONFLICT.
+        assert!(validate_conflict_clause("; DROP TABLE users").is_err());
+    }
+
+    #[test]
+    fn conflict_clause_rejects_injection_tokens() {
+        assert!(validate_conflict_clause("ON CONFLICT DO NOTHING; DROP TABLE users").is_err());
+        assert!(validate_conflict_clause("ON CONFLICT DO NOTHING -- comment").is_err());
+        assert!(validate_conflict_clause("ON CONFLICT DO NOTHING /* block */").is_err());
+    }
+
+    #[test]
+    fn build_insert_sql_numbers_placeholders_and_appends_conflict() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let sql = build_insert_sql("t", &cols, 2, None);
+        assert_eq!(
+            sql,
+            "INSERT INTO \"t\" (\"a\",\"b\") VALUES ($1,$2),($3,$4)"
+        );
+
+        let sql = build_insert_sql("t", &cols, 1, Some("ON CONFLICT DO NOTHING"));
+        assert_eq!(
+            sql,
+            "INSERT INTO \"t\" (\"a\",\"b\") VALUES ($1,$2) ON CONFLICT DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn quote_ident_escapes_double_quotes() {
+        assert_eq!(quote_ident("col"), "\"col\"");
+        assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
+    }
+
+    // -- quote_ident edge cases -----------------------------------------------
+
+    #[test]
+    fn quote_ident_empty_string() {
+        assert_eq!(quote_ident(""), "\"\"");
+    }
+
+    #[test]
+    fn quote_ident_multiple_double_quotes() {
+        assert_eq!(quote_ident("a\"b\"c"), "\"a\"\"b\"\"c\"");
+    }
+
+    #[test]
+    fn quote_ident_special_chars() {
+        assert_eq!(quote_ident("my col"), "\"my col\"");
+        assert_eq!(quote_ident("table-name"), "\"table-name\"");
+    }
+
+    // -- validate_type_name ---------------------------------------------------
+
+    #[test]
+    fn validate_type_name_valid() {
+        assert!(validate_type_name("bigint").is_ok());
+        assert!(validate_type_name("character varying").is_ok());
+        assert!(validate_type_name("integer[]").is_ok());
+        assert!(validate_type_name("text").is_ok());
+        assert!(validate_type_name("double_precision").is_ok());
+    }
+
+    #[test]
+    fn validate_type_name_rejects_empty() {
+        assert!(validate_type_name("").is_err());
+    }
+
+    #[test]
+    fn validate_type_name_rejects_injection() {
+        assert!(validate_type_name("int; DROP TABLE").is_err());
+        assert!(validate_type_name("int--comment").is_err());
+        assert!(validate_type_name("int'").is_err());
+    }
+
+    // -- build_update_sql -----------------------------------------------------
+
+    #[test]
+    fn build_update_sql_single_row_with_key_type() {
+        let set_cols = vec!["name".to_string(), "value".to_string()];
+        let sql = build_update_sql("items", "id", &set_cols, 1, Some("bigint"));
+        assert_eq!(
+            sql,
+            "UPDATE \"items\" AS _t SET \"name\" = _d.\"name\", \"value\" = _d.\"value\" \
+             FROM (VALUES ($1,$2,$3)) AS _d(_k, \"name\", \"value\") \
+             WHERE _t.\"id\" = _d._k::bigint"
+        );
+    }
+
+    #[test]
+    fn build_update_sql_multi_row_without_key_type() {
+        let set_cols = vec!["score".to_string()];
+        let sql = build_update_sql("players", "uid", &set_cols, 3, None);
+        assert_eq!(
+            sql,
+            "UPDATE \"players\" AS _t SET \"score\" = _d.\"score\" \
+             FROM (VALUES ($1,$2),($3,$4),($5,$6)) AS _d(_k, \"score\") \
+             WHERE _t.\"uid\"::text = _d._k"
+        );
+    }
+
+    #[test]
+    fn build_update_sql_quoted_identifiers() {
+        let set_cols = vec!["col\"x".to_string()];
+        let sql = build_update_sql("my\"table", "k\"ey", &set_cols, 1, None);
+        assert!(sql.contains("\"my\"\"table\""));
+        assert!(sql.contains("\"k\"\"ey\""));
+        assert!(sql.contains("\"col\"\"x\""));
+    }
+
+    // -- build_insert_sql edge cases ------------------------------------------
+
+    #[test]
+    fn build_insert_sql_single_column_single_row() {
+        let cols = vec!["x".to_string()];
+        let sql = build_insert_sql("t", &cols, 1, None);
+        assert_eq!(sql, "INSERT INTO \"t\" (\"x\") VALUES ($1)");
+    }
+
+    #[test]
+    fn build_insert_sql_many_rows() {
+        let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let sql = build_insert_sql("t", &cols, 3, None);
+        assert_eq!(
+            sql,
+            "INSERT INTO \"t\" (\"a\",\"b\",\"c\") VALUES ($1,$2,$3),($4,$5,$6),($7,$8,$9)"
+        );
+    }
+
+    // -- parse_command_tag additional cases ------------------------------------
+
+    #[test]
+    fn command_tag_delete() {
+        assert_eq!(
+            parse_command_tag(b"DELETE 10\0"),
+            ("DELETE".into(), Some(10))
+        );
+    }
+
+    #[test]
+    fn command_tag_create_table() {
+        assert_eq!(
+            parse_command_tag(b"CREATE TABLE\0"),
+            ("CREATE".into(), None)
+        );
+    }
+
+    #[test]
+    fn command_tag_copy() {
+        assert_eq!(parse_command_tag(b"COPY 100\0"), ("COPY".into(), Some(100)));
+    }
+
+    #[test]
+    fn command_tag_no_null_terminator() {
+        let (cmd, rows) = parse_command_tag(b"UPDATE 5");
+        assert_eq!(cmd, "UPDATE");
+        assert_eq!(rows, Some(5));
+    }
+
+    // -- parse_error additional fields ----------------------------------------
+
+    #[test]
+    fn error_response_all_fields() {
+        let body = b"SERROR\0C42P01\0Mtable not found\0P15\0Dmore info\0sfoo_schema\0tbar_table\0nmy_constraint\0\0";
+        let err = parse_error(body);
+        assert_eq!(err.severity.as_deref(), Some("ERROR"));
+        assert_eq!(err.code.as_deref(), Some("42P01"));
+        assert_eq!(err.message.as_deref(), Some("table not found"));
+        assert_eq!(err.position.as_deref(), Some("15"));
+        assert_eq!(err.detail.as_deref(), Some("more info"));
+        assert_eq!(err.schema.as_deref(), Some("foo_schema"));
+        assert_eq!(err.table.as_deref(), Some("bar_table"));
+        assert_eq!(err.constraint.as_deref(), Some("my_constraint"));
+    }
+
+    #[test]
+    fn error_response_empty_body() {
+        let err = parse_error(b"\0");
+        assert!(err.severity.is_none());
+        assert!(err.code.is_none());
+        assert!(err.message.is_none());
+    }
+
+    #[test]
+    fn parse_error_string_missing_message_field() {
+        let body = b"SERROR\0C12345\0\0"; // no M field
+        assert_eq!(parse_error_string(body), "unknown database error");
+    }
+
+    // -- parse_notification edge cases ----------------------------------------
+
+    #[test]
+    fn notification_empty_payload() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1i32.to_be_bytes());
+        body.extend_from_slice(b"test_channel\0\0");
+        let n = parse_notification(&body).unwrap();
+        assert_eq!(n.pid, 1);
+        assert_eq!(n.channel, "test_channel");
+        assert_eq!(n.payload, "");
+    }
+
+    #[test]
+    fn notification_too_short() {
+        assert!(parse_notification(b"abc").is_none()); // < 5 bytes
+    }
+
+    #[test]
+    fn notification_with_unicode() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&99i32.to_be_bytes());
+        body.extend_from_slice("日本語\0メッセージ\0".as_bytes());
+        let n = parse_notification(&body).unwrap();
+        assert_eq!(n.pid, 99);
+        assert_eq!(n.channel, "日本語");
+        assert_eq!(n.payload, "メッセージ");
+    }
+
+    // -- parse_row_desc edge cases --------------------------------------------
+
+    #[test]
+    fn row_description_multiple_fields() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_be_bytes()); // 2 fields
+        // Field 1: "name", OID 25 (text)
+        body.extend_from_slice(b"name\0");
+        body.extend_from_slice(&0i32.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&25i32.to_be_bytes());
+        body.extend_from_slice(&(-1i16).to_be_bytes());
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+        // Field 2: "age", OID 23 (int4)
+        body.extend_from_slice(b"age\0");
+        body.extend_from_slice(&0i32.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&23i32.to_be_bytes());
+        body.extend_from_slice(&4i16.to_be_bytes());
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+
+        let fields = parse_row_desc(&body);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0], ("name".to_string(), 25));
+        assert_eq!(fields[1], ("age".to_string(), 23));
+    }
+
+    #[test]
+    fn row_description_empty() {
+        assert!(parse_row_desc(b"").is_empty());
+        assert!(parse_row_desc(b"\x00").is_empty()); // < 2 bytes
+    }
+
+    #[test]
+    fn row_description_zero_fields() {
+        let body = 0u16.to_be_bytes();
+        let fields = parse_row_desc(&body);
+        assert!(fields.is_empty());
+    }
+
+    // -- parse_url edge cases -------------------------------------------------
+
+    #[test]
+    fn parse_url_ipv6_host() {
+        let p = ConnParams::parse("postgres://user:pass@[::1]:5433/mydb").unwrap();
+        assert_eq!(p.host, "[::1]");
+        assert_eq!(p.port, 5433);
+    }
+
+    #[test]
+    fn parse_url_default_host() {
+        let p = ConnParams::parse("postgres://user:pass@/mydb");
+        // URL parsing with empty host may vary; should not panic
+        assert!(p.is_ok() || p.is_err());
+    }
+
+    // -- start_message / end_message ------------------------------------------
+
+    #[test]
+    fn start_end_message_encodes_length_correctly() {
+        let mut buf = Vec::new();
+        let stub = start_message(&mut buf, b'Q');
+        buf.extend_from_slice(b"SELECT 1\0");
+        end_message(&mut buf, stub);
+        // msg_type + 4 bytes length + payload
+        assert_eq!(buf[0], b'Q');
+        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        // length includes itself (4 bytes) + "SELECT 1\0" (9 bytes) = 13
+        assert_eq!(len, 13);
+    }
+
+    #[test]
+    fn append_sync_produces_5_bytes() {
+        let mut buf = Vec::new();
+        append_sync(&mut buf);
+        assert_eq!(buf.len(), 5); // 'S' + 4-byte length(4)
+        assert_eq!(buf[0], PQ_SYNC);
+        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        assert_eq!(len, 4);
+    }
+
+    #[test]
+    fn append_parse_unnamed_format() {
+        let mut buf = Vec::new();
+        append_parse_unnamed(&mut buf, b"SELECT $1");
+        assert_eq!(buf[0], PQ_PARSE);
+        // Body: length(4) + "" NUL (1) + "SELECT $1" NUL (10) + 0u16 (2) = 17
+        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        assert_eq!(len, 17);
+        // stmt name = empty string + NUL
+        assert_eq!(buf[5], 0); // empty statement name
+        // query starts at 6
+        assert_eq!(&buf[6..15], b"SELECT $1");
+        assert_eq!(buf[15], 0); // query NUL terminator
+    }
+
+    // -- md5_hex additional ---------------------------------------------------
+
+    #[test]
+    fn md5_hex_hello_world() {
+        assert_eq!(md5_hex(b"hello"), "5d41402abc4b2a76b9719d911017c592");
+    }
+
+    // -- conflict_clause edge cases -------------------------------------------
+
+    #[test]
+    fn conflict_clause_case_variations() {
+        assert!(validate_conflict_clause("On Conflict DO NOTHING").is_ok());
+        assert!(validate_conflict_clause("on conflict do nothing").is_ok());
+    }
+
+    #[test]
+    fn conflict_clause_rejects_block_comment_at_end() {
+        assert!(validate_conflict_clause("ON CONFLICT DO NOTHING /**/").is_err());
+    }
+
+    // -- write_cstr -----------------------------------------------------------
+
+    #[test]
+    fn write_cstr_appends_nul() {
+        let mut buf = Vec::new();
+        write_cstr(&mut buf, b"hello");
+        assert_eq!(buf, b"hello\0");
+    }
+
+    #[test]
+    fn write_cstr_empty() {
+        let mut buf = Vec::new();
+        write_cstr(&mut buf, b"");
+        assert_eq!(buf, b"\0");
+    }
+
+    // -- read_i32 / read_u16 --------------------------------------------------
+
+    #[test]
+    fn read_i32_big_endian() {
+        let buf = [0x00, 0x01, 0x00, 0x00];
+        assert_eq!(read_i32(&buf, 0), 65536);
+    }
+
+    #[test]
+    fn read_i32_negative() {
+        let buf = (-1i32).to_be_bytes();
+        assert_eq!(read_i32(&buf, 0), -1);
+    }
+
+    #[test]
+    fn read_u16_big_endian() {
+        let buf = [0x01, 0x00];
+        assert_eq!(read_u16(&buf, 0), 256);
+    }
+
+    // -- percent_decode -------------------------------------------------------
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("100%25"), "100%");
+        assert_eq!(percent_decode("no_encoding"), "no_encoding");
+    }
+
+    #[test]
+    fn percent_decode_empty() {
+        assert_eq!(percent_decode(""), "");
+    }
+
+    #[test]
+    fn percent_decode_special_chars() {
+        assert_eq!(percent_decode("%40%2F%3A"), "@/:");
     }
 }

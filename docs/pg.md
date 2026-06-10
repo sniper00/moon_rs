@@ -14,7 +14,7 @@ High-performance native PostgreSQL driver implementing the v3 wire protocol in R
 │    → send request via mpsc channel                          │
 │    → moon.wait(session) — coroutine yields                  │
 │                                                             │
-│  PTYPE_PG message arrives → c.decode(raw_bytes)             │
+│  PTYPE_PG message arrives → moon.core.decode_message(m)     │
 │    → parse DataRow/CommandComplete into Lua tables           │
 │    → coroutine resumes with result                          │
 └─────────────┬───────────────────────────────────────────────┘
@@ -150,7 +150,8 @@ Options: `connect_timeout`, `application_name`, `sslmode` (not yet implemented).
 |-----------|---------|-------------|
 | `timeout` | 5000ms | Connect timeout |
 | `max_connections` | 5 | Pool size (worker count) |
-| `read_timeout` | max(timeout, 30000)ms | Response read timeout |
+| `read_timeout` | 10000ms | Response read timeout |
+| `queue_capacity` | 1024 | Per-worker bounded request queue capacity |
 
 ## Wire Protocol Details
 

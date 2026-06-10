@@ -1,18 +1,18 @@
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use moon_runtime::{
-    actor::LuaActor,
-    context::{self, ActorId, CONTEXT},
-};
 use moon_lua::{
     self, cstr,
     ffi::{self},
     laux::{self, LuaState, LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib
+    lreg, lreg_null, luaL_newlib,
+};
+use moon_runtime::{
+    actor::LuaActor,
+    context::{self, ActorId, CONTEXT},
 };
 use percent_encoding::percent_decode;
 use reqwest::ClientBuilder;
-use reqwest::{header::HeaderMap, Method, Version};
+use reqwest::{Method, Version, header::HeaderMap};
 use std::{error::Error, ffi::c_int, str::FromStr, time::Duration};
 use url::form_urlencoded::{self};
 
@@ -25,7 +25,7 @@ struct HttpRequest {
     session: i64,
     method: String,
     url: String,
-    body: String,
+    body: Vec<u8>,
     headers: HeaderMap,
     timeout: u64,
     proxy: String,
@@ -38,32 +38,36 @@ struct HttpResponse {
     body: bytes::Bytes,
 }
 
-pub fn get_http_client(timeout: u64, proxy: &String) -> reqwest::Client {
-    let name = format!("{}_{}", timeout, proxy);
-    if let Some(client) = HTTP_CLIENTS.get(&name) {
-        return client.clone();
+/// Returns a cached `reqwest::Client` for the given proxy.
+///
+/// Clients are keyed by **proxy only** — the proxy is the sole setting baked into
+/// the client at build time. The per-call timeout is *not* part of the key; it is
+/// applied on the `RequestBuilder` in `http_request` instead. As a result every
+/// request sharing a proxy reuses a single connection pool regardless of its
+/// individual timeout, and the cache is bounded by the number of distinct proxies
+/// (typically just one, the empty/no-proxy case) rather than growing with every
+/// distinct timeout value.
+pub fn get_http_client(proxy: &str) -> Result<reqwest::Client, Box<dyn Error>> {
+    if let Some(client) = HTTP_CLIENTS.get(proxy) {
+        return Ok(client.clone());
     }
 
-    if timeout > 100000 {
-        log::warn!("http client timeout {}ms is too long", timeout);
-    }
+    let builder = ClientBuilder::new().use_rustls_tls().tcp_nodelay(true);
 
-    let builder = ClientBuilder::new()
-        .timeout(Duration::from_millis(timeout))
-        .use_rustls_tls()
-        .tcp_nodelay(true);
-
+    // Surface invalid proxy / TLS-builder configuration to the caller instead
+    // of panicking or silently falling back to a default client.
     let client = if proxy.is_empty() {
-        builder.build().unwrap_or_default()
+        builder.build()?
     } else {
-        builder
-            .proxy(reqwest::Proxy::all(proxy).unwrap())
-            .build()
-            .unwrap_or_default()
+        let parsed = reqwest::Proxy::all(proxy)
+            .map_err(|e| format!("invalid http proxy '{}': {}", proxy, e))?;
+        builder.proxy(parsed).build()?
     };
 
-    HTTP_CLIENTS.insert(name.to_string(), client.clone());
-    client
+    // A concurrent builder for the same proxy may race us here; last write wins
+    // and the redundant client is simply dropped (its pool is never used).
+    HTTP_CLIENTS.insert(proxy.to_string(), client.clone());
+    Ok(client)
 }
 
 fn version_to_string(version: &reqwest::Version) -> &str {
@@ -77,25 +81,61 @@ fn version_to_string(version: &reqwest::Version) -> &str {
     }
 }
 
+/// Read a response body into memory, refusing to buffer more than
+/// `crate::LIMITS.network_read_bytes` bytes. The advertised `Content-Length` (when
+/// present) is rejected up-front; the streamed total is also enforced because
+/// the header may be absent or untruthful (e.g. chunked transfer).
+async fn read_body_capped(mut response: reqwest::Response) -> Result<bytes::Bytes, Box<dyn Error>> {
+    let limit = crate::LIMITS.network_read_bytes;
+    if let Some(len) = response.content_length() {
+        if len > limit as u64 {
+            return Err(format!(
+                "http response body too large: {} bytes (limit {})",
+                len, limit
+            )
+            .into());
+        }
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if buf.len() + chunk.len() > limit {
+            return Err(format!("http response body exceeds limit of {} bytes", limit).into());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(bytes::Bytes::from(buf))
+}
+
 async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
-    let http_client = &get_http_client(req.timeout, &req.proxy);
+    let http_client = get_http_client(&req.proxy)?;
+
+    if req.timeout > crate::LIMITS.http_client_timeout_ms {
+        log::warn!("http request timeout {}ms is too long", req.timeout);
+    }
 
     let response = http_client
         .request(Method::from_str(req.method.as_str())?, req.url)
         .headers(req.headers)
+        .timeout(Duration::from_millis(req.timeout))
         .body(req.body)
         .send()
         .await?;
+
+    let version = response.version();
+    let status_code = response.status().as_u16() as i32;
+    let headers = response.headers().clone();
+    let body = read_body_capped(response).await?;
 
     let _ = CONTEXT.send_value(
         context::PTYPE_HTTPC,
         req.id,
         req.session,
         HttpResponse {
-        version: response.version(),
-        status_code: response.status().as_u16() as i32,
-        headers: response.headers().clone(),
-        body: response.bytes().await?,
+            version,
+            status_code,
+            headers,
+            body,
         },
     );
 
@@ -151,12 +191,30 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
     let id = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
+    // Read the (optional) request body as raw bytes so binary payloads are
+    // preserved, and cap it so a single request can't buffer an unbounded
+    // amount of memory before it is even sent.
+    let body: Vec<u8> = match laux::opt_field::<&[u8]>(state, 1, "body") {
+        Some(b) if b.len() > crate::LIMITS.network_read_bytes => {
+            return crate::lua_push_error(
+                state,
+                &format!(
+                    "http request body too large: {} bytes (max {})",
+                    b.len(),
+                    crate::LIMITS.network_read_bytes
+                ),
+            );
+        }
+        Some(b) => b.to_vec(),
+        None => Vec::new(),
+    };
+
     let req = HttpRequest {
         id,
         session,
         method: laux::opt_field(state, 1, "method").unwrap_or("GET".to_string()),
         url: laux::opt_field(state, 1, "url").unwrap_or_default(),
-        body: laux::opt_field(state, 1, "body").unwrap_or_default(),
+        body,
         headers,
         timeout: laux::opt_field(state, 1, "timeout").unwrap_or(5000),
         proxy: laux::opt_field(state, 1, "proxy").unwrap_or_default(),
@@ -169,10 +227,10 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
                 id,
                 session,
                 HttpResponse {
-                version: Version::HTTP_11,
-                status_code: -1,
-                headers: HeaderMap::new(),
-                body: err.to_string().into(),
+                    version: Version::HTTP_11,
+                    status_code: -1,
+                    headers: HeaderMap::new(),
+                    body: err.to_string().into(),
                 },
             );
         }
@@ -182,11 +240,7 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
     1
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::lua_checkstack(state, 4, std::ptr::null());
-    let p_as_isize: isize = laux::lua_get(state, 1);
-    let response = unsafe { Box::from_raw(p_as_isize as *mut HttpResponse) };
-
+fn push_http_response(state: LuaState, response: HttpResponse) -> i32 {
     LuaTable::new(state, 0, 6)
         .insert("version", version_to_string(&response.version))
         .insert("status_code", response.status_code)
@@ -326,19 +380,24 @@ extern "C-unwind" fn lua_http_parse_request(state: LuaState) -> c_int {
                 });
             1
         }
-        Ok(httparse::Status::Partial) => {
-            crate::lua_push_error(state, "Incomplete request")
-        }
-        Err(err) => {
-            crate::lua_push_error(state, &err.to_string())
-        }
+        Ok(httparse::Status::Partial) => crate::lua_push_error(state, "Incomplete request"),
+        Err(err) => crate::lua_push_error(state, &err.to_string()),
+    }
+}
+
+pub unsafe extern "C-unwind" fn decode_httpc_message(
+    state: LuaState,
+    m: *mut moon_runtime::context::Message,
+) -> c_int {
+    match unsafe { crate::message_decode::take_boxed::<HttpResponse>(m) } {
+        Ok(response) => push_http_response(state, response),
+        Err(e) => crate::lua_push_error(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_httpc(state: LuaState) -> c_int {
     let l = [
         lreg!("request", lua_http_request),
-        lreg!("decode", decode),
         lreg!("form_urlencode", lua_http_form_urlencode),
         lreg!("form_urldecode", lua_http_form_urldecode),
         lreg!("parse_response", lua_http_parse_response),

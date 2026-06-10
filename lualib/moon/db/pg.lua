@@ -15,9 +15,6 @@ moon.register_protocol {
     name = "pg",
     PTYPE = moon.PTYPE_PG,
     pack = function(...) return ... end,
-    unpack = function(val)
-        return c.decode(val)
-    end
 }
 
 ---@class pg_result
@@ -26,6 +23,15 @@ moon.register_protocol {
 ---@field public data? table @ rows / aggregated results
 ---@field public num_queries? integer
 ---@field public notifications? table
+
+---Structured, injection-safe `ON CONFLICT` specification for `insert_many`.
+---All identifiers are quoted by the native layer. Provide at most one of
+---`columns`/`constraint`; provide `update` for `DO UPDATE SET`, omit for
+---`DO NOTHING`.
+---@class pg_conflict
+---@field public columns? string[] @ conflict-target columns, e.g. { "uid", "key" }
+---@field public constraint? string @ conflict-target constraint name (alternative to columns)
+---@field public update? string[] @ columns to set from EXCLUDED; omit/empty => DO NOTHING
 
 ---@class pg
 local M = {}
@@ -47,10 +53,12 @@ end
 ---@param name string Connection name for lookup by other services
 ---@param timeout? integer Connect timeout in milliseconds (default 5000)
 ---@param max_connections? integer Pool size (default 5)
----@param read_timeout? integer Read timeout in milliseconds (default max(timeout, 30000))
+---@param read_timeout? integer Read timeout in milliseconds (default 10000)
+---@param queue_capacity? integer Per-worker request queue capacity (default 1024)
 ---@return pg|pg_result @ connection object, or an error table (check `.code`)
-function M.connect(database_url, name, timeout, max_connections, read_timeout)
-    local res = moon.wait(c.connect(database_url, name, timeout, max_connections, read_timeout))
+function M.connect(database_url, name, timeout, max_connections, read_timeout, queue_capacity)
+    ---@diagnostic disable-next-line: redundant-parameter
+    local res = moon.wait(c.connect(database_url, name, timeout, max_connections, read_timeout, queue_capacity))
     if res.code then
         return res
     end
@@ -74,9 +82,18 @@ end
 M.disconnect = M.close
 
 ---Simple query protocol; `sql` may contain multiple `;`-separated statements.
+---
+---**Trust requirement:** `sql` is sent on the wire verbatim with no parameter
+---binding (the simple-query protocol has no placeholders), so it is fully
+---caller-controlled SQL. Never build it from untrusted input — use `query_params`
+---(or `insert_many`/`update_many`) with bound `$1, $2, ...` parameters for
+---anything that includes user data.
+---
+---**Result cap:** the reply is buffered in memory and the call fails if it
+---returns more than 100,000 rows. Paginate large reads with `LIMIT`/`OFFSET`.
 ---@async
 ---@nodiscard
----@param sql string
+---@param sql string trusted, statically-known SQL (no parameter binding)
 ---@return pg_result
 function M:query(sql)
     local res = self.obj:query(sql)
@@ -87,7 +104,10 @@ function M:query(sql)
 end
 
 ---Fire-and-forget simple query (no response awaited).
----@param sql string
+---
+---**Trust requirement:** like `query`, `sql` is sent verbatim with no binding —
+---never build it from untrusted input; use `execute_params` for user data.
+---@param sql string trusted, statically-known SQL (no parameter binding)
 function M:execute(sql)
     local res = self.obj:exec_query(sql)
     if type(res) == "table" then
@@ -148,12 +168,22 @@ end
 ---
 ---Note: a single multi-row UPSERT cannot touch the same conflict key twice —
 ---de-duplicate keys (keep the latest) before calling.
+---
+---**Conflict handling:** row *values* are always bound as parameters and safe
+---for user data. For the `ON CONFLICT` clause prefer the **table form**, which
+---is built from quoted identifiers and is safe even with untrusted input:
+---  `{ columns = {"uid","key"}, update = {"value"} }`
+---  → `ON CONFLICT ("uid","key") DO UPDATE SET "value"=EXCLUDED."value"`
+---  `{ constraint = "pk" }` → `ON CONFLICT ON CONSTRAINT "pk" DO NOTHING`
+---A **string** `conflict` is still accepted but is appended verbatim as trusted,
+---caller-controlled SQL (only a defense-in-depth `ON CONFLICT` prefix / no
+---`;`,`--`,`/*` check); never build the string form from untrusted input.
 ---@async
 ---@nodiscard
 ---@param table_name string e.g. "userdata"
 ---@param columns string[] column names, e.g. { "uid", "key", "value" }
 ---@param rows table @ array of value arrays (one value per column)
----@param conflict? string e.g. "ON CONFLICT (uid,key) DO UPDATE SET value = EXCLUDED.value"
+---@param conflict? pg_conflict|string table form (safe) or trusted "ON CONFLICT ..." string
 ---@return pg_result
 function M:insert_many(table_name, columns, rows, conflict)
     local res = self.obj:insert_many(table_name, columns, rows, conflict)
@@ -163,7 +193,9 @@ function M:insert_many(table_name, columns, rows, conflict)
     return moon.wait(res)
 end
 
----Fire-and-forget bulk INSERT/UPSERT.
+---Fire-and-forget bulk INSERT/UPSERT. Same `conflict` rules as `insert_many`
+---(prefer the safe table form; the string form is trusted, verbatim SQL).
+---@param conflict? pg_conflict|string table form (safe) or trusted "ON CONFLICT ..." string
 function M:execute_insert_many(table_name, columns, rows, conflict)
     local res = self.obj:exec_insert_many(table_name, columns, rows, conflict)
     if type(res) == "table" then

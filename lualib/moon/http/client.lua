@@ -6,9 +6,6 @@ moon.register_protocol {
     name = "http",
     PTYPE = moon.PTYPE_HTTPC,
     pack = function(...) return ... end,
-    unpack =  function (val)
-        return core.decode(val)
-    end,
 }
 
 ---@return table

@@ -1,8 +1,12 @@
 #![allow(clippy::collapsible_if)]
 
+use moon_lua::{
+    cstr, ffi,
+    laux::{self, LuaState},
+};
 use std::ffi::c_int;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, Ordering};
-use moon_lua::{cstr, ffi, laux::{self, LuaState}};
 
 /// Stack-allocated byte buffer. `data[0]` stores the length, `data[1..]` stores
 /// the content (string or binary). Max capacity is N-1 bytes. No heap allocation.
@@ -39,31 +43,136 @@ impl<const N: usize> ShortBytes<N> {
 }
 
 mod lua_buffer;
+#[cfg(feature = "cluster")]
+mod lua_cluster;
+pub mod lua_coroutine;
 #[cfg(feature = "excel")]
 mod lua_excel;
 mod lua_fs;
 #[cfg(feature = "httpc")]
 mod lua_httpc;
-mod lua_seri;
-mod lua_socket;
-mod lua_utils;
-#[cfg(feature = "sqlx")]
-mod lua_sqlx;
+#[cfg(feature = "httpd")]
+mod lua_httpd;
 #[cfg(feature = "mongodb")]
 mod lua_mongodb;
 #[cfg(feature = "pg")]
 mod lua_pg;
+mod lua_random;
 #[cfg(feature = "redis")]
 mod lua_redis;
+mod lua_seri;
+mod lua_socket;
+#[cfg(feature = "sqlx")]
+mod lua_sqlx;
+mod lua_utils;
 #[cfg(feature = "websocket")]
 mod lua_websocket;
-#[cfg(feature = "httpd")]
-mod lua_httpd;
-#[cfg(feature = "cluster")]
-mod lua_cluster;
+mod message_decode;
+mod request_pool;
 
-pub mod lua_json;
 pub mod lua_actor;
+pub mod lua_json;
+
+/// Shared hardening limits used by native modules.
+///
+/// Keeping these defaults in one place makes it visible when HTTP, WebSocket,
+/// socket, cluster, and database modules share the same resource ceilings.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// Hard ceiling on bytes a single network-facing operation may read or
+    /// accumulate in memory. Used by sockets and HTTP client/server paths to
+    /// bound attacker-controlled `Content-Length`, frame, or read sizes.
+    pub network_read_bytes: usize,
+    /// Default maximum number of simultaneously accepted inbound connections
+    /// per listener. Shared by TCP socket, HTTP server, and WebSocket listeners;
+    /// callers may still override it through `max_connections`.
+    pub listener_connections: usize,
+    /// Maximum rows/documents a single non-streaming DB query may materialize.
+    /// Large result sets should use streaming APIs so one request cannot buffer
+    /// unbounded SQL rows or MongoDB documents.
+    pub db_query_rows: usize,
+    /// Default batch size for streaming DB cursors. Kept lower than
+    /// `db_query_rows` so each cursor response has a predictable per-message
+    /// memory footprint while still allowing callers to tune it per request.
+    pub db_stream_batch_rows: i64,
+    /// Default bounded request queue capacity for async DB/worker pools. This is
+    /// the backpressure limit for Redis, PG, sqlx, and MongoDB handlers before
+    /// enqueue starts failing instead of growing memory without bound.
+    pub request_queue_capacity: usize,
+    /// Default maximum bytes accumulated by socket `read_until` when the caller
+    /// does not provide an explicit limit. This protects delimiter reads from
+    /// scanning forever or buffering unbounded input.
+    pub socket_read_until_bytes: usize,
+    /// Maximum total bytes accepted by one socket write batch. Lua can pass many
+    /// buffers at once, so this bounds the transient aggregation before the IO
+    /// task writes to the network.
+    pub socket_write_batch_bytes: usize,
+    /// Capacity of outbound network writer queues. Shared by socket and cluster
+    /// writers to bound pending writes when a peer or remote node is slow.
+    pub network_write_queue_capacity: usize,
+    /// Maximum HTTP client timeout accepted from Lua, in milliseconds. Prevents
+    /// accidental or malicious requests from pinning client tasks for excessive
+    /// durations.
+    pub http_client_timeout_ms: u64,
+    /// Maximum payload size for one cluster frame. Cluster peers are trusted more
+    /// than public clients, but frame length still comes from the wire and must
+    /// have a hard allocation cap.
+    pub cluster_frame_bytes: usize,
+    /// Default maximum request/response body size for the HTTP server helpers.
+    /// This is separate from `network_read_bytes` so HTTP server policy can stay
+    /// conservative while the global network ceiling remains a hard stop.
+    pub http_body_bytes: usize,
+    /// Static files larger than this threshold are streamed instead of read into
+    /// memory at once. Small files are served directly for simplicity; large
+    /// files avoid a single allocation proportional to file size.
+    pub http_static_stream_threshold_bytes: u64,
+    /// Time-to-live for cached static-file metadata. The cache avoids repeated
+    /// filesystem metadata lookups while keeping changes visible quickly.
+    pub http_static_cache_ttl_secs: u64,
+    /// Maximum entries in the HTTP static-file metadata cache. Prevents a wide
+    /// set of requested paths from growing the cache indefinitely.
+    pub http_static_cache_entries: usize,
+    /// Maximum wire message size accepted from DB protocols. Used by Redis RESP
+    /// and PostgreSQL protocol decoders to cap allocation from server-provided
+    /// message lengths before parsing rows, arrays, or protocol errors.
+    pub db_wire_message_bytes: usize,
+    /// Maximum RESP array item count accepted from Redis. Protects nested array
+    /// decoding from allocating a huge vector based on a wire-provided count.
+    pub redis_array_items: usize,
+    /// Default DB pool size for modules that expose `max_connections`. Redis has
+    /// its own historical default, but PG/sqlx use this shared baseline.
+    pub db_pool_size: u32,
+    /// Default read/query timeout for DB protocols, in milliseconds. Used where
+    /// the module has a protocol-level read timeout separate from connect time.
+    pub db_read_timeout_ms: u64,
+}
+
+impl Limits {
+    pub const fn new() -> Self {
+        Self {
+            network_read_bytes: 512 * 1024 * 1024,
+            listener_connections: 100_000,
+            db_query_rows: 100_000,
+            db_stream_batch_rows: 100,
+            request_queue_capacity: 1024,
+            socket_read_until_bytes: 16 * 1024 * 1024,
+            socket_write_batch_bytes: 256 * 1024,
+            network_write_queue_capacity: 64 * 1024,
+            http_client_timeout_ms: 100_000,
+            cluster_frame_bytes: 512 * 1024 * 1024,
+            http_body_bytes: 10 * 1024 * 1024,
+            http_static_stream_threshold_bytes: 1024 * 1024,
+            http_static_cache_ttl_secs: 5,
+            http_static_cache_entries: 10_000,
+            db_wire_message_bytes: 64 * 1024 * 1024,
+            redis_array_items: 1024 * 1024,
+            db_pool_size: 5,
+            db_read_timeout_ms: 10_000,
+        }
+    }
+}
+
+pub(crate) const LIMITS: Limits = Limits::new();
 
 static NET_UUID: AtomicI64 = AtomicI64::new(1);
 
@@ -82,19 +191,18 @@ pub fn lua_push_error(state: LuaState, msg: &str) -> c_int {
     2
 }
 
-
 #[macro_export]
 macro_rules! not_null_wrapper {
-    ($fn:expr) => {
-        {
-            unsafe extern "C-unwind" fn func_wrapper(state: *mut ffi::lua_State) -> i32 {
-                #[allow(unused_unsafe)]
-                #[allow(clippy::macro_metavars_in_unsafe)]
-                unsafe { $fn(LuaState::new(state).unwrap()) }
+    ($fn:expr) => {{
+        unsafe extern "C-unwind" fn func_wrapper(state: *mut ffi::lua_State) -> i32 {
+            #[allow(unused_unsafe)]
+            #[allow(clippy::macro_metavars_in_unsafe)]
+            unsafe {
+                $fn(LuaState::new(state).unwrap())
             }
-            func_wrapper
         }
-    };
+        func_wrapper
+    }};
 }
 
 #[macro_export]
@@ -110,6 +218,10 @@ macro_rules! lua_require {
 }
 
 pub fn luaopen_custom_libs(state: LuaState) {
+    unsafe extern "C-unwind" {
+        fn luaopen_sharetable_core(L: *mut ffi::lua_State) -> c_int;
+    }
+
     #[cfg(feature = "httpc")]
     lua_require!(state, "httpc.core", lua_httpc::luaopen_httpc);
     #[cfg(feature = "httpd")]
@@ -119,6 +231,7 @@ pub fn luaopen_custom_libs(state: LuaState) {
     lua_require!(state, "excel", lua_excel::luaopen_excel);
     lua_require!(state, "fs", lua_fs::luaopen_fs);
     lua_require!(state, "json", lua_json::luaopen_json);
+    lua_require!(state, "random", lua_random::luaopen_random);
     lua_require!(state, "buffer", lua_buffer::luaopen_buffer);
     lua_require!(state, "seri", lua_seri::luaopen_seri);
     #[cfg(feature = "sqlx")]
@@ -134,6 +247,84 @@ pub fn luaopen_custom_libs(state: LuaState) {
     #[cfg(feature = "cluster")]
     lua_require!(state, "cluster.core", lua_cluster::luaopen_cluster);
     lua_require!(state, "utils", lua_utils::luaopen_utils);
+    unsafe {
+        ffi::luaL_requiref(
+            state.as_ptr(),
+            cstr!("sharetable.core"),
+            luaopen_sharetable_core,
+            0,
+        );
+        ffi::lua_pop(state.as_ptr(), 1);
+    }
+}
+
+/// Eagerly build the process-wide message-decoder table.
+///
+/// Call this once at startup (before any actor is spawned) so the one-time
+/// initialization happens on the main path instead of lazily on the first
+/// decode. Idempotent: subsequent calls are no-ops.
+pub fn init_message_decoders() {
+    LazyLock::force(&DECODERS);
+}
+
+/// Process-wide message-decoder dispatch table, keyed by `ptype`.
+///
+/// `luaopen_custom_libs` runs once per actor, so the registration must NOT be a
+/// per-actor write into a shared `static mut` (that races readers in `handle()`
+/// and is UB under the aliasing model / a Rust 2024 hazard). Instead the table
+/// is built exactly once via `LazyLock`; every actor and the dispatch path in
+/// `lua_actor::lua_decode_message_payload` only ever *read* it.
+pub(crate) static DECODERS: LazyLock<[message_decode::MessageDecodeFn; 256]> =
+    LazyLock::new(build_decoders);
+
+fn build_decoders() -> [message_decode::MessageDecodeFn; 256] {
+    use moon_runtime::context::{
+        PTYPE_DEBUG, PTYPE_ERROR, PTYPE_HTTPC, PTYPE_HTTPD, PTYPE_INTEGER, PTYPE_LUA,
+        PTYPE_MONGODB, PTYPE_PG, PTYPE_REDIS, PTYPE_SOCKET_EVENT, PTYPE_SOCKET_TCP, PTYPE_SQLX,
+        PTYPE_TEXT, PTYPE_TIMER, PTYPE_WEBSOCKET,
+    };
+
+    let mut decoders: [message_decode::MessageDecodeFn; 256] =
+        [message_decode::default_decode as message_decode::MessageDecodeFn; 256];
+
+    decoders[PTYPE_ERROR as usize] = message_decode::decode_error_message;
+    decoders[PTYPE_INTEGER as usize] = message_decode::decode_integer_message;
+    decoders[PTYPE_TIMER as usize] = message_decode::decode_integer_message;
+    decoders[PTYPE_TEXT as usize] = message_decode::decode_buffer_as_string_message;
+    decoders[PTYPE_SOCKET_TCP as usize] = message_decode::decode_buffer_as_string_message;
+    decoders[PTYPE_LUA as usize] = lua_seri::decode_buffer_message;
+    decoders[PTYPE_DEBUG as usize] = lua_seri::decode_buffer_message;
+    decoders[PTYPE_SOCKET_EVENT as usize] = lua_socket::decode_socket_event_message;
+    #[cfg(feature = "httpc")]
+    {
+        decoders[PTYPE_HTTPC as usize] = lua_httpc::decode_httpc_message;
+    }
+    #[cfg(feature = "httpd")]
+    {
+        decoders[PTYPE_HTTPD as usize] = lua_httpd::decode_httpd_message;
+    }
+    #[cfg(feature = "sqlx")]
+    {
+        decoders[PTYPE_SQLX as usize] = lua_sqlx::decode_sqlx_message;
+    }
+    #[cfg(feature = "mongodb")]
+    {
+        decoders[PTYPE_MONGODB as usize] = lua_mongodb::decode_mongodb_message;
+    }
+    #[cfg(feature = "websocket")]
+    {
+        decoders[PTYPE_WEBSOCKET as usize] = lua_websocket::decode_websocket_message;
+    }
+    #[cfg(feature = "pg")]
+    {
+        decoders[PTYPE_PG as usize] = lua_pg::decode_pg_message;
+    }
+    #[cfg(feature = "redis")]
+    {
+        decoders[PTYPE_REDIS as usize] = lua_redis::decode_redis_message;
+    }
+
+    decoders
 }
 
 #[cfg(test)]
@@ -141,6 +332,8 @@ mod tests {
     use super::*;
     use moon_lua::ffi;
     use moon_lua::laux::LuaGlobalState;
+    use moon_runtime::buffer::Buffer;
+    use moon_runtime::context::{self, Message, MessageBody};
     use std::ffi::CString;
 
     fn new_lua_vm() -> (LuaState, LuaGlobalState) {
@@ -287,10 +480,7 @@ mod tests {
             r#"local ok, err = pcall(require("json").decode, '{}') return ok"#,
             deep
         );
-        let result = run_lua_expr(state, &format!(
-            r#"(function() {} end)()"#,
-            code
-        ));
+        let result = run_lua_expr(state, &format!(r#"(function() {} end)()"#, code));
         assert_eq!(result, "false", "deeply nested JSON should fail");
     }
 
@@ -351,14 +541,20 @@ mod tests {
     #[test]
     fn json_object_marks_existing_table() {
         let (state, _guard) = new_lua_vm();
-        let result = run_lua_expr(state, r#"require("json").encode(require("json").object({}))"#);
+        let result = run_lua_expr(
+            state,
+            r#"require("json").encode(require("json").object({}))"#,
+        );
         assert_eq!(result, "{}");
     }
 
     #[test]
     fn json_array_marks_existing_table() {
         let (state, _guard) = new_lua_vm();
-        let result = run_lua_expr(state, r#"require("json").encode(require("json").array({}))"#);
+        let result = run_lua_expr(
+            state,
+            r#"require("json").encode(require("json").array({}))"#,
+        );
         assert_eq!(result, "[]");
     }
 
@@ -419,6 +615,59 @@ mod tests {
         run_lua(state, code).expect("seri empty pack failed");
     }
 
+    #[test]
+    fn seri_pack_metapairs_roundtrip() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local seri = require("seri")
+            local data = { x = 1, y = "two" }
+            local t = setmetatable({}, {
+                __pairs = function() return next, data, nil end
+            })
+            local out = seri.unpack(seri.packstring(t))
+            assert(out.x == 1, "x mismatch")
+            assert(out.y == "two", "y mismatch")
+        "#;
+        run_lua(state, code).expect("seri __pairs roundtrip failed");
+    }
+
+    #[test]
+    fn seri_pack_metapairs_error_propagates() {
+        // A __pairs metamethod that raises must abort serialization with a Lua
+        // error (regression test: it used to silently produce a truncated stream).
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local seri = require("seri")
+            local t = setmetatable({}, {
+                __pairs = function() error("boom in pairs") end
+            })
+            local ok, err = pcall(seri.packstring, t)
+            assert(not ok, "pack should fail when __pairs errors")
+            assert(string.find(err, "serialize", 1, true), "missing serialize prefix: " .. tostring(err))
+            assert(string.find(err, "boom in pairs", 1, true), "inner error not propagated: " .. tostring(err))
+        "#;
+        run_lua(state, code).expect("seri __pairs error test failed");
+    }
+
+    #[test]
+    fn seri_pack_metapairs_iterator_error_propagates() {
+        // The per-step iterator pcall failure path must also surface as an error.
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local seri = require("seri")
+            local t = setmetatable({}, {
+                __pairs = function(tbl)
+                    return function() error("boom in iterator") end, tbl, nil
+                end
+            })
+            local ok, err = pcall(seri.packstring, t)
+            assert(not ok, "pack should fail when iterator errors")
+            assert(string.find(err, "serialize", 1, true), "missing serialize prefix: " .. tostring(err))
+            assert(string.find(err, "boom in iterator", 1, true), "inner error not propagated: " .. tostring(err))
+        "#;
+        run_lua(state, code).expect("seri __pairs iterator error test failed");
+    }
+
     // ========================= Utils tests =========================
 
     #[test]
@@ -458,7 +707,10 @@ mod tests {
     fn utils_hash_sha256() {
         let (state, _guard) = new_lua_vm();
         let result = run_lua_expr(state, r#"require("utils").hash("sha256", "hello")"#);
-        assert_eq!(result, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(
+            result,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 
     // ========================= Buffer (Lua API) tests =========================
@@ -536,5 +788,192 @@ mod tests {
             buffer.drop(buf)
         "#;
         run_lua(state, code).expect("buffer seek test failed");
+    }
+
+    // ========================= Message decoder tests =========================
+    //
+    // These exercise the dispatch table built by `build_decoders` plus each
+    // generic decoder in `message_decode` (and the `seri` decoder), by feeding a
+    // hand-built `Message` through `DECODERS[ptype]` exactly like the runtime's
+    // `lua_decode_message_payload` does, then inspecting the resulting Lua stack.
+
+    fn buffer_msg(ptype: u8, data: &[u8]) -> Message {
+        Message {
+            from: 0,
+            to: 0,
+            session: 0,
+            data: MessageBody::Buffer(ptype, Box::new(Buffer::from_slice(data))),
+        }
+    }
+
+    fn isize_msg(ptype: u8, v: isize) -> Message {
+        Message {
+            from: 0,
+            to: 0,
+            session: 0,
+            data: MessageBody::ISize(ptype, v),
+        }
+    }
+
+    /// Dispatch a message through the real `DECODERS` table (covering the
+    /// `build_decoders` wiring) and return the number of values pushed.
+    unsafe fn decode_via_table(state: LuaState, mut msg: Message) -> i32 {
+        let decoder = DECODERS[msg.ptype() as usize];
+        unsafe { decoder(state, &mut msg as *mut Message) }
+    }
+
+    unsafe fn stack_bytes(state: LuaState, idx: i32) -> Vec<u8> {
+        unsafe {
+            let mut len = 0usize;
+            let ptr = ffi::lua_tolstring(state.as_ptr(), idx, &mut len);
+            assert!(!ptr.is_null(), "value at {} is not a string", idx);
+            std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+        }
+    }
+
+    #[test]
+    fn decode_error_message_pushes_false_and_text() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            let n = decode_via_table(state, buffer_msg(context::PTYPE_ERROR, b"boom"));
+            assert_eq!(n, 2, "PTYPE_ERROR should push (false, message)");
+            assert_eq!(
+                ffi::lua_toboolean(state.as_ptr(), 1),
+                0,
+                "first value must be false"
+            );
+            assert_eq!(stack_bytes(state, 2), b"boom");
+        }
+    }
+
+    #[test]
+    fn decode_error_message_invalid_utf8_is_lossy() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            let n = decode_via_table(state, buffer_msg(context::PTYPE_ERROR, &[0xff, 0xfe, b'!']));
+            assert_eq!(n, 2);
+            assert_eq!(ffi::lua_toboolean(state.as_ptr(), 1), 0);
+            // Invalid bytes are replaced (U+FFFD), the trailing '!' is preserved.
+            let bytes = stack_bytes(state, 2);
+            assert!(
+                bytes.ends_with(b"!"),
+                "tail should survive lossy decode: {:?}",
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn decode_integer_message_for_integer_and_timer() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            // PTYPE_INTEGER and PTYPE_TIMER both map to decode_integer_message.
+            let n = decode_via_table(state, isize_msg(context::PTYPE_INTEGER, 12345));
+            assert_eq!(n, 1);
+            assert_eq!(ffi::lua_tointeger(state.as_ptr(), 1), 12345);
+            ffi::lua_settop(state.as_ptr(), 0);
+
+            let n = decode_via_table(state, isize_msg(context::PTYPE_TIMER, -7));
+            assert_eq!(n, 1);
+            assert_eq!(ffi::lua_tointeger(state.as_ptr(), 1), -7);
+        }
+    }
+
+    #[test]
+    fn decode_buffer_as_string_for_text_and_socket_tcp() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            let n = decode_via_table(state, buffer_msg(context::PTYPE_TEXT, b"hello"));
+            assert_eq!(n, 1);
+            assert_eq!(stack_bytes(state, 1), b"hello");
+            ffi::lua_settop(state.as_ptr(), 0);
+
+            // Binary payloads (including embedded NULs) must be preserved verbatim.
+            let raw = [0u8, 1, 2, 255, b'a'];
+            let n = decode_via_table(state, buffer_msg(context::PTYPE_SOCKET_TCP, &raw));
+            assert_eq!(n, 1);
+            assert_eq!(stack_bytes(state, 1), raw);
+        }
+    }
+
+    #[test]
+    fn decode_lua_message_seri_roundtrip() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            // Produce a real seri stream, read its raw bytes back out.
+            run_lua(
+                state,
+                r#"_packed = require("seri").packstring(42, "hi", true)"#,
+            )
+            .expect("seri pack failed");
+            let name = CString::new("_packed").unwrap();
+            ffi::lua_getglobal(state.as_ptr(), name.as_ptr());
+            let packed = stack_bytes(state, -1);
+            ffi::lua_settop(state.as_ptr(), 0);
+
+            // PTYPE_LUA (and PTYPE_DEBUG) decode via lua_seri::decode_buffer_message.
+            let n = decode_via_table(state, buffer_msg(context::PTYPE_LUA, &packed));
+            assert_eq!(n, 3, "expected 3 decoded values");
+            assert_eq!(ffi::lua_tointeger(state.as_ptr(), 1), 42);
+            assert_eq!(stack_bytes(state, 2), b"hi");
+            assert_eq!(ffi::lua_toboolean(state.as_ptr(), 3), 1);
+        }
+    }
+
+    #[test]
+    fn decode_lua_message_empty_buffer_yields_nothing() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            let n = decode_via_table(state, buffer_msg(context::PTYPE_DEBUG, b""));
+            assert_eq!(n, 0, "empty seri stream decodes to no values");
+        }
+    }
+
+    #[test]
+    fn decode_default_for_unmapped_ptype() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            // PTYPE_SYSTEM has no registered decoder -> default_decode (0 results).
+            let n = decode_via_table(state, buffer_msg(context::PTYPE_SYSTEM, b"x"));
+            assert_eq!(n, 0);
+            assert_eq!(ffi::lua_gettop(state.as_ptr()), 0);
+        }
+    }
+
+    #[test]
+    fn decode_integer_rejects_wrong_body() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            // A Buffer body for an integer ptype must fail gracefully as (false, err).
+            let n = decode_via_table(state, buffer_msg(context::PTYPE_INTEGER, b"x"));
+            assert_eq!(n, 2);
+            assert_eq!(ffi::lua_toboolean(state.as_ptr(), 1), 0);
+            assert!(
+                !stack_bytes(state, 2).is_empty(),
+                "should carry an error message"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_error_rejects_wrong_body() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            // An ISize body for PTYPE_ERROR cannot be borrowed as a Buffer.
+            let n = decode_via_table(state, isize_msg(context::PTYPE_ERROR, 1));
+            assert_eq!(n, 2);
+            assert_eq!(ffi::lua_toboolean(state.as_ptr(), 1), 0);
+        }
+    }
+
+    #[test]
+    fn decode_socket_event_rejects_wrong_body() {
+        let (state, _guard) = new_lua_vm();
+        unsafe {
+            // Neither Boxed(SocketEvent) nor Buffer -> the error arm: (false, err).
+            let n = decode_via_table(state, isize_msg(context::PTYPE_SOCKET_EVENT, 1));
+            assert_eq!(n, 2);
+            assert_eq!(ffi::lua_toboolean(state.as_ptr(), 1), 0);
+        }
     }
 }

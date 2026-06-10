@@ -13,7 +13,7 @@ Multi-database driver using the `sqlx` crate, supporting PostgreSQL, MySQL, and 
 │    → send to worker via mpsc channel                        │
 │    → moon.wait(session) — coroutine yields                  │
 │                                                             │
-│  PTYPE_SQLX message arrives → c.decode(raw)                 │
+│  PTYPE_SQLX message arrives → moon.core.decode_message(m)   │
 │    → parse rows into Lua tables                             │
 │    → coroutine resumes with result                          │
 └─────────────┬───────────────────────────────────────────────┘
@@ -128,6 +128,7 @@ end
 |-----------|---------|-------------|
 | `timeout` | 5000ms | Connect timeout |
 | `max_connections` | 5 | Maximum pool size |
+| `queue_capacity` | 1024 | Bounded request queue capacity |
 
 ## Files
 

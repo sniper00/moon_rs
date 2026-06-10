@@ -4,7 +4,6 @@ use moon_lua::{
     laux::{self, LuaState, LuaTable, LuaType, LuaValue},
     lreg, lreg_null,
 };
-use serde::de::Error;
 use serde_json::Value;
 use std::{
     ffi::{c_char, c_int, c_void},
@@ -14,9 +13,9 @@ use std::{
 
 use moon_runtime::buffer::{BUFFER_HEAD_RESERVE, Buffer};
 
-const JSON_NULL: &str = "null";
-const JSON_TRUE: &str = "true";
-const JSON_FALSE: &str = "false";
+const JSON_NULL: &[u8] = b"null";
+const JSON_TRUE: &[u8] = b"true";
+const JSON_FALSE: &[u8] = b"false";
 const CHAR2ESCAPE: [u8; 256] = [
     b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'b', b't', b'n', b'u', b'f', b'r', b'u', b'u',
     b'u', b'u', b'u', b'u', // 0~19
@@ -120,6 +119,29 @@ pub fn fetch_options(state: LuaState) -> &'static mut JsonOptions {
     opts.unwrap()
 }
 
+/// Write `val` as a JSON string literal (surrounding quotes included), escaping
+/// control characters and JSON metacharacters per `CHAR2ESCAPE`.
+pub fn write_json_string(writer: &mut Vec<u8>, val: &[u8]) {
+    writer.reserve(val.len() * 6 + 2);
+    writer.push(b'\"');
+    for ch in val {
+        let esc = CHAR2ESCAPE[*ch as usize];
+        if esc == 0 {
+            writer.push(*ch);
+        } else {
+            writer.push(b'\\');
+            writer.push(esc);
+            if esc == b'u' {
+                writer.push(b'0');
+                writer.push(b'0');
+                writer.push(HEX_DIGITS[(*ch >> 4) as usize & 0xF]);
+                writer.push(HEX_DIGITS[*ch as usize & 0xF]);
+            }
+        }
+    }
+    writer.push(b'\"');
+}
+
 pub fn encode_one(
     writer: &mut Vec<u8>,
     val: LuaValue,
@@ -130,43 +152,40 @@ pub fn encode_one(
     match val {
         LuaValue::Boolean(val) => {
             if val {
-                writer.extend_from_slice(JSON_TRUE.as_bytes());
+                writer.extend_from_slice(JSON_TRUE);
             } else {
-                writer.extend_from_slice(JSON_FALSE.as_bytes());
+                writer.extend_from_slice(JSON_FALSE);
             }
         }
-        LuaValue::Number(val) => writer.extend_from_slice(val.to_string().as_bytes()),
+        LuaValue::Number(val) => {
+            // NaN / +-Inf have no JSON representation; emitting `val.to_string()`
+            // here would produce `NaN`/`inf`, i.e. invalid JSON that no decoder
+            // accepts. Surface a hard error instead of writing garbage.
+            if !val.is_finite() {
+                return Err(
+                    "json encode: cannot encode a non-finite number (NaN or Infinity)".to_string(),
+                );
+            }
+            writer.extend_from_slice(val.to_string().as_bytes());
+        }
         LuaValue::Integer(val) => writer.extend_from_slice(val.to_string().as_bytes()),
         LuaValue::String(val) => {
-            writer.reserve(val.len() * 6 + 2);
-            writer.push(b'\"');
-            for ch in val {
-                let esc = CHAR2ESCAPE[*ch as usize];
-                if esc == 0 {
-                    writer.push(*ch);
-                } else {
-                    writer.push(b'\\');
-                    writer.push(esc);
-                    if esc == b'u' {
-                        writer.push(b'0');
-                        writer.push(b'0');
-                        writer.push(HEX_DIGITS[(*ch >> 4) as usize & 0xF]);
-                        writer.push(HEX_DIGITS[*ch as usize & 0xF]);
-                    }
-                }
-            }
-
-            writer.push(b'\"');
+            write_json_string(writer, val);
         }
         LuaValue::Table(val) => {
             encode_table(writer, &val, depth, fmt, options)?;
         }
         LuaValue::Nil => {
-            writer.extend_from_slice(JSON_NULL.as_bytes());
+            writer.extend_from_slice(JSON_NULL);
         }
         LuaValue::LightUserData(val) => {
             if val.is_null() {
-                writer.extend_from_slice(JSON_NULL.as_bytes());
+                writer.extend_from_slice(JSON_NULL);
+            } else {
+                // A non-null lightuserdata has no JSON representation. Writing
+                // nothing would desync the separators already emitted by the
+                // array/object caller (e.g. produce `[1,,3]`), so fail instead.
+                return Err("json encode: cannot encode a non-null lightuserdata value".to_string());
             }
         }
         val => {
@@ -248,9 +267,11 @@ fn encode_object(
         match key {
             LuaValue::String(key) => {
                 format_space(writer, fmt, depth);
-                writer.push(b'\"');
-                writer.extend_from_slice(key);
-                writer.extend_from_slice(b"\":");
+                // Keys must be escaped exactly like string values: a key
+                // containing `"`, `\`, or control characters would otherwise
+                // produce invalid JSON.
+                write_json_string(writer, key);
+                writer.push(b':');
                 if fmt {
                     writer.push(b' ');
                 }
@@ -270,7 +291,12 @@ fn encode_object(
                     return Err("json encode: unsupport number key type.".to_string());
                 }
             }
-            _ => {}
+            // The separator/newline above are emitted before this match, so a
+            // key we can't serialize would otherwise leave a dangling comma and
+            // produce invalid JSON. Fail instead of silently skipping it.
+            _ => {
+                return Err("json encode: unsupported table key type (only string/integer keys are allowed).".to_string());
+            }
         }
     }
 
@@ -344,11 +370,14 @@ extern "C-unwind" fn encode(state: LuaState) -> i32 {
     laux::throw_error(state)
 }
 
-#[inline]
-fn decode_one(state: LuaState, val: &Value, depth: usize, options: &JsonOptions) {
+fn decode_one(
+    state: LuaState,
+    val: &Value,
+    depth: usize,
+    options: &JsonOptions,
+) -> Result<(), String> {
     if depth > 64 {
-        laux::lua_push(state, "json decode: too deep");
-        laux::throw_error(state);
+        return Err("json decode: too deep".to_string());
     }
     match val {
         Value::Object(map) => {
@@ -366,7 +395,7 @@ fn decode_one(state: LuaState, val: &Value, depth: usize, options: &JsonOptions)
                     } else {
                         laux::lua_push(state, k.as_str());
                     }
-                    decode_one(state, v, depth + 1, options);
+                    decode_one(state, v, depth + 1, options)?;
                     table.insert_from_stack();
                 }
             }
@@ -378,21 +407,26 @@ fn decode_one(state: LuaState, val: &Value, depth: usize, options: &JsonOptions)
             laux::lua_checkstack(state, 6, cstr!("json.decode.array"));
             let table = LuaTable::new(state, arr.len(), 0);
             for (i, v) in arr.iter().enumerate() {
-                decode_one(state, v, depth + 1, options);
-                table.rawseti(i+1);
+                decode_one(state, v, depth + 1, options)?;
+                table.rawseti(i + 1);
             }
             if options.has_metatfield {
                 set_json_metatable(state, -1, JSON_ARRAY_META);
             }
-        },
+        }
         Value::Bool(b) => {
             laux::lua_push(state, *b);
         }
         Value::Number(n) => {
-            if n.is_f64() {
-                laux::lua_push(state, n.as_f64().unwrap_or_default());
+            if let Some(i) = n.as_i64() {
+                laux::lua_push(state, i);
+            } else if let Some(f) = n.as_f64() {
+                // `u64` values above `i64::MAX` (and genuine floats) don't fit a
+                // Lua integer. Represent them as a float instead of silently
+                // collapsing to 0 via `as_i64().unwrap_or_default()`.
+                laux::lua_push(state, f);
             } else {
-                laux::lua_push(state, n.as_i64().unwrap_or_default());
+                return Err(format!("json decode: number out of range: {}", n));
             }
         }
         Value::Null => {
@@ -402,6 +436,18 @@ fn decode_one(state: LuaState, val: &Value, depth: usize, options: &JsonOptions)
             laux::lua_push(state, s.as_str());
         }
     }
+    Ok(())
+}
+
+/// Parse `data` as JSON and push the resulting Lua value.
+///
+/// Returns `Err` (never longjmps) so callers can drop owned resources (the parsed
+/// `Value`, and for `decode_file` the `File`/`contents`) before raising the Lua
+/// error. The parsed `Value` is local to this function and dropped on every path.
+fn decode_bytes(state: LuaState, data: &[u8], options: &JsonOptions) -> Result<i32, String> {
+    let val: Value = serde_json::from_slice(data).map_err(|e| format!("json.decode: {}", e))?;
+    decode_one(state, &val, 0, options)?;
+    Ok(1)
 }
 
 extern "C-unwind" fn decode(state: LuaState) -> i32 {
@@ -412,37 +458,50 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
         return 1;
     }
 
-    fn handle_error(state: LuaState, e: serde_json::Error) -> i32 {
-        laux::lua_push(state, format!("json.decode: {}", e));
-        laux::throw_error(state)
+    match decode_bytes(state, str, options) {
+        Ok(n) => n,
+        Err(e) => {
+            laux::lua_push(state, e);
+            laux::throw_error(state)
+        }
     }
+}
 
-    // Decode JSON data
-    let result = if !str.is_empty() && str[0] == b'@' {
-        match std::str::from_utf8(&str[1..]) {
-            Ok(path) => {
-                let mut file = match File::open(path) {
-                    Ok(file) => file,
-                    Err(e) => return handle_error(state, serde_json::Error::custom(e.to_string())),
-                };
-                let mut contents = Vec::new();
-                if let Err(e) = file.read_to_end(&mut contents) {
-                    return handle_error(state, serde_json::Error::custom(e.to_string()));
-                }
-                serde_json::from_slice::<Value>(&contents)
+/// Read the file at the given path and decode its contents as JSON.
+///
+/// File access is intentionally a *separate*, explicit API: `decode` only ever
+/// parses in-memory bytes, so JSON arriving from a network/client source can
+/// never be coerced into reading arbitrary files. Only call `decode_file` with
+/// a trusted, caller-controlled path.
+extern "C-unwind" fn decode_file(state: LuaState) -> i32 {
+    let options = fetch_options(state);
+    let path = unsafe { laux::lua_check_str(state, 1) };
+
+    // Read + parse with all owned resources (the `File`, the `contents` Vec, and
+    // the parsed `Value`) confined to this closure, so they are dropped *before*
+    // any longjmp below — a longjmp would otherwise skip their `Drop` and leak the
+    // file descriptor and buffers.
+    let parsed: Result<Value, String> = (|| {
+        let mut file = File::open(path).map_err(|e| format!("json.decode: {}", e))?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|e| format!("json.decode: {}", e))?;
+        serde_json::from_slice::<Value>(&contents).map_err(|e| format!("json.decode: {}", e))
+    })();
+
+    match parsed {
+        Ok(val) => match decode_one(state, &val, 0, options) {
+            Ok(()) => 1,
+            Err(e) => {
+                drop(val);
+                laux::lua_push(state, e);
+                laux::throw_error(state)
             }
-            Err(e) => return handle_error(state, serde_json::Error::custom(e.to_string())),
+        },
+        Err(e) => {
+            laux::lua_push(state, e);
+            laux::throw_error(state)
         }
-    } else {
-        serde_json::from_slice::<Value>(str)
-    };
-
-    match result {
-        Ok(val) => {
-            decode_one(state, &val, 0, options);
-            1
-        }
-        Err(e) => handle_error(state, e),
     }
 }
 
@@ -463,7 +522,7 @@ extern "C-unwind" fn concat(state: LuaState) -> i32 {
     laux::lua_settop(state, 1);
 
     let mut writer = Box::new(Buffer::new());
-    let _ =writer.commit(BUFFER_HEAD_RESERVE);
+    let _ = writer.commit(BUFFER_HEAD_RESERVE);
     let mut has_error = false;
 
     for val in LuaTable::from_stack(state, 1).array_iter() {
@@ -473,9 +532,9 @@ extern "C-unwind" fn concat(state: LuaState) -> i32 {
             LuaValue::Integer(val) => writer.write_chars(val),
             LuaValue::Boolean(val) => {
                 if val {
-                    writer.write_slice(JSON_TRUE.as_bytes());
+                    writer.write_slice(JSON_TRUE);
                 } else {
-                    writer.write_slice(JSON_FALSE.as_bytes());
+                    writer.write_slice(JSON_FALSE);
                 }
             }
             LuaValue::Table(val) => {
@@ -539,11 +598,11 @@ fn hash_string(s: &str) -> u64 {
 }
 
 #[inline]
-fn write_resp(writer: &mut Buffer, cmd: &str) {
+fn write_resp(writer: &mut Buffer, cmd: &[u8]) {
     writer.write_slice(b"\r\n$");
     writer.write_chars(cmd.len());
     writer.write_slice(b"\r\n");
-    writer.write_str(cmd);
+    writer.write_slice(cmd);
 }
 
 fn concat_resp_one(
@@ -555,8 +614,8 @@ fn concat_resp_one(
         LuaValue::Nil => {
             writer.write_slice(b"\r\n$-1");
         }
-        LuaValue::Number(val) => write_resp(writer, val.to_string().as_str()),
-        LuaValue::Integer(val) => write_resp(writer, val.to_string().as_str()),
+        LuaValue::Number(val) => write_resp(writer, val.to_string().as_bytes()),
+        LuaValue::Integer(val) => write_resp(writer, val.to_string().as_bytes()),
         LuaValue::Boolean(val) => write_resp(writer, if val { JSON_TRUE } else { JSON_FALSE }),
         LuaValue::String(val) => {
             writer.write_slice(b"\r\n$");
@@ -573,7 +632,7 @@ fn concat_resp_one(
             } else {
                 let mut w = Buffer::new();
                 encode_table(w.as_mut_vec(), &val, 0, false, options)?;
-                write_resp(writer, w.as_str());
+                write_resp(writer, w.as_slice());
             }
         }
         val => {
@@ -682,6 +741,7 @@ extern "C-unwind" fn json_array(state: LuaState) -> c_int {
 pub extern "C-unwind" fn luaopen_json(state: LuaState) -> i32 {
     let l = [
         lreg!("decode", decode),
+        lreg!("decode_file", decode_file),
         lreg!("encode", encode),
         lreg!("concat", concat),
         lreg!("concat_resp", concat_resp),
