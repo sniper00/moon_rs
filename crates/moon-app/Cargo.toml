@@ -2,6 +2,7 @@
 name = "moon-app"
 version = "0.1.0"
 edition = "2024"
+default-run = "moon_rs"
 
 [[bin]]
 name = "moon_rs"

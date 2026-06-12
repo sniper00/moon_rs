@@ -10,6 +10,9 @@ members = [
     "crates/moon-app",
     "xtask",
 ]
+exclude = [
+    ".extensions",
+]
 
 [workspace.dependencies]
 moon-runtime = { path = "crates/moon-runtime" }
