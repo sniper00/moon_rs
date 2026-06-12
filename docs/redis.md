@@ -190,7 +190,7 @@ Lua values are converted to RESP bulk strings:
 
 | Path | Role |
 |------|------|
-| `crates/moon-modules/src/lua_redis.rs` | Rust implementation (pool + pub/sub watch) |
+| `crates/moon-runtime/src/modules/lua_redis.rs` | Rust implementation (pool + pub/sub watch) |
 | `lualib/moon/db/redis.lua` | Lua wrapper with dynamic dispatch |
 | `assets/example/example_redis.lua` | Usage examples |
 | `assets/test/test_redis.lua` | Native driver + pub/sub watch + stream tests |

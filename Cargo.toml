@@ -5,16 +5,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/moon-lua",
+    "crates/moon-base",
     "crates/moon-runtime",
-    "crates/moon-modules",
     "crates/moon-app",
+    "xtask",
 ]
 
 [workspace.dependencies]
 moon-runtime = { path = "crates/moon-runtime" }
-moon-modules = { path = "crates/moon-modules" }
-moon-lua = { path = "crates/moon-lua", features = ["lua55"] }
+moon-base = { path = "crates/moon-base", features = ["lua55"] }
 
 mimalloc = "0.1.39"
 tokio = { version = "1", features = ["full"] }

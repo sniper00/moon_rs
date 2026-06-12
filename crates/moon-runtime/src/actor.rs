@@ -1,7 +1,7 @@
 use crate::context::{ActorId, LuaActorParam, Watchdog};
-use moon_lua::laux::{LuaGlobalState, LuaState, LuaThread};
+use moon_base::laux::{LuaGlobalState, LuaState, LuaThread};
 
-pub use moon_lua as ffi;
+pub use moon_base as ffi;
 
 pub struct LuaActor {
     pub ok: bool,

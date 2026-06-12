@@ -143,6 +143,6 @@ For `post_json`, response body is only auto-decoded when `status_code == 200`.
 
 | Path | Role |
 |------|------|
-| `crates/moon-modules/src/lua_httpc.rs` | Rust implementation (~350 lines) |
+| `crates/moon-runtime/src/modules/lua_httpc.rs` | Rust implementation (~350 lines) |
 | `lualib/moon/http/client.lua` | Lua wrapper with convenience methods |
 | `assets/test/test_http.lua` | HTTP client tests |

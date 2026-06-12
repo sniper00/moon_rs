@@ -163,7 +163,7 @@ Error:
 
 | Path | Role |
 |------|------|
-| `crates/moon-modules/src/lua_mongodb.rs` | Rust implementation (~1200 lines) |
+| `crates/moon-runtime/src/modules/lua_mongodb.rs` | Rust implementation (~1200 lines) |
 | `lualib/moon/db/mongodb.lua` | Lua wrapper with collection proxy |
 | `assets/example/example_mongodb.lua` | Usage examples |
 | `assets/test/test_mongodb.lua` | Functional tests |

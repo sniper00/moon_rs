@@ -123,7 +123,7 @@ The Rust-level `httpd` module (used internally) provides:
 
 | Path | Role |
 |------|------|
-| `crates/moon-modules/src/lua_httpd.rs` | Rust hyper server (~700 lines) |
+| `crates/moon-runtime/src/modules/lua_httpd.rs` | Rust hyper server (~700 lines) |
 | `lualib/moon/http/server.lua` | Lua HTTP server with routing |
 | `lualib/moon/http/internal.lua` | HTTP parsing helpers |
 | `assets/test/httpd_fixtures.lua` | Shared demo/test routes for `moon.httpd` |

@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Workspace task runner (cargo-xtask pattern).
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+# toml 0.5 is a single serde-based crate (no toml_edit), keeping the task runner
+# light and offline-friendly. Used to parse extensions.toml and read/write the
+# extensions.lock file.
+serde = { version = "1", features = ["derive"] }
+toml = "0.5"

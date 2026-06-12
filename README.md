@@ -19,10 +19,9 @@ flowchart LR
 	A[Lua services] --> B[Typed messages]
 	B --> C[moon-runtime]
 	C --> D[Tokio runtime]
-	D --> E[moon-modules]
-	E --> F[Network\nSocket HTTP WebSocket]
-	E --> G[Data\nRedis PG SQLx MongoDB]
-	E --> H[Cluster and utils]
+	C --> F[Network\nSocket HTTP WebSocket]
+	C --> G[Data\nRedis PG SQLx MongoDB]
+	C --> H[Cluster and utils]
 	C --> I[Per-actor lua_State]
 	A --> J[lualib APIs]
 ```
@@ -43,9 +42,9 @@ flowchart LR
 | Path | Responsibility |
 | --- | --- |
 | `crates/moon-app` | binary entry point, bootstrap, signal handling |
-| `crates/moon-runtime` | actor runtime, message types, timer, logger, shared context |
-| `crates/moon-modules` | Rust to Lua native bindings |
-| `crates/moon-lua` | embedded Lua 5.5 sources and Rust FFI |
+| `crates/moon-runtime` | actor runtime (context, messages, timer, logger) + all Rust→Lua native bindings |
+| `crates/moon-base` | foundation: embedded Lua 5.5 sources, Rust FFI, helper macros, shared Buffer |
+| `crates/moon-thrift` | standalone Lua C extension example (cdylib), built separately |
 | `lualib/` | user-facing Lua APIs and wrappers |
 | `assets/` | examples, benchmarks, integration-style test scripts |
 | `docs/` | module-focused documentation |

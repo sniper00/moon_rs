@@ -140,7 +140,7 @@ end
 
 | Path | Role |
 |------|------|
-| `crates/moon-modules/src/lua_socket.rs` | Rust implementation (~820 lines) |
+| `crates/moon-runtime/src/modules/lua_socket.rs` | Rust implementation (~820 lines) |
 | `lualib/moon/socket.lua` | Lua wrapper with event dispatch |
 | `assets/test/test_socket.lua` | Socket tests |
 | `assets/test/test_socket_frame.lua` | Frame protocol tests |

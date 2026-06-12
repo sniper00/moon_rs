@@ -164,7 +164,7 @@ Options: `connect_timeout`, `application_name`, `sslmode` (not yet implemented).
 
 | Path | Role |
 |------|------|
-| `crates/moon-modules/src/lua_pg.rs` | Rust implementation (~2100 lines) |
+| `crates/moon-runtime/src/modules/lua_pg.rs` | Rust implementation (~2100 lines) |
 | `lualib/moon/db/pg.lua` | Lua wrapper with async/await |
 | `assets/example/example_pg.lua` | Usage examples |
 | `assets/test/test_pg.lua` | Comprehensive type/feature tests |

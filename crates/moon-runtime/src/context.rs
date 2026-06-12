@@ -17,9 +17,9 @@ use crate::escape_print;
 
 use super::{actor::LuaActor, buffer::Buffer, log::Logger};
 
-use moon_lua::ffi as lua_ffi;
+use moon_base::ffi as lua_ffi;
 
-// Defined in `moon-modules/src/lua_coroutine.rs`. The monitor installs this
+// Defined in `moon-runtime/src/modules/lua_coroutine.rs`. The monitor installs this
 // hook on the active lua_State when a timeout is detected.
 unsafe extern "C-unwind" {
     pub fn moon_signal_hook(l: *mut lua_ffi::lua_State, ar: *mut lua_ffi::lua_Debug);
@@ -735,10 +735,20 @@ mod tests {
 
         CONTEXT.remove_actor(target_id, &target.name);
 
-        let msg = unique_watcher_rx
-            .try_recv()
-            .expect("unique watcher should receive service-exit notice");
-        assert_eq!(msg.from, target_id);
+        // `CONTEXT` is a process-wide singleton shared by every test in this
+        // crate. Other tests running in parallel (e.g. cluster's
+        // `broadcast_system(CLUSTER_ACTOR_ID, ...)`) also fan PTYPE_SYSTEM
+        // messages out to *all* unique actors, so foreign messages can land in
+        // this watcher's mailbox. Scan for our own service-exit (identified by
+        // `from == target_id`) instead of assuming it is the first message.
+        let mut service_exit = None;
+        while let Ok(msg) = unique_watcher_rx.try_recv() {
+            if msg.from == target_id {
+                service_exit = Some(msg);
+                break;
+            }
+        }
+        let msg = service_exit.expect("unique watcher should receive service-exit notice");
         assert_eq!(msg.to, unique_watcher_id);
         assert_eq!(msg.session, 0);
         assert_eq!(msg.ptype(), PTYPE_SYSTEM);
@@ -752,10 +762,15 @@ mod tests {
             other => panic!("unexpected service-exit payload: {}", other),
         }
 
-        assert!(
-            normal_watcher_rx.try_recv().is_err(),
-            "non-unique watcher should match Moon and skip PTYPE_SYSTEM broadcast"
-        );
+        // A non-unique actor must never receive the service-exit broadcast (this
+        // matches Moon). It may still see unrelated foreign traffic, so assert
+        // specifically that nothing came from `target_id`.
+        while let Ok(msg) = normal_watcher_rx.try_recv() {
+            assert_ne!(
+                msg.from, target_id,
+                "non-unique watcher should match Moon and skip PTYPE_SYSTEM broadcast"
+            );
+        }
 
         CONTEXT.remove_actor(unique_watcher_id, &unique_watcher.name);
         CONTEXT.remove_actor(normal_watcher_id, &normal_watcher.name);

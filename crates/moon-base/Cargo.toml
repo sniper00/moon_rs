@@ -1,0 +1,31 @@
+[package]
+name = "moon-base"
+version = "0.1.0"
+edition = "2024"
+links = "lua54"
+build = "build.rs"
+categories = ["external-ffi-bindings"]
+# Foundation crate every moon_rs crate and native extension depends on:
+# Lua 5.5 C sources + Rust FFI bindings (ffi/laux), helper macros, and the
+# shared byte Buffer. Kept dependency-light so it can be linked into standalone
+# Lua C extension cdylibs.
+
+[lib]
+doctest = false
+
+[dependencies]
+libc = "0.2"
+
+[features]
+default = ["lua55", "bundled"]
+lua55 = []
+luau = []
+raw_dylib = []
+# When enabled (the default), the Lua 5.5 C sources are compiled and statically
+# linked. Disable it (default-features = false) for crates that build a Lua C
+# extension (cdylib) which resolves the Lua C API from the host executable at
+# load time instead of bundling its own copy.
+bundled = []
+
+[build-dependencies]
+cc = "1.0"

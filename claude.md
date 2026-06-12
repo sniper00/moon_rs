@@ -12,10 +12,10 @@ Architecture: Lua actors (services) communicate via typed message passing, with 
 
 ```
 crates/
-  moon-lua/       # Lua 5.5 C sources + Rust FFI (laux.rs), yyjson JSON decoder
-  moon-runtime/   # Actor server runtime: CONTEXT, message types, buffer, timer, logger (no Lua)
-  moon-modules/   # All Rust→Lua native bindings (lua_socket, lua_httpc, lua_httpd, etc.)
+  moon-base/      # Foundation: Lua 5.5 C sources + Rust FFI (laux.rs), macros, shared Buffer, yyjson JSON decoder
+  moon-runtime/   # Actor server runtime (CONTEXT, message types, timer, logger) + ALL Rust→Lua native bindings (lua_socket, lua_httpc, lua_httpd, etc.)
   moon-app/       # Binary entry point (moon_rs), Tokio setup, signal handling, bootstrap
+  moon-thrift/    # Standalone Lua C extension (cdylib), excluded from the workspace; built separately
 lualib/           # Lua runtime library (user-facing API: moon.lua, socket, http, db wrappers)
 assets/           # Example scripts, benchmarks, integration test Lua scripts
 docs/             # Per-module architecture and API docs
@@ -48,7 +48,7 @@ cargo run --release assets/test/test_socket.lua
 - **Unsafe code:** extensive around Lua C API — `#[allow(clippy::not_unsafe_ptr_arg_deref)]` etc. Wrap Rust fns as `extern "C-unwind"` via `not_null_wrapper!` macro
 - **Naming:** crates are `moon-*`; Lua binding source files are `lua_<feature>.rs`; protocol constants are `PTYPE_*`
 - **Global singletons:** `CONTEXT` (actor registry, runtimes), `LOGGER` (async logger) — both `lazy_static`
-- **Feature flags (`moon-modules`):** each native module is feature-gated (`excel`, `httpc`, `httpd`, `sqlx`, `mongodb`, `websocket`, `pg`, `redis`, `cluster`, `thrift`). Use `#[cfg(feature = "...")]` for conditional compilation
+- **Feature flags (`moon-runtime`):** each native module is feature-gated (`excel`, `httpc`, `httpd`, `sqlx`, `mongodb`, `websocket`, `pg`, `redis`, `cluster`, `protobuf`). Use `#[cfg(feature = "...")]` for conditional compilation
 
 ### Lua
 
@@ -58,17 +58,17 @@ cargo run --release assets/test/test_socket.lua
 
 ### Testing
 
-- **Rust unit tests:** inline `#[cfg(test)] mod tests` in `moon-modules/src/lib.rs`, `lua_redis.rs`, `lua_pg.rs`, `moon-runtime/src/buffer.rs`
-- **Test helpers:** `new_lua_vm()`, `run_lua()`, `run_lua_expr()` in `moon-modules/src/lib.rs`
+- **Rust unit tests:** inline `#[cfg(test)] mod tests` in `moon-runtime/src/lib.rs`, `lua_redis.rs`, `lua_pg.rs`, `moon-base/src/buffer.rs`
+- **Test helpers:** `new_lua_vm()`, `run_lua()`, `run_lua_expr()` in `moon-runtime/src/lib.rs`
 - **Lua integration tests:** under `assets/test/` — run manually via `cargo run --release`
 - **No automated tests in CI** — CI only builds release binaries
 
 ### Module Pattern
 
 Adding a new native module follows this pattern:
-1. Create `crates/moon-modules/src/lua_<name>.rs`
-2. Add feature flag in `crates/moon-modules/Cargo.toml` if it has optional deps
-3. Register via `lua_require!` macro in `crates/moon-modules/src/lib.rs` (with `#[cfg(feature)]` guard)
+1. Create `crates/moon-runtime/src/modules/lua_<name>.rs`
+2. Add feature flag in `crates/moon-runtime/Cargo.toml` if it has optional deps
+3. Register via `lua_require!` macro in `crates/moon-runtime/src/lib.rs` (with `#[cfg(feature)]` guard)
 4. Create Lua wrapper in `lualib/moon/<name>.lua`
 5. Add tests and docs
 

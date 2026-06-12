@@ -9,8 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 moon-runtime = { workspace = true }
-moon-modules = { workspace = true }
-moon-lua = { workspace = true }
+moon-base = { workspace = true }
 mimalloc = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }

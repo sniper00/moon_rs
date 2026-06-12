@@ -134,7 +134,7 @@ end
 
 | Path | Role |
 |------|------|
-| `crates/moon-modules/src/lua_sqlx.rs` | Rust implementation (~1000 lines) |
+| `crates/moon-runtime/src/modules/lua_sqlx.rs` | Rust implementation (~1000 lines) |
 | `lualib/moon/db/sqlx.lua` | Lua wrapper with async/await |
 | `assets/example/example_sqlx.lua` | Usage examples |
 | `assets/test/test_sqlx_postgres_types.lua` | PostgreSQL type tests |

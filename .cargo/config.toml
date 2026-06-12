@@ -1,0 +1,4 @@
+[alias]
+# Workspace task runner (cargo-xtask pattern). `--quiet` hides cargo's own
+# "Compiling xtask" noise; the tasks themselves still print their progress.
+xtask = "run --quiet --package xtask --"

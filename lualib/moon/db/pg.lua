@@ -1,7 +1,7 @@
 -- PostgreSQL driver backed by the native `pg.core` Rust extension.
 --
 -- The previous pure-Lua wire-protocol implementation (over `moon.socket`) has
--- been moved into Rust (`crates/moon-modules/src/lua_pg.rs`) for tighter
+-- been moved into Rust (`crates/moon-runtime/src/modules/lua_pg.rs`) for tighter
 -- protocol control and fewer data copies. This module is now a thin,
 -- session-based async wrapper around `pg.core`, mirroring `moon.db.sqlx`.
 --

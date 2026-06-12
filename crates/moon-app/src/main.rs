@@ -1,9 +1,9 @@
 use mimalloc::MiMalloc;
-use moon_lua::{
+use moon_base::{
     self, cstr, ffi,
     laux::{self, LuaState},
 };
-use moon_modules::{lua_actor, not_null_wrapper};
+use moon_runtime::{lua_actor, not_null_wrapper};
 use moon_runtime::{
     context::{self, CONTEXT, LOGGER, LuaActorParam},
     error::{Error, Result},
@@ -253,6 +253,42 @@ async fn async_main() -> Result<()> {
         CONTEXT.set_env("PATH", package_path.as_ref());
     }
 
+    // Lua C dynamic extension libraries are loaded via `require` from the `clib`
+    // directory (alongside `lualib`). Append a search template to package.cpath so
+    // every actor inherits it (see CONTEXT env "PATH" propagation in lua_actor).
+    {
+        let mut root = env::current_dir()?.canonicalize()?;
+        if !root.join("lualib").is_dir() {
+            root = env::current_exe()?.canonicalize()?;
+            root.pop();
+        }
+        if let Some(stripped) = root.to_string_lossy().strip_prefix(r"\\?\") {
+            root = PathBuf::from(stripped);
+        }
+        let root = root.to_string_lossy().replace('\\', "/");
+
+        // Platform-specific shared library extension.
+        let ext = if cfg!(target_os = "windows") {
+            "dll"
+        } else if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        };
+
+        let cpath = format!(
+            "package.cpath='{root}/clib/?.{ext};'..package.cpath;",
+            root = root,
+            ext = ext
+        );
+
+        let package_path = CONTEXT
+            .get_env("PATH")
+            .map(|p| (*p).clone())
+            .unwrap_or_default();
+        CONTEXT.set_env("PATH", format!("{}{}", package_path, cpath).as_ref());
+    }
+
     let cwd = bootstrap_path.parent().unwrap_or(Path::new("./"));
     //Change the working directory to the directory where the opened file is located.
     env::set_current_dir(cwd)?;
@@ -280,7 +316,7 @@ async fn async_main() -> Result<()> {
     context::run_timer();
 
     // Build the message-decoder dispatch table once, before any actor spawns.
-    moon_modules::init_message_decoders();
+    moon_runtime::init_message_decoders();
 
     log::info!("system start. ({}:{})", file!(), line!());
 

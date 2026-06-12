@@ -125,7 +125,7 @@ If `target_node == self`, calls are routed locally via `moon.send` / `moon.call`
 
 | Path | Role |
 |------|------|
-| `crates/moon-modules/src/lua_cluster.rs` | Core Rust implementation |
+| `crates/moon-runtime/src/modules/lua_cluster.rs` | Core Rust implementation |
 | `lualib/moon/cluster.lua` | Thin Lua wrapper (local routing + seri pack/unpack) |
 | `assets/example/cluster/` | Example: multi-node cluster with discovery server |
 | `assets/test/test_cluster.lua` | Same-node functional test |
