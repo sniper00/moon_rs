@@ -9,7 +9,7 @@ edition = "2024"
 doctest = false
 
 [features]
-default = ["excel", "httpc", "httpd", "websocket", "pg", "redis", "cluster", "protobuf"]
+default = ["excel", "httpc", "httpd", "websocket", "pg", "redis", "cluster", "protobuf", "sqlx", "mongodb"]
 excel = ["dep:calamine", "dep:csv"]
 httpc = ["dep:reqwest", "dep:httparse", "dep:percent-encoding", "dep:form_urlencoded", "dep:url"]
 httpd = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-util", "dep:futures-util", "dep:httpdate"]
