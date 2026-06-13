@@ -270,7 +270,7 @@ fn build_and_install(
     let patch = format!(
         "patch.\"{}\".moon-base.path=\"{}\"",
         manifest.moon_base_git,
-        local_moon_base.display()
+        local_moon_base.display().to_string().replace('\\', "/")
     );
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
