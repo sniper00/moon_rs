@@ -33,7 +33,13 @@ fn main() {
         }
 
         #[cfg(target_os = "windows")]
-        builder.flag("/experimental:c11atomics");
+        {
+            builder.flag("/experimental:c11atomics");
+            // Mark Lua API functions with __declspec(dllexport) so they are
+            // exported from the host executable. Lua C extensions loaded via
+            // LoadLibrary resolve their lua_* / luaL_* imports against these.
+            builder.define("LUA_BUILD_AS_DLL", None);
+        }
         builder.compile("lua55");
 
         // dlopen lives in libdl on Linux; macOS provides it in libc.

@@ -8,6 +8,9 @@ default-run = "moon_rs"
 name = "moon_rs"
 path = "src/main.rs"
 
+[build-dependencies]
+cc = "1.0"
+
 [dependencies]
 moon-runtime = { workspace = true }
 moon-base = { workspace = true }

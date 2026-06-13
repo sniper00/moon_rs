@@ -274,7 +274,15 @@ fn build_and_install(
     );
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+    // Pass the host target directory (where moon_rs.lib lives) so extension
+    // build scripts can link against it on Windows.
+    let host_target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("target"));
+
     Command::new(&cargo)
+        .env("MOON_HOST_TARGET_DIR", host_target_dir.join("release"))
         .args(["build", "--release", "--manifest-path"])
         .arg(&manifest_path)
         .arg("--config")
