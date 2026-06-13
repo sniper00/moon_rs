@@ -2,7 +2,7 @@
 name = "moon-base"
 version = "0.1.0"
 edition = "2024"
-links = "lua54"
+links = "lua55"
 build = "build.rs"
 categories = ["external-ffi-bindings"]
 # Foundation crate every moon_rs crate and native extension depends on:
