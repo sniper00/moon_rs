@@ -280,8 +280,13 @@ fn check_message(state: LuaState, index: i32, kind: &str) -> Message {
                     format!("bad argument #{} (non-null lightuserdata expected)", index),
                 );
             }
-            let buf = unsafe { &*(ptr as *const moon_runtime::buffer::Buffer) };
-            buf.as_slice().to_vec()
+            // Take ownership of the heap `Buffer` created on the Lua side
+            // (e.g. `buffer.concat` -> `Box::into_raw`). `to_vec` moves the
+            // underlying `Vec` out when nothing has been consumed (zero-copy),
+            // and dropping the `Box` at the end of this scope frees the
+            // allocation instead of leaking it.
+            let buf = unsafe { Box::from_raw(ptr as *mut moon_runtime::buffer::Buffer) };
+            buf.into_vec()
         }
         _ => {
             laux::lua_error(

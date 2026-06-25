@@ -19,7 +19,6 @@ libc = "0.2"
 [features]
 default = ["lua55", "bundled"]
 lua55 = []
-luau = []
 raw_dylib = []
 # When enabled (the default), the Lua 5.5 C sources are compiled and statically
 # linked. Disable it (default-features = false) for crates that build a Lua C

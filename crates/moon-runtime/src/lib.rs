@@ -196,6 +196,10 @@ mod lua_socket;
 mod lua_sqlx;
 #[path = "modules/lua_utils.rs"]
 mod lua_utils;
+#[path = "modules/lua_zset.rs"]
+mod lua_zset;
+#[path = "modules/lua_schema.rs"]
+mod lua_schema;
 #[cfg(feature = "websocket")]
 #[path = "modules/lua_websocket.rs"]
 mod lua_websocket;
@@ -220,9 +224,9 @@ pub mod lua_json;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
     /// Hard ceiling on bytes a single network-facing operation may read or
-    /// accumulate in memory. Used by sockets and HTTP client/server paths to
+    /// accumulate in memory. Used by sockets, cluster and HTTP client/server paths to
     /// bound attacker-controlled `Content-Length`, frame, or read sizes.
-    pub network_read_bytes: usize,
+    pub max_network_read_bytes: usize,
     /// Default maximum number of simultaneously accepted inbound connections
     /// per listener. Shared by TCP socket, HTTP server, and WebSocket listeners;
     /// callers may still override it through `max_connections`.
@@ -239,10 +243,6 @@ pub(crate) struct Limits {
     /// the backpressure limit for Redis, PG, sqlx, and MongoDB handlers before
     /// enqueue starts failing instead of growing memory without bound.
     pub request_queue_capacity: usize,
-    /// Default maximum bytes accumulated by socket `read_until` when the caller
-    /// does not provide an explicit limit. This protects delimiter reads from
-    /// scanning forever or buffering unbounded input.
-    pub socket_read_until_bytes: usize,
     /// Maximum total bytes accepted by one socket write batch. Lua can pass many
     /// buffers at once, so this bounds the transient aggregation before the IO
     /// task writes to the network.
@@ -254,14 +254,10 @@ pub(crate) struct Limits {
     /// accidental or malicious requests from pinning client tasks for excessive
     /// durations.
     pub http_client_timeout_ms: u64,
-    /// Maximum payload size for one cluster frame. Cluster peers are trusted more
-    /// than public clients, but frame length still comes from the wire and must
-    /// have a hard allocation cap.
-    pub cluster_frame_bytes: usize,
     /// Default maximum request/response body size for the HTTP server helpers.
-    /// This is separate from `network_read_bytes` so HTTP server policy can stay
+    /// This is separate from `max_network_read_bytes` so HTTP server policy can stay
     /// conservative while the global network ceiling remains a hard stop.
-    pub http_body_bytes: usize,
+    pub max_http_body_bytes: usize,
     /// Static files larger than this threshold are streamed instead of read into
     /// memory at once. Small files are served directly for simplicity; large
     /// files avoid a single allocation proportional to file size.
@@ -290,17 +286,15 @@ pub(crate) struct Limits {
 impl Limits {
     pub const fn new() -> Self {
         Self {
-            network_read_bytes: 512 * 1024 * 1024,
+            max_network_read_bytes: 512 * 1024 * 1024,
             listener_connections: 100_000,
             db_query_rows: 100_000,
             db_stream_batch_rows: 100,
             request_queue_capacity: 1024,
-            socket_read_until_bytes: 16 * 1024 * 1024,
             socket_write_batch_bytes: 256 * 1024,
             network_write_queue_capacity: 64 * 1024,
-            http_client_timeout_ms: 100_000,
-            cluster_frame_bytes: 512 * 1024 * 1024,
-            http_body_bytes: 10 * 1024 * 1024,
+            http_client_timeout_ms: 10_000,
+            max_http_body_bytes: 10 * 1024 * 1024,
             http_static_stream_threshold_bytes: 1024 * 1024,
             http_static_cache_ttl_secs: 5,
             http_static_cache_entries: 10_000,
@@ -360,6 +354,8 @@ macro_rules! lua_require {
 pub fn luaopen_custom_libs(state: LuaState) {
     unsafe extern "C-unwind" {
         fn luaopen_sharetable_core(L: *mut ffi::lua_State) -> c_int;
+        // C module amalgamated into the lua55 static lib (lua55/clonefunc.c via onelua.c).
+        fn luaopen_clonefunc(L: *mut ffi::lua_State) -> c_int;
     }
 
     #[cfg(feature = "httpc")]
@@ -372,6 +368,8 @@ pub fn luaopen_custom_libs(state: LuaState) {
     lua_require!(state, "fs", lua_fs::luaopen_fs);
     lua_require!(state, "json", lua_json::luaopen_json);
     lua_require!(state, "random", lua_random::luaopen_random);
+    lua_require!(state, "zset", lua_zset::luaopen_zset);
+    lua_require!(state, "schema", lua_schema::luaopen_schema);
     lua_require!(state, "buffer", lua_buffer::luaopen_buffer);
     lua_require!(state, "seri", lua_seri::luaopen_seri);
     lua_require!(state, "utils", lua_utils::luaopen_utils);
@@ -396,6 +394,9 @@ pub fn luaopen_custom_libs(state: LuaState) {
             luaopen_sharetable_core,
             0,
         );
+        ffi::lua_pop(state.as_ptr(), 1);
+
+        ffi::luaL_requiref(state.as_ptr(), cstr!("clonefunc"), luaopen_clonefunc, 0);
         ffi::lua_pop(state.as_ptr(), 1);
     }
 }
@@ -712,6 +713,77 @@ mod tests {
         );
         assert_eq!(result, "[]");
     }
+
+    // --- streaming-decoder regression coverage (no intermediate Value DOM) ---
+
+    #[test]
+    fn json_decode_escaped_strings() {
+        let (state, _guard) = new_lua_vm();
+        // Each `\\x` in this Lua literal is the two raw bytes `\x` handed to the
+        // JSON parser as an escape sequence, so the decoded value is the unescaped form.
+        let code = r#"
+            local json = require("json")
+            local t = json.decode('{"nl":"a\\nb","tab":"a\\tb","q":"a\\"b","bs":"a\\\\b","u":"caf\\u00e9"}')
+            assert(t.nl == "a\nb", "newline escape mismatch: " .. tostring(t.nl))
+            assert(t.tab == "a\tb", "tab escape mismatch")
+            assert(t.q == 'a"b', "quote escape mismatch")
+            assert(t.bs == "a\\b", "backslash escape mismatch")
+            assert(t.u == "caf\xc3\xa9", "unicode escape mismatch: " .. tostring(t.u))
+        "#;
+        run_lua(state, code).expect("json escaped strings failed");
+    }
+
+    #[test]
+    fn json_decode_rejects_trailing_garbage() {
+        let (state, _guard) = new_lua_vm();
+        let result = run_lua_expr(
+            state,
+            r#"select(1, pcall(require("json").decode, '{"a":1} trailing'))"#,
+        );
+        assert_eq!(result, "false", "trailing content after JSON should error");
+    }
+
+    #[test]
+    fn json_decode_big_u64_as_float() {
+        let (state, _guard) = new_lua_vm();
+        // 2^63 = 9223372036854775808 is > i64::MAX, so it must decode as a float.
+        let code = r#"
+            local json = require("json")
+            local t = json.decode('{"big":9223372036854775808}')
+            assert(math.type(t.big) == "float", "expected float, got " .. tostring(math.type(t.big)))
+            assert(t.big == 9223372036854775808.0)
+        "#;
+        run_lua(state, code).expect("json big u64 test failed");
+    }
+
+    #[test]
+    fn json_decode_skips_empty_key() {
+        let (state, _guard) = new_lua_vm();
+        // Empty object keys are intentionally dropped (parity with the old decoder).
+        let code = r#"
+            local json = require("json")
+            local t = json.decode('{"":"skipped","keep":"yes"}')
+            assert(t[""] == nil, "empty key should be skipped")
+            assert(t.keep == "yes")
+        "#;
+        run_lua(state, code).expect("json empty key test failed");
+    }
+
+    #[test]
+    fn json_decode_deep_nested_arrays() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local json = require("json")
+            local t = json.decode('[[[[1,2],[3]],[[4]]],[]]')
+            assert(t[1][1][1][1] == 1)
+            assert(t[1][1][1][2] == 2)
+            assert(t[1][1][2][1] == 3)
+            assert(t[1][2][1][1] == 4)
+            assert(#t[2] == 0)
+        "#;
+        run_lua(state, code).expect("json deep nested arrays failed");
+    }
+
 
     // ========================= PG protocol (json.pq_*) tests =========================
 

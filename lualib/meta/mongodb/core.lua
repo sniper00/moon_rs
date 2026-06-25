@@ -3,9 +3,11 @@
 
 --- MongoDB connection userdata.
 ---@class mongodb_connection
+local mongodb_connection = {}
 
 --- MongoDB cursor handle.
 ---@class mongodb_cursor
+local mongodb_cursor = {}
 
 --- Native MongoDB driver (`require("mongodb.core")`).
 ---@class mongodb.core
@@ -27,6 +29,10 @@ function mongodb.find_connection(name) end
 ---@param t table
 ---@return any
 function mongodb.tt(t) end
+
+--- Statistics per named connection.
+---@return table<string, pool_stats>
+function mongodb.stats() end
 
 --- Dispatch a MongoDB operation asynchronously.
 ---@param conn mongodb_connection

@@ -79,10 +79,6 @@ impl RedisPool {
             reply_count,
         }))
     }
-
-    fn pending(&self) -> i64 {
-        self.inner.pending()
-    }
 }
 
 struct RedisRequest {
@@ -1110,7 +1106,16 @@ extern "C-unwind" fn close(state: LuaState) -> c_int {
 extern "C-unwind" fn stats(state: LuaState) -> c_int {
     let table = LuaTable::new(state, 0, REDIS_CONNECTIONS.len());
     REDIS_CONNECTIONS.iter().for_each(|pair| {
-        table.insert(pair.key().as_str(), pair.value().pending());
+        let pool = &pair.value().inner;
+        table.rawset_x(pair.key().as_str(), || {
+            crate::request_pool::push_pool_stats(
+                state,
+                pool.pending(),
+                pool.total(),
+                pool.peak(),
+                pool.worker_count() as i64,
+            );
+        });
     });
     1
 }
@@ -1714,7 +1719,7 @@ mod tests {
             inner: Arc::new(WorkerSet::new("test".into(), workers)),
         };
         // 0 + 10 + 20 + 30 = 60
-        assert_eq!(pool.pending(), 60);
+        assert_eq!(pool.inner.pending(), 60);
     }
 
     // -- find_crlf edge cases -------------------------------------------------

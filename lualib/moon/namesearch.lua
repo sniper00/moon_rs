@@ -27,6 +27,7 @@ function M.new(db, table_name)
     return setmetatable({ db = db, tbl = table_name or "players" }, M)
 end
 
+---@async
 --- Create the table, the pg_trgm extension and both indexes (idempotent).
 --- `pg_trgm` requires privileges; if it cannot be created, substring/similar
 --- modes are unavailable but prefix search still works.
@@ -57,7 +58,7 @@ end
 ---@param name string
 function M:add(uid, name)
     return self.db:query_params(string.format(
-        "INSERT INTO %s(uid,name) VALUES($1,$2) ON CONFLICT(uid) DO UPDATE SET name=EXCLUDED.name", self.tbl),
+            "INSERT INTO %s(uid,name) VALUES($1,$2) ON CONFLICT(uid) DO UPDATE SET name=EXCLUDED.name", self.tbl),
         uid, name)
 end
 

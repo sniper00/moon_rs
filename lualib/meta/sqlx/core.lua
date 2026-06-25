@@ -3,12 +3,15 @@
 
 --- SQLx database connection userdata.
 ---@class sqlx_connection
+local sqlx_connection = {}
 
 --- SQLx streaming cursor handle.
 ---@class sqlx_cursor
+local sqlx_cursor = {}
 
 --- SQLx transaction query builder userdata.
 ---@class sqlx_transaction
+local sqlx_transaction = {}
 
 --- SQLx JSON query parameter userdata.
 ---@class sqlx_json_param
@@ -31,8 +34,8 @@ function sqlx.connect(database_url, name, connect_timeout, max_connections, queu
 ---@return sqlx_connection? conn
 function sqlx.find_connection(name) end
 
---- Pending request counts per named connection.
----@return table<string, integer>
+--- Statistics per named connection.
+---@return table<string, pool_stats>
 function sqlx.stats() end
 
 --- Create a transaction query builder.
@@ -60,10 +63,11 @@ function sqlx_connection:exec_query(sql, ...) end
 
 --- Start a streaming query asynchronously.
 ---@param conn sqlx_connection
+---@param batch_size? integer @ Rows per batch (default 100)
 ---@param sql string
----@vararg any
+---@vararg any @ Query parameters
 ---@return integer session
-function sqlx_connection:query_stream(sql, ...) end
+function sqlx_connection:query_stream(batch_size, sql, ...) end
 
 --- Execute a transaction asynchronously.
 ---@param conn sqlx_connection

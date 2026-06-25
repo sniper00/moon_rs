@@ -11,10 +11,10 @@ doctest = false
 [features]
 default = ["excel", "httpc", "httpd", "websocket", "pg", "redis", "cluster", "protobuf", "sqlx", "mongodb"]
 excel = ["dep:calamine", "dep:csv"]
-httpc = ["dep:reqwest", "dep:httparse", "dep:percent-encoding", "dep:form_urlencoded", "dep:url"]
+httpc = ["dep:reqwest", "dep:httparse", "dep:percent-encoding", "dep:url"]
 httpd = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-util", "dep:futures-util", "dep:httpdate"]
-sqlx = ["dep:sqlx", "dep:phf", "dep:uuid"]
-mongodb = ["dep:mongodb", "dep:futures"]
+sqlx = ["dep:sqlx", "dep:phf", "dep:uuid", "dep:futures-util"]
+mongodb = ["dep:mongodb", "dep:futures-util"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 pg = ["dep:url"]
 redis = []
@@ -57,7 +57,6 @@ csv = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 httparse = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
-form_urlencoded = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
 # Optional: HTTP server
@@ -73,7 +72,6 @@ uuid = { workspace = true, optional = true }
 
 # Optional: MongoDB
 mongodb = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
 
 # Optional: HTTP date formatting/parsing
 httpdate = { workspace = true, optional = true }
@@ -84,3 +82,4 @@ futures-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 serial_test = "3.5.0"
+pprof = { version = "0.14", features = ["flamegraph"] }

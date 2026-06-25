@@ -7,6 +7,7 @@ moon.register_protocol {
     pack = function(...) return ... end,
 }
 
+---@async
 local function operators(self, ...)
     local res = self.obj:operators(self.op_name, self.db_name, self.col_name, ...)
     if type(res) == "table" then
@@ -27,6 +28,7 @@ end
 ---@field count fun(filter:table):table
 
 ---@class MongoDB
+---@field obj mongodb_connection
 local M = {}
 
 ---@async
@@ -54,6 +56,9 @@ function M.find_connection(name)
     return setmetatable(o, { __index = M })
 end
 
+---Statistics (pending/total/peak/workers) per named connection.
+---@nodiscard
+---@return table<string, pool_stats>
 function M.stats()
     return c.stats()
 end
@@ -64,8 +69,8 @@ end
 
 ---@async
 ---@nodiscard
----@param sql string
----@vararg any
+---@param db_name string
+---@param col_name string
 ---@return Collection
 function M:collection(db_name, col_name)
     return setmetatable({
@@ -77,7 +82,8 @@ function M:collection(db_name, col_name)
             t.op_name = op_name
             return t
         end,
-        __call = function(t, ...)
+        __call = function(_t, ...)
+            ---@diagnostic disable-next-line: await-in-sync
             return operators(...)
         end
     })
@@ -116,6 +122,7 @@ end
 function M:find_stream(db_name, col_name, query, opts, batch_size)
     local res = self.obj:operators("find_stream", db_name, col_name, query, opts, batch_size)
     if type(res) == "table" then
+        ---@diagnostic disable-next-line: return-type-mismatch, missing-return-value
         return nil, res.message
     end
     local current_session = res
@@ -137,6 +144,7 @@ function M:find_stream(db_name, col_name, query, opts, batch_size)
         end,
     })
 
+    ---@async
     local function iter()
         while true do
             if buffer and idx < #buffer then

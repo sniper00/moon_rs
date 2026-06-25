@@ -34,6 +34,7 @@ moon.register_protocol {
 ---@field public update? string[] @ columns to set from EXCLUDED; omit/empty => DO NOTHING
 
 ---@class pg
+---@field obj pg_pool
 local M = {}
 M.__index = M
 
@@ -71,7 +72,8 @@ function M:len()
     return self.obj:len()
 end
 
----Total pending requests across all named pools.
+---Statistics (pending/total/peak/workers) per named pool.
+---@return table<string, pool_stats>
 function M.stats()
     return c.stats()
 end
@@ -195,6 +197,9 @@ end
 
 ---Fire-and-forget bulk INSERT/UPSERT. Same `conflict` rules as `insert_many`
 ---(prefer the safe table form; the string form is trusted, verbatim SQL).
+---@param table_name string e.g. "userdata"
+---@param columns string[] column names, e.g. { "uid", "key", "value" }
+---@param rows table @ array of value arrays (one value per column)
 ---@param conflict? pg_conflict|string table form (safe) or trusted "ON CONFLICT ..." string
 function M:execute_insert_many(table_name, columns, rows, conflict)
     local res = self.obj:exec_insert_many(table_name, columns, rows, conflict)
@@ -227,6 +232,11 @@ function M:update_many(table_name, key_column, set_columns, rows, key_type)
 end
 
 ---Fire-and-forget bulk UPDATE.
+---@param table_name string
+---@param key_column string the column matched in the WHERE clause
+---@param set_columns string[] columns to assign
+---@param rows table @ array of `{ key, set1, set2, ... }`
+---@param key_type? string e.g. "bigint" — cast the join key to keep its index usable
 function M:execute_update_many(table_name, key_column, set_columns, rows, key_type)
     local res = self.obj:exec_update_many(table_name, key_column, set_columns, rows, key_type)
     if type(res) == "table" then

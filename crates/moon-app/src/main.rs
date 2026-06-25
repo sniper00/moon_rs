@@ -5,9 +5,10 @@ use moon_base::{
 };
 use moon_runtime::{lua_actor, not_null_wrapper};
 use moon_runtime::{
-    context::{self, CONTEXT, LOGGER, LuaActorParam},
+    context::{self, CLUSTER_ACTOR_ADDR, CONTEXT, LOGGER, LuaActorParam},
     error::{Error, Result},
 };
+use tokio::sync::mpsc;
 use std::{
     env,
     ffi::CString,
@@ -224,7 +225,7 @@ async fn async_main() -> Result<()> {
             let mut path: String = laux::opt_field(lua_state, -1, "path").unwrap_or_default();
             if !path.is_empty() {
                 path = format!("package.path='{};'..package.path;", path);
-                CONTEXT.set_env("PATH", path.as_ref());
+                CONTEXT.set_env("PATH", path.as_bytes());
             }
         }
     }
@@ -250,7 +251,7 @@ async fn async_main() -> Result<()> {
         //Lualib directories are added to the lua search path
         let package_path = format!("package.path='{}/lualib/?.lua;'..package.path;", strpath);
 
-        CONTEXT.set_env("PATH", package_path.as_ref());
+        CONTEXT.set_env("PATH", package_path.as_bytes());
     }
 
     // Lua C dynamic extension libraries are loaded via `require` from the `clib`
@@ -284,9 +285,9 @@ async fn async_main() -> Result<()> {
 
         let package_path = CONTEXT
             .get_env("PATH")
-            .map(|p| (*p).clone())
+            .map(|p| String::from_utf8_lossy(&p).into_owned())
             .unwrap_or_default();
-        CONTEXT.set_env("PATH", format!("{}{}", package_path, cpath).as_ref());
+        CONTEXT.set_env("PATH", format!("{}{}", package_path, cpath).as_bytes());
     }
 
     let cwd = bootstrap_path.parent().unwrap_or(Path::new("./"));
@@ -300,14 +301,14 @@ async fn async_main() -> Result<()> {
         .as_ref()
         .to_string();
 
-    CONTEXT.set_env("ARG", &arg);
+    CONTEXT.set_env("ARG", arg.as_bytes());
 
     if let Err(err) = LOGGER.setup_logger(enable_stdout, logfile, loglevel) {
         return Err(Error::Custom(err.to_string()));
     }
 
     let package_path = CONTEXT.get_env("PATH").unwrap_or_default();
-    let mut package_path = (*package_path).clone();
+    let mut package_path = String::from_utf8_lossy(&package_path).into_owned();
 
     package_path.push_str(&arg);
 
@@ -319,6 +320,15 @@ async fn async_main() -> Result<()> {
     moon_runtime::init_message_decoders();
 
     log::info!("system start. ({}:{})", file!(), line!());
+
+    // Pre-register the cluster pseudo-actor so `next_actor_id()` skips its
+    // reserved ID (2), preventing a collision if a user actor is spawned
+    // before `cluster.init()` runs. The dummy channel is replaced by the real
+    // one when cluster.init() calls `register_pseudo_actor`.
+    {
+        let (dummy_tx, _dummy_rx) = mpsc::unbounded_channel();
+        CONTEXT.register_pseudo_actor(CLUSTER_ACTOR_ADDR, dummy_tx);
+    }
 
     lua_actor::new_actor(LuaActorParam {
         id: context::BOOTSTRAP_ACTOR_ADDR,
@@ -332,10 +342,26 @@ async fn async_main() -> Result<()> {
         block: true,
     });
 
+    let mut last_report = std::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if CONTEXT.exit_code() != i32::MAX && CONTEXT.stopped() {
+        let code = CONTEXT.exit_code();
+        if code < 0 || (CONTEXT.exit_code() != i32::MAX && CONTEXT.stopped()) {
             break;
+        }
+
+        // Once shutdown has been requested, periodically report which actors
+        // are still running so a stuck shutdown can be diagnosed.
+        if CONTEXT.exit_code() != i32::MAX && last_report.elapsed() >= Duration::from_secs(3) {
+            last_report = std::time::Instant::now();
+            let running = CONTEXT.running_actors();
+            if !running.is_empty() {
+                log::warn!(
+                    "waiting for {} actor(s) to stop: [{}].",
+                    running.len(),
+                    running.join(", ")
+                );
+            }
         }
     }
 

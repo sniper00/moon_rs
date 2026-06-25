@@ -4,9 +4,10 @@ use moon_base::{
     laux::{self, LuaState, LuaTable, LuaType, LuaValue},
     lreg, lreg_null,
 };
-use serde_json::Value;
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::{
     ffi::{c_char, c_int, c_void},
+    fmt,
     fs::File,
     io::Read,
 };
@@ -38,12 +39,16 @@ const HEX_DIGITS: [u8; 16] = [
     b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'A', b'B', b'C', b'D', b'E', b'F',
 ];
 
-const JSON_OBJECT_META: *const c_char = cstr!("__json_object");
-const JSON_ARRAY_META: *const c_char = cstr!("__json_array");
+const JSON_OBJECT_META: *const c_char = cstr!("__object");
+const JSON_ARRAY_META: *const c_char = cstr!("__array");
 
 const DEFAULT_CONCAT_BUFFER_SIZE: usize = 512;
 const MIN_CONCAT_BUFFER_SIZE: usize = 16;
 
+/// `#[repr(C)]` so the C JSON decoder (`lualib-src/lua_json_decode.c`) can read
+/// the same options struct out of the shared `json_options` userdata upvalue.
+/// The field order/types MUST stay in sync with the `json_options` struct there.
+#[repr(C)]
 pub struct JsonOptions {
     empty_as_array: bool,
     enable_number_key: bool,
@@ -225,11 +230,10 @@ fn encode_array(
     writer.push(b'[');
 
     for (i, val) in table.expected_array_iter(size).enumerate() {
-        if i == 0 {
-            format_new_line(writer, fmt);
-        } else {
+        if i > 0 {
             writer.push(b',');
         }
+        format_new_line(writer, fmt);
         format_space(writer, fmt, depth);
 
         if let LuaValue::Nil = val
@@ -239,9 +243,11 @@ fn encode_array(
             return encode_object(writer, table, depth, fmt, options, false);
         }
         encode_one(writer, val, depth, fmt, options)?;
-        format_new_line(writer, fmt)
     }
-    format_space(writer, fmt, depth - 1);
+    if size > 0 {
+        format_new_line(writer, fmt);
+        format_space(writer, fmt, depth - 1);
+    }
     writer.push(b']');
     Ok(())
 }
@@ -370,86 +376,228 @@ extern "C-unwind" fn encode(state: LuaState) -> i32 {
     laux::throw_error(state)
 }
 
-fn decode_one(
+const MAX_DECODE_DEPTH: usize = 64;
+
+/// A stateful serde seed that drives a streaming parse straight onto the Lua
+/// stack: no intermediate `serde_json::Value` DOM is ever materialized. Each
+/// JSON value is pushed onto the stack as the parser yields it, so there are no
+/// per-key `String`, no `Map`, and no `Vec` allocations on the Rust side. The
+/// `type Value = ()` because the decoded value lives on the Lua stack, not in a
+/// returned Rust object.
+struct LuaSeed<'o> {
     state: LuaState,
-    val: &Value,
+    options: &'o JsonOptions,
     depth: usize,
-    options: &JsonOptions,
-) -> Result<(), String> {
-    if depth > 64 {
-        return Err("json decode: too deep".to_string());
+}
+
+impl<'de, 'o> DeserializeSeed<'de> for LuaSeed<'o> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Recursion here grows the Rust call stack with the JSON nesting depth,
+        // so the limit must be enforced before descending.
+        if self.depth > MAX_DECODE_DEPTH {
+            return Err(de::Error::custom("json decode: too deep"));
+        }
+        deserializer.deserialize_any(LuaVisitor {
+            state: self.state,
+            options: self.options,
+            depth: self.depth,
+        })
     }
-    match val {
-        Value::Object(map) => {
-            laux::lua_checkstack(state, 6, cstr!("json.decode.object"));
-            let table = LuaTable::new(state, 0, map.len());
-            for (k, v) in map {
-                if !k.is_empty() {
-                    let c = k.as_bytes()[0];
-                    if (c.is_ascii_digit() || c == b'-') && options.enable_number_key {
-                        if let Ok(n) = k.parse::<ffi::lua_Integer>() {
-                            laux::lua_push(state, n);
-                        } else {
-                            laux::lua_push(state, k.as_str());
-                        }
-                    } else {
-                        laux::lua_push(state, k.as_str());
-                    }
-                    decode_one(state, v, depth + 1, options)?;
-                    table.insert_from_stack();
-                }
-            }
-            if options.has_metatfield {
-                set_json_metatable(state, -1, JSON_OBJECT_META);
-            }
+}
+
+struct LuaVisitor<'o> {
+    state: LuaState,
+    options: &'o JsonOptions,
+    depth: usize,
+}
+
+impl<'de, 'o> Visitor<'de> for LuaVisitor<'o> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<(), E> {
+        laux::lua_push(self.state, v);
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<(), E> {
+        laux::lua_push(self.state, v);
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<(), E> {
+        // `u64` values above `i64::MAX` don't fit a Lua integer; represent them
+        // as a float rather than silently wrapping to a negative integer.
+        if v <= i64::MAX as u64 {
+            laux::lua_push(self.state, v as i64);
+        } else {
+            laux::lua_push(self.state, v as f64);
         }
-        Value::Array(arr) => {
-            laux::lua_checkstack(state, 6, cstr!("json.decode.array"));
-            let table = LuaTable::new(state, arr.len(), 0);
-            for (i, v) in arr.iter().enumerate() {
-                decode_one(state, v, depth + 1, options)?;
-                table.rawseti(i + 1);
-            }
-            if options.has_metatfield {
-                set_json_metatable(state, -1, JSON_ARRAY_META);
-            }
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<(), E> {
+        laux::lua_push(self.state, v);
+        Ok(())
+    }
+
+    /// String with no escapes: borrows directly from the input buffer, so there
+    /// is no transient Rust `String` — Lua copies it once into its own GC heap.
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<(), E> {
+        laux::lua_push(self.state, v);
+        Ok(())
+    }
+
+    /// String containing escapes: `v` points at serde_json's reusable scratch
+    /// buffer (still not a one-shot `String`); Lua copies it once.
+    fn visit_str<E>(self, v: &str) -> Result<(), E> {
+        laux::lua_push(self.state, v);
+        Ok(())
+    }
+
+    /// JSON `null`: `deserialize_any` reports it via `visit_unit`.
+    fn visit_unit<E>(self) -> Result<(), E> {
+        laux::lua_pushlightuserdata(self.state, std::ptr::null_mut());
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        laux::lua_checkstack(self.state, 4, cstr!("json.decode.array"));
+        let table = LuaTable::new(self.state, seq.size_hint().unwrap_or(0), 0);
+        let mut i = 0usize;
+        // Each element is pushed onto the stack by its seed, then moved into the
+        // table at the next array index.
+        while seq
+            .next_element_seed(LuaSeed {
+                state: self.state,
+                options: self.options,
+                depth: self.depth + 1,
+            })?
+            .is_some()
+        {
+            i += 1;
+            table.rawseti(i);
         }
-        Value::Bool(b) => {
-            laux::lua_push(state, *b);
+        if self.options.has_metatfield {
+            set_json_metatable(self.state, -1, JSON_ARRAY_META);
         }
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                laux::lua_push(state, i);
-            } else if let Some(f) = n.as_f64() {
-                // `u64` values above `i64::MAX` (and genuine floats) don't fit a
-                // Lua integer. Represent them as a float instead of silently
-                // collapsing to 0 via `as_i64().unwrap_or_default()`.
-                laux::lua_push(state, f);
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        laux::lua_checkstack(self.state, 6, cstr!("json.decode.object"));
+        let table = LuaTable::new(self.state, 0, map.size_hint().unwrap_or(0));
+        // `KeySeed` pushes the key onto the stack and returns whether it should be
+        // kept (empty keys are skipped, matching the previous behaviour).
+        while let Some(keep) = map.next_key_seed(KeySeed {
+            state: self.state,
+            options: self.options,
+        })? {
+            if keep {
+                // Key is on the stack top; push the value above it, then `rawset`
+                // pops both and stores them in the table.
+                map.next_value_seed(LuaSeed {
+                    state: self.state,
+                    options: self.options,
+                    depth: self.depth + 1,
+                })?;
+                table.insert_from_stack();
             } else {
-                return Err(format!("json decode: number out of range: {}", n));
+                map.next_value::<IgnoredAny>()?;
             }
         }
-        Value::Null => {
-            laux::lua_pushlightuserdata(state, std::ptr::null_mut());
+        if self.options.has_metatfield {
+            set_json_metatable(self.state, -1, JSON_OBJECT_META);
         }
-        Value::String(s) => {
-            laux::lua_push(state, s.as_str());
-        }
+        Ok(())
     }
-    Ok(())
+}
+
+/// Decodes a JSON object key and pushes it onto the Lua stack, reproducing the
+/// `enable_number_key` behaviour. `type Value = bool`: `true` means the key was
+/// pushed (keep it), `false` means it was an empty key (skip the entry).
+struct KeySeed<'o> {
+    state: LuaState,
+    options: &'o JsonOptions,
+}
+
+impl<'de, 'o> DeserializeSeed<'de> for KeySeed<'o> {
+    type Value = bool;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<bool, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de, 'o> Visitor<'de> for KeySeed<'o> {
+    type Value = bool;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON object key")
+    }
+
+    fn visit_str<E>(self, k: &str) -> Result<bool, E> {
+        if k.is_empty() {
+            return Ok(false);
+        }
+        let c = k.as_bytes()[0];
+        if (c.is_ascii_digit() || c == b'-') && self.options.enable_number_key {
+            if let Ok(n) = k.parse::<ffi::lua_Integer>() {
+                laux::lua_push(self.state, n);
+            } else {
+                laux::lua_push(self.state, k);
+            }
+        } else {
+            laux::lua_push(self.state, k);
+        }
+        Ok(true)
+    }
+
+    fn visit_borrowed_str<E>(self, k: &'de str) -> Result<bool, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(k)
+    }
 }
 
 /// Parse `data` as JSON and push the resulting Lua value.
 ///
-/// Returns `Err` (never longjmps) so callers can drop owned resources (the parsed
-/// `Value`, and for `decode_file` the `File`/`contents`) before raising the Lua
-/// error. The parsed `Value` is local to this function and dropped on every path.
+/// Returns `Err` (never longjmps for parse errors) so callers can drop owned
+/// resources before raising the Lua error. The parser borrows `data` and owns no
+/// heap that would leak if a Lua push longjmps mid-decode.
 fn decode_bytes(state: LuaState, data: &[u8], options: &JsonOptions) -> Result<i32, String> {
-    let val: Value = serde_json::from_slice(data).map_err(|e| format!("json.decode: {}", e))?;
-    decode_one(state, &val, 0, options)?;
+    let mut de = serde_json::Deserializer::from_slice(data);
+    LuaSeed {
+        state,
+        options,
+        depth: 0,
+    }
+    .deserialize(&mut de)
+    .map_err(|e| format!("json.decode: {}", e))?;
+    // Reject trailing garbage after the top-level value (parity with from_slice).
+    de.end().map_err(|e| format!("json.decode: {}", e))?;
     Ok(1)
 }
 
+#[allow(unused)]
 extern "C-unwind" fn decode(state: LuaState) -> i32 {
     let options = fetch_options(state);
     let str = unsafe { laux::lua_check_lstring(state, 1) };
@@ -477,27 +625,40 @@ extern "C-unwind" fn decode_file(state: LuaState) -> i32 {
     let options = fetch_options(state);
     let path = unsafe { laux::lua_check_str(state, 1) };
 
-    // Read + parse with all owned resources (the `File`, the `contents` Vec, and
-    // the parsed `Value`) confined to this closure, so they are dropped *before*
-    // any longjmp below — a longjmp would otherwise skip their `Drop` and leak the
-    // file descriptor and buffers.
-    let parsed: Result<Value, String> = (|| {
+    // Read the file with the owned `File`/`contents` confined to this closure so
+    // they are dropped before any longjmp — a longjmp would otherwise skip their
+    // `Drop` and leak the file descriptor and buffer.
+    let contents: Result<Vec<u8>, String> = (|| {
         let mut file = File::open(path).map_err(|e| format!("json.decode: {}", e))?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
             .map_err(|e| format!("json.decode: {}", e))?;
-        serde_json::from_slice::<Value>(&contents).map_err(|e| format!("json.decode: {}", e))
+        Ok(contents)
     })();
 
-    match parsed {
-        Ok(val) => match decode_one(state, &val, 0, options) {
-            Ok(()) => 1,
-            Err(e) => {
-                drop(val);
-                laux::lua_push(state, e);
-                laux::throw_error(state)
-            }
-        },
+    let contents = match contents {
+        Ok(c) => c,
+        Err(e) => {
+            laux::lua_push(state, e);
+            laux::throw_error(state)
+        }
+    };
+
+    if contents.is_empty() {
+        laux::lua_pushnil(state);
+        return 1;
+    }
+
+    // Hand the bytes to Lua's GC heap, then drop the Rust-owned buffer. The
+    // streaming decode below borrows from this Lua string, so no Rust heap is
+    // held across the push phase: a longjmp mid-decode leaks nothing. The source
+    // string sits below the decoded result and is discarded by the return.
+    laux::lua_push(state, contents.as_slice());
+    drop(contents);
+
+    let data = unsafe { laux::lua_to_lstring(state, -1) };
+    match decode_bytes(state, data, options) {
+        Ok(n) => n,
         Err(e) => {
             laux::lua_push(state, e);
             laux::throw_error(state)
@@ -738,9 +899,18 @@ extern "C-unwind" fn json_array(state: LuaState) -> c_int {
     1
 }
 
+/// Alternative decoder backed by the yyjson C implementation
+extern "C-unwind" fn yyjson_decode(state: LuaState) -> i32 {
+    unsafe extern "C-unwind" {
+        fn lua_json_decode(state: *mut ffi::lua_State) -> c_int;
+    }
+    unsafe { lua_json_decode(state.as_ptr()) }
+}
+
 pub extern "C-unwind" fn luaopen_json(state: LuaState) -> i32 {
     let l = [
-        lreg!("decode", decode),
+        // lreg!("decode", decode),
+        lreg!("decode", yyjson_decode),
         lreg!("decode_file", decode_file),
         lreg!("encode", encode),
         lreg!("concat", concat),

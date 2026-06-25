@@ -72,6 +72,18 @@ local function request_handler(fd, request)
         end
     end
 
+    -- 为 request 添加 parse_query 方法 (request.query_string 已提供)
+    if not request.parse_query then
+        function request:parse_query()
+            local q = {}
+            local qs = self.query_string or ""
+            for k, v in qs:gmatch("([^&=]+)=([^&=]*)") do
+                q[k] = v
+            end
+            return q
+        end
+    end
+
     local handler = routers[request.path] or routers["*"]
     if handler then
         local ok, err = xpcall(handler, traceback, request, response)

@@ -1,7 +1,7 @@
 use crate::lua_json::{JsonOptions, encode_table};
 use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests};
 use dashmap::DashMap;
-use futures::TryStreamExt;
+use futures_util::TryStreamExt;
 use lazy_static::lazy_static;
 use moon_base::laux::LuaState;
 use moon_base::{
@@ -370,7 +370,7 @@ impl DatabasePool {
 /// `query` can buffer; large result sets must use the streaming cursor API.
 async fn collect_capped<S, R>(mut stream: S) -> Result<Vec<R>, sqlx::Error>
 where
-    S: futures::Stream<Item = Result<R, sqlx::Error>> + Unpin,
+    S: futures_util::Stream<Item = Result<R, sqlx::Error>> + Unpin,
 {
     let mut rows = Vec::new();
     while let Some(row) = stream.try_next().await? {
@@ -503,10 +503,8 @@ async fn handle_result(
             let _ = CONTEXT.send_value(protocol_type, owner, session, rows);
             if *failed_times > 0 {
                 log::info!(
-                    "Database '{}' recover from error. Retry success. ({}:{})",
-                    database_url,
-                    file!(),
-                    line!()
+                    "Database '{}' recover from error. Retry success.",
+                    database_url
                 );
             }
             counter.dec();
@@ -526,22 +524,18 @@ async fn handle_result(
                 // and wedging this single-threaded handler.
                 if !is_transient_sqlx_error(&err) {
                     log::error!(
-                        "Database '{}' permanent error: '{}'. Dropped (fire-and-forget, no retry). ({}:{})",
+                        "Database '{}' permanent error: '{}'. Dropped (fire-and-forget, no retry).",
                         database_url,
-                        err,
-                        file!(),
-                        line!()
+                        err
                     );
                     counter.dec();
                     return false;
                 }
                 if *failed_times > 0 {
                     log::error!(
-                        "Database '{}' transient error: '{}'. Will retry. ({}:{})",
+                        "Database '{}' transient error: '{}'. Will retry.",
                         database_url,
-                        err,
-                        file!(),
-                        line!()
+                        err
                     );
                 }
                 *failed_times += 1;
@@ -1169,7 +1163,16 @@ fn push_sqlx_response(state: LuaState, result: DatabaseResponse) -> c_int {
 extern "C-unwind" fn stats(state: LuaState) -> c_int {
     let table = LuaTable::new(state, 0, DATABASE_CONNECTIONS.len());
     DATABASE_CONNECTIONS.iter().for_each(|pair| {
-        table.insert(pair.key().as_str(), pair.value().counter.load());
+        let counter = &pair.value().counter;
+        table.rawset_x(pair.key().as_str(), || {
+            crate::request_pool::push_pool_stats(
+                state,
+                counter.load(),
+                counter.total(),
+                counter.peak(),
+                1,
+            );
+        });
     });
     1
 }

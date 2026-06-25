@@ -3,6 +3,7 @@
 
 --- PostgreSQL connection pool userdata.
 ---@class pg_pool
+local pg_pool = {}
 
 --- Native PostgreSQL driver (`require("pg.core")`).
 ---@class pg.core
@@ -23,8 +24,8 @@ function pg.connect(database_url, name, timeout, max_connections, read_timeout, 
 ---@return pg_pool? pool
 function pg.find_connection(name) end
 
---- Pending request counts per named pool.
----@return table<string, integer>
+--- Statistics per named pool.
+---@return table<string, pool_stats>
 function pg.stats() end
 
 --- Execute a SQL query asynchronously.
@@ -42,26 +43,28 @@ function pg_pool:query_params(sql, ...) end
 
 --- Execute a pipeline of queries asynchronously.
 ---@param pool pg_pool
----@vararg string sql
+---@param queries table @ `{ {sql, p1, ...}, {sql, p1, ...}, ... }`
 ---@return integer session
-function pg_pool:pipe(...) end
+function pg_pool:pipe(queries) end
 
 --- Bulk insert asynchronously.
 ---@param pool pg_pool
 ---@param table_name string
 ---@param columns string[]
 ---@param rows any[][]
+---@param conflict? string|table @ optional ON CONFLICT clause
 ---@return integer session
-function pg_pool:insert_many(table_name, columns, rows) end
+function pg_pool:insert_many(table_name, columns, rows, conflict) end
 
 --- Bulk update asynchronously.
 ---@param pool pg_pool
 ---@param table_name string
+---@param key_column string @ the column matched in the WHERE clause
 ---@param set_columns string[]
----@param where_column string
----@param rows any[][]
+---@param rows any[][] @ array of `{ key, set1, set2, ... }`
+---@param key_type? string @ e.g. "bigint" — cast the join key to keep its index usable
 ---@return integer session
-function pg_pool:update_many(table_name, set_columns, where_column, rows) end
+function pg_pool:update_many(table_name, key_column, set_columns, rows, key_type) end
 
 --- Fire-and-forget query.
 ---@param pool pg_pool
@@ -78,26 +81,28 @@ function pg_pool:exec_query_params(sql, ...) end
 
 --- Fire-and-forget pipeline.
 ---@param pool pg_pool
----@vararg string
+---@param queries table @ `{ {sql, p1, ...}, {sql, p1, ...}, ... }`
 ---@return boolean
-function pg_pool:exec_pipe(...) end
+function pg_pool:exec_pipe(queries) end
 
 --- Fire-and-forget bulk insert.
 ---@param pool pg_pool
 ---@param table_name string
 ---@param columns string[]
 ---@param rows any[][]
+---@param conflict? string|table @ optional ON CONFLICT clause
 ---@return boolean
-function pg_pool:exec_insert_many(table_name, columns, rows) end
+function pg_pool:exec_insert_many(table_name, columns, rows, conflict) end
 
 --- Fire-and-forget bulk update.
 ---@param pool pg_pool
 ---@param table_name string
+---@param key_column string @ the column matched in the WHERE clause
 ---@param set_columns string[]
----@param where_column string
----@param rows any[][]
+---@param rows any[][] @ array of `{ key, set1, set2, ... }`
+---@param key_type? string @ e.g. "bigint" — cast the join key to keep its index usable
 ---@return boolean
-function pg_pool:exec_update_many(table_name, set_columns, where_column, rows) end
+function pg_pool:exec_update_many(table_name, key_column, set_columns, rows, key_type) end
 
 --- Pending request counts per pool worker.
 ---@param pool pg_pool

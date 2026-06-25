@@ -9,7 +9,7 @@ use moon_runtime::{
     actor::LuaActor,
     buffer::Buffer,
     check_buffer,
-    context::{self, ActorId, CONTEXT, Message, MessageBody},
+    context::{self, CONTEXT, Message, MessageBody},
 };
 use std::{
     ffi::c_int,
@@ -27,12 +27,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-const CLUSTER_ACTOR_ID: ActorId = 0xFFFF_FF00;
-
 const CONNECT_TIMEOUT_MS: u64 = 5000;
 const PING_INTERVAL_MS: u64 = 5000;
 const CALL_TIMEOUT_S: u64 = 10;
-const MAX_FRAME_SIZE: usize = crate::LIMITS.cluster_frame_bytes;
+const MAX_FRAME_SIZE: usize = crate::LIMITS.max_network_read_bytes;
 const CLUSTER_WRITE_QUEUE_CAPACITY: usize = crate::LIMITS.network_write_queue_capacity;
 
 type ClusterWriteSender = mpsc::Sender<ClusterFrame>;
@@ -405,7 +403,7 @@ fn dispatch_frame(mut frame: Box<Buffer>, remote_node_id: u32) {
 
                 frame.consume(nl + 1);
                 let _ = CONTEXT.send(Message {
-                    from: CLUSTER_ACTOR_ID,
+                    from: context::CLUSTER_ACTOR_ADDR,
                     to: actor_id,
                     session: -local_session,
                     data: MessageBody::Buffer(context::PTYPE_LUA, frame),
@@ -811,7 +809,7 @@ fn on_connection_closed(node_id: u32, cgen: u64, reason: ClusterCloseReason) {
     // to all unique actors so they can react to connection loss.
     if !has_newer {
         let payload = format!("_cluster_close,{},{}", node_id, reason.as_str());
-        CONTEXT.broadcast_system(CLUSTER_ACTOR_ID, &payload);
+        CONTEXT.broadcast_system(context::CLUSTER_ACTOR_ADDR, &payload);
     }
 }
 
@@ -1065,7 +1063,7 @@ extern "C-unwind" fn lua_cluster_init(state: LuaState) -> c_int {
 
     // Register pseudo-actor for receiving call responses
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
-    CONTEXT.register_pseudo_actor(CLUSTER_ACTOR_ID, tx);
+    CONTEXT.register_pseudo_actor(context::CLUSTER_ACTOR_ADDR, tx);
 
     spawn_response_reader(rx);
     spawn_keepalive();
@@ -1305,7 +1303,9 @@ pub extern "C-unwind" fn luaopen_cluster(state: LuaState) -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::context::ActorId;
+
+use super::*;
     use serial_test::{parallel, serial};
 
     fn reg_actor(id: ActorId) -> mpsc::UnboundedReceiver<Message> {

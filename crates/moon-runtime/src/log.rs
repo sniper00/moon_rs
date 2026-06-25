@@ -22,7 +22,6 @@ const STATE_STOPPING: u8 = 2;
 const STATE_STOPPED: u8 = 3;
 
 struct LoggerConext {
-    error_count: AtomicUsize,
     enable_stdout: AtomicBool,
     state: Arc<AtomicU8>,
     level: AtomicU8,
@@ -31,6 +30,8 @@ struct LoggerConext {
 pub struct Logger {
     sender: Sender<LogMessage>,
     state: Arc<LoggerConext>,
+    // Number of log lines enqueued but not yet written by the consumer thread.
+    pending: Arc<AtomicUsize>,
 }
 
 enum LogMessage {
@@ -46,14 +47,30 @@ impl log::Log for Logger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
+            // Append the source location (file:line) captured by the `log` macros so
+            // every Rust log carries it automatically, matching the manual
+            // `({file}:{line})` convention used elsewhere.
+            let suffix = format!(
+                " ({}:{})",
+                record.file().unwrap_or("<unknown>"),
+                record.line().unwrap_or(0)
+            );
             if let Some(str_record) = record.args().as_str() {
-                let mut line = self.make_line(true, record.level(), str_record.len());
+                let mut line =
+                    self.make_line(true, record.level(), str_record.len() + suffix.len());
+                // Non-actor logs use a zero address so they align with the
+                // `{actor_id:08X}| ` column emitted for per-actor logs.
+                line.write_str("00000000| ");
                 line.write_str(str_record);
+                line.write_str(&suffix);
                 self.write(line);
             } else {
                 let str_record = record.args().to_string();
-                let mut line = self.make_line(true, record.level(), str_record.len());
+                let mut line =
+                    self.make_line(true, record.level(), str_record.len() + suffix.len());
+                line.write_str("00000000| ");
                 line.write_str(str_record.as_str());
+                line.write_str(&suffix);
                 self.write(line);
             }
         }
@@ -73,13 +90,15 @@ impl Logger {
         let (sender, receiver) = mpsc::channel::<LogMessage>();
 
         let state = Arc::new(LoggerConext {
-            error_count: AtomicUsize::new(0),
             enable_stdout: AtomicBool::new(true),
             state: Arc::new(AtomicU8::new(STATE_INIT)),
             level: AtomicU8::new(Logger::level_to_u8(Level::Debug)),
         });
 
         let clone_state = state.clone();
+
+        let pending = Arc::new(AtomicUsize::new(0));
+        let clone_pending = pending.clone();
 
         thread::spawn(move || {
             let mut file: Option<File> = None;
@@ -90,6 +109,7 @@ impl Logger {
                 match receiver.recv() {
                     Ok(message) => match message {
                         LogMessage::Line(mut line) => {
+                            clone_pending.fetch_sub(1, Ordering::Relaxed);
                             let enable_stdout = line.read_u8(0) != 0;
                             let level = line.read_u8(1);
                             line.consume(2);
@@ -127,7 +147,11 @@ impl Logger {
             clone_state.state.store(STATE_STOPPED, Ordering::Release);
         });
 
-        Logger { sender, state }
+        Logger {
+            sender,
+            state,
+            pending,
+        }
     }
 
     pub fn level_to_u8(level: Level) -> u8 {
@@ -174,7 +198,7 @@ impl Logger {
 
     pub fn make_line(&self, mut enable_stdout: bool, level: Level, data_size: usize) -> Buffer {
         if level == Level::Error {
-            self.state.error_count.fetch_add(1, Ordering::Release);
+            CONTEXT.increment_error_count();
         }
 
         let self_enable_stdout = self.state.enable_stdout.load(Ordering::Acquire);
@@ -204,7 +228,15 @@ impl Logger {
     }
 
     pub fn write(&self, data: Buffer) {
-        let _ = self.sender.send(LogMessage::Line(data));
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if self.sender.send(LogMessage::Line(data)).is_err() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Number of log lines enqueued but not yet flushed by the consumer thread.
+    pub fn pending_count(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
     }
 
     pub fn stop(&self) {

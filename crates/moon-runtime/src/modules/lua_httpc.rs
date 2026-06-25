@@ -82,11 +82,11 @@ fn version_to_string(version: &reqwest::Version) -> &str {
 }
 
 /// Read a response body into memory, refusing to buffer more than
-/// `crate::LIMITS.network_read_bytes` bytes. The advertised `Content-Length` (when
+/// `crate::LIMITS.max_network_read_bytes` bytes. The advertised `Content-Length` (when
 /// present) is rejected up-front; the streamed total is also enforced because
 /// the header may be absent or untruthful (e.g. chunked transfer).
 async fn read_body_capped(mut response: reqwest::Response) -> Result<bytes::Bytes, Box<dyn Error>> {
-    let limit = crate::LIMITS.network_read_bytes;
+    let limit = crate::LIMITS.max_network_read_bytes;
     if let Some(len) = response.content_length() {
         if len > limit as u64 {
             return Err(format!(
@@ -195,13 +195,13 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
     // preserved, and cap it so a single request can't buffer an unbounded
     // amount of memory before it is even sent.
     let body: Vec<u8> = match laux::opt_field::<&[u8]>(state, 1, "body") {
-        Some(b) if b.len() > crate::LIMITS.network_read_bytes => {
+        Some(b) if b.len() > crate::LIMITS.max_network_read_bytes => {
             return crate::lua_push_error(
                 state,
                 &format!(
                     "http request body too large: {} bytes (max {})",
                     b.len(),
-                    crate::LIMITS.network_read_bytes
+                    crate::LIMITS.max_network_read_bytes
                 ),
             );
         }

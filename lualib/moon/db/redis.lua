@@ -18,7 +18,7 @@ moon.register_protocol {
 ---@field public message? string @ error message
 
 ---@class redis
----@field public obj userdata
+---@field obj redis_pool
 local M = {}
 M.__index = M
 
@@ -58,7 +58,9 @@ function M:len()
     return self.obj:len()
 end
 
----Total pending requests across all named pools.
+---Statistics (pending/total/peak/workers) per named pool.
+---@nodiscard
+---@return table<string, pool_stats>
 function M.stats()
     return c.stats()
 end
@@ -127,30 +129,47 @@ end
 -- Pub/Sub watch (native redis.core)
 ---------------------------------------------------------------------------
 
+---@class redis_watcher
+---@field obj redis_watch
 local watch_meta = {}
 watch_meta.__index = watch_meta
 
+---Subscribe to channels.
+---@vararg string
+---@return boolean|table
 function watch_meta:subscribe(...)
     return self.obj:subscribe(...)
 end
 
+---Pattern-subscribe.
+---@vararg string
+---@return boolean|table
 function watch_meta:psubscribe(...)
     return self.obj:psubscribe(...)
 end
 
+---Unsubscribe from channels.
+---@vararg string
+---@return boolean|table
 function watch_meta:unsubscribe(...)
     return self.obj:unsubscribe(...)
 end
 
+---Pattern-unsubscribe.
+---@vararg string
+---@return boolean|table
 function watch_meta:punsubscribe(...)
     return self.obj:punsubscribe(...)
 end
 
+---Close the watch connection.
+---@return boolean
 function watch_meta:disconnect()
     return self.obj:close()
 end
 
 ---Wait for the next pub/sub message.
+---@async
 ---@return string|nil message
 ---@return string|nil channel
 ---@return string|nil pattern
@@ -172,8 +191,9 @@ function watch_meta:message()
 end
 
 ---Create a dedicated pub/sub connection (Rust `redis.core.watch`).
+---@async
 ---@param db_conf table @ `{ host, port?, auth?, db?, timeout? }`
----@return table|nil watcher
+---@return redis_watcher|nil watcher
 ---@return string|nil err
 function M.watch(db_conf)
     local session = c.watch(db_conf)

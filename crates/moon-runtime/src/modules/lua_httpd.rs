@@ -33,7 +33,7 @@ use moon_runtime::context::{self, ActorId, CONTEXT};
 use crate::LIMITS;
 use crate::next_net_fd;
 
-const DEFAULT_MAX_BODY_SIZE: usize = LIMITS.http_body_bytes;
+const DEFAULT_MAX_BODY_SIZE: usize = LIMITS.max_http_body_bytes;
 const STREAM_THRESHOLD: u64 = LIMITS.http_static_stream_threshold_bytes;
 const CACHE_TTL: Duration = Duration::from_secs(LIMITS.http_static_cache_ttl_secs);
 const MAX_CACHE_ENTRIES: usize = LIMITS.http_static_cache_entries;
@@ -693,13 +693,13 @@ extern "C-unwind" fn response(state: LuaState) -> c_int {
         LuaValue::String(s) => s.to_vec(),
         _ => Vec::new(),
     };
-    if body.len() > LIMITS.network_read_bytes {
+    if body.len() > LIMITS.max_network_read_bytes {
         return crate::lua_push_error(
             state,
             &format!(
                 "httpd response: body of {} bytes exceeds limit of {} bytes",
                 body.len(),
-                LIMITS.network_read_bytes
+                LIMITS.max_network_read_bytes
             ),
         );
     }

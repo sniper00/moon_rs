@@ -1,6 +1,6 @@
 use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests};
 use dashmap::DashMap;
-use futures::stream::TryStreamExt;
+use futures_util::stream::TryStreamExt;
 use lazy_static::lazy_static;
 use mongodb::{
     Client, Collection, IndexModel,
@@ -199,11 +199,9 @@ impl DatabaseState {
                     // to receive the error and the handler does not retry, so the
                     // failure is dropped after logging.
                     log::error!(
-                        "Database '{}' error: '{:?}'. Dropped (fire-and-forget, no retry). ({}:{})",
+                        "Database '{}' error: '{:?}'. Dropped (fire-and-forget, no retry).",
                         self.database_url,
-                        err.to_string(),
-                        file!(),
-                        line!()
+                        err.to_string()
                     );
                 }
             }
@@ -257,13 +255,7 @@ where
                     return Err(err);
                 }
                 if failed_times == 0 {
-                    log::error!(
-                        "mongodb '{}' network error: {}. retrying. ({}:{})",
-                        database_url,
-                        err,
-                        file!(),
-                        line!()
-                    );
+                    log::error!("mongodb '{}' network error: {}. retrying.", database_url, err);
                 }
                 failed_times += 1;
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1349,6 +1341,23 @@ extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
     1
 }
 
+extern "C-unwind" fn stats(state: LuaState) -> c_int {
+    let table = LuaTable::new(state, 0, DATABASE_CONNECTIONSS.len());
+    DATABASE_CONNECTIONSS.iter().for_each(|pair| {
+        let counter = &pair.value().counter;
+        table.rawset_x(pair.key().as_str(), || {
+            crate::request_pool::push_pool_stats(
+                state,
+                counter.load(),
+                counter.total(),
+                counter.peak(),
+                1,
+            );
+        });
+    });
+    1
+}
+
 fn lua_to_doc(value: LuaValue) -> Result<Document, String> {
     match value {
         LuaValue::Table(val) => table_to_doc(val),
@@ -1467,6 +1476,7 @@ pub extern "C-unwind" fn luaopen_mongodb(state: LuaState) -> c_int {
     let l = [
         lreg!("connect", connect),
         lreg!("find_connection", find_connection),
+        lreg!("stats", stats),
         lreg!("tt", tt),
         lreg_null!(),
     ];

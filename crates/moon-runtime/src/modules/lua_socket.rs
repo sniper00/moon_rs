@@ -5,7 +5,11 @@ use moon_base::{
     laux::{self, LuaState, LuaType},
     lreg, lreg_null, luaL_newlib,
 };
-use moon_runtime::{buffer::Buffer, check_arc_buffer, context::MessageBody};
+use moon_runtime::{
+    buffer::{BUFFER_HEAD_RESERVE, Buffer},
+    check_arc_buffer,
+    context::MessageBody,
+};
 use std::{
     ffi::{c_int, c_void},
     io::{Error, ErrorKind, IoSlice},
@@ -57,8 +61,8 @@ const SOCKET_DATA_CLOSE: u8 = 4;
 const MESSAGE_CONTINUED_FLAG: u16 = u16::MAX;
 
 /// Hard upper bound on the bytes a single `socket.read` may request
-/// (`read_bytes`) or accumulate (`read_until`). See `crate::LIMITS.network_read_bytes`.
-const MAX_READ_SIZE: usize = crate::LIMITS.network_read_bytes;
+/// (`read_bytes`) or accumulate (`read_until`). See `crate::LIMITS.max_network_read_bytes`.
+const MAX_READ_SIZE: usize = crate::LIMITS.max_network_read_bytes;
 const MAX_SOCKET_WRITE_BATCH_BYTES: usize = crate::LIMITS.socket_write_batch_bytes;
 
 enum SocketWriteItem {
@@ -80,8 +84,6 @@ async fn read_until(
     delim: Delimiter,
     read_timeout: u64,
 ) -> bool {
-    // Never accumulate past the global ceiling, regardless of the caller's max.
-    let max_size = max_size.min(MAX_READ_SIZE);
     let mut with_delim = false;
     let raw = delim.as_slice();
     let delim_bytes = if raw[0] == b'^' {
@@ -595,7 +597,8 @@ async fn read_one_frame(
         let size = header as usize;
 
         if size == 0 && fin {
-            if let Some(buf) = data.take() {
+            if let Some(mut buf) = data.take() {
+                buf.seek(BUFFER_HEAD_RESERVE as isize);
                 return Ok(buf);
             }
             continue;
@@ -610,7 +613,13 @@ async fn read_one_frame(
 
         let buf = data.get_or_insert_with(|| {
             let alloc_size = if fin { size } else { size * 2 };
-            Box::new(Buffer::with_capacity(alloc_size))
+            // Reserve BUFFER_HEAD_RESERVE bytes at the front so downstream Lua
+            // code (e.g. `buffer.write_front`) can prepend headers without
+            // reallocating/shifting. The reserved bytes are committed up front
+            // and skipped past via `seek` before the buffer is handed off.
+            let mut buf = Box::new(Buffer::with_capacity(alloc_size + BUFFER_HEAD_RESERVE));
+            let _ = buf.commit(BUFFER_HEAD_RESERVE);
+            buf
         });
 
         if size > 0 {
@@ -643,7 +652,8 @@ async fn read_one_frame(
         }
 
         if fin {
-            if let Some(buf) = data.take() {
+            if let Some(mut buf) = data.take() {
+                buf.seek(BUFFER_HEAD_RESERVE as isize);
                 return Ok(buf);
             }
         }
@@ -865,7 +875,7 @@ extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
                 );
             }
         };
-        let max_size = laux::lua_opt(state, 3).unwrap_or(crate::LIMITS.socket_read_until_bytes);
+        let max_size = laux::lua_opt(state, 3).unwrap_or(crate::LIMITS.max_network_read_bytes);
         let read_timeout: u64 = laux::lua_opt(state, 4).unwrap_or(0);
         if let Some(channel) = NET.get(&fd) {
             let actor = LuaActor::from_lua_state(state);

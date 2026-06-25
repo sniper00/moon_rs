@@ -10,6 +10,7 @@ local xpcall = xpcall
 
 local _M = {}
 
+---@async
 function _M.wait_all(fnlist)
     local n = #fnlist
     local res = {}

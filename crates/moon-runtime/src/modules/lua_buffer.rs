@@ -5,9 +5,10 @@ use moon_base::{
     lreg, lreg_null, luaL_newlib,
 };
 use std::ffi::{c_int, c_void};
-use std::sync::Arc;
 
 use moon_runtime::buffer::{self, Buffer};
+
+use crate::check_arc_buffer;
 
 const MAX_DEPTH: i32 = 32;
 
@@ -150,8 +151,11 @@ extern "C-unwind" fn unpack(state: LuaState) -> c_int {
                     pos += 4;
                 }
                 'C' => {
-                    laux::lua_pushlightuserdata(state, buf.as_ptr() as *mut c_void);
-                    laux::lua_push(state, buf.len() as lua_Integer);
+                    laux::lua_pushlightuserdata(
+                        state,
+                        unsafe { buf.as_ptr().add(pos) } as *mut c_void,
+                    );
+                    laux::lua_push(state, (len - pos) as lua_Integer);
                 }
                 'Z' => {
                     laux::lua_push(state, buf.as_slice());
@@ -299,29 +303,9 @@ extern "C-unwind" fn clear(state: LuaState) -> c_int {
 }
 
 extern "C-unwind" fn into_arc_buffer(state: LuaState) -> c_int {
-    let val = LuaValue::from_stack(state, 1);
-    match val {
-        LuaValue::LightUserData(ptr) => {
-            if ptr.is_null() {
-                laux::lua_error(
-                    state,
-                    "bad argument #1 (non-null lightuserdata expected)".to_string(),
-                );
-            }
-            let data = unsafe { Arc::<Buffer>::from(Box::from_raw(ptr as *mut Buffer)) };
-            laux::lua_newuserdata(state, data, cstr!("shared_buffer"), &[lreg_null!()]);
-            1
-        }
-        _ => {
-            laux::lua_error(
-                state,
-                format!(
-                    "bad argument #1 (buffer lightuserdata expected, got {})",
-                    laux::type_name(state, 1)
-                ),
-            );
-        }
-    }
+    let buf = check_arc_buffer(state, 1);
+    laux::lua_newuserdata(state, buf, cstr!("shared_buffer"), &[lreg_null!()]);
+    1
 }
 
 pub extern "C-unwind" fn luaopen_buffer(state: LuaState) -> c_int {

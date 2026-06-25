@@ -18,6 +18,7 @@ use std::ffi::c_int;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use moon_base::laux::LuaValue;
 use moon_base::{
     cstr, ffi, laux,
     laux::LuaState,
@@ -279,7 +280,6 @@ struct PbMessage {
     is_map: bool,
     name: String,
     full_name: String,
-    meta_name_c: CString,
     all_fields: Vec<PbField>,
     oneof_decl: Vec<CString>,
     fast_fields: [Option<usize>; 32],
@@ -628,34 +628,32 @@ impl Protobuf {
             ffi::lua_createtable(state.as_ptr(), 0, msg.all_fields.len() as c_int);
 
             for field in &msg.all_fields {
+                // Repeated/map fields default to an (empty) table that decode
+                // appends into.
                 if field.is_repeated() || field.is_map {
                     ffi::lua_createtable(state.as_ptr(), 0, 0);
                     ffi::lua_setfield(state.as_ptr(), -2, field.name_c.as_ptr());
+                    continue;
                 }
-            }
 
-            if ffi::luaL_newmetatable(state.as_ptr(), msg.meta_name_c.as_ptr()) != 0 {
-                ffi::lua_createtable(state.as_ptr(), 0, msg.all_fields.len() as c_int);
-                for field in &msg.all_fields {
-                    if field.is_repeated() || field.is_map {
-                        continue;
+                // Singular fields are pre-populated with their proto3 default
+                // value directly in the result table (no `__index` metatable);
+                // decode overwrites any field actually present on the wire.
+                // Message-typed fields have no scalar default, so they are left
+                // absent (read back as `nil`).
+                match field.type_ {
+                    FieldType::Message => continue,
+                    FieldType::Bool => ffi::lua_pushboolean(state.as_ptr(), 0),
+                    FieldType::Double | FieldType::Float => {
+                        ffi::lua_pushnumber(state.as_ptr(), 0.0)
                     }
-                    match field.type_ {
-                        FieldType::Bool => ffi::lua_pushboolean(state.as_ptr(), 0),
-                        FieldType::Double | FieldType::Float => {
-                            ffi::lua_pushnumber(state.as_ptr(), 0.0)
-                        }
-                        FieldType::String | FieldType::Bytes => {
-                            ffi::lua_pushlstring(state.as_ptr(), b"".as_ptr() as _, 0);
-                        }
-                        FieldType::Message => ffi::lua_pushnil(state.as_ptr()),
-                        _ => ffi::lua_pushinteger(state.as_ptr(), 0),
+                    FieldType::String | FieldType::Bytes => {
+                        ffi::lua_pushlstring(state.as_ptr(), b"".as_ptr() as _, 0);
                     }
-                    ffi::lua_setfield(state.as_ptr(), -2, field.name_c.as_ptr());
+                    _ => ffi::lua_pushinteger(state.as_ptr(), 0),
                 }
-                ffi::lua_setfield(state.as_ptr(), -2, cstr!("__index"));
+                ffi::lua_setfield(state.as_ptr(), -2, field.name_c.as_ptr());
             }
-            ffi::lua_setmetatable(state.as_ptr(), -2);
         }
     }
 
@@ -1358,7 +1356,6 @@ impl Loader {
                         is_map: false,
                         name: String::new(),
                         full_name: String::new(),
-                        meta_name_c: CString::default(),
                         all_fields: std::mem::take(&mut all_fields),
                         oneof_decl: Vec::new(),
                         fast_fields: [None; 32],
@@ -1409,12 +1406,10 @@ impl Loader {
             }
         }
 
-        let meta_name = format!("__protobuf_meta_{}", full_name);
         self.all_messages.push(PbMessage {
             is_map,
             name,
             full_name: full_name.clone(),
-            meta_name_c: CString::new(meta_name).unwrap_or_default(),
             all_fields,
             oneof_decl,
             fast_fields: [None; 32],
@@ -1622,7 +1617,12 @@ extern "C-unwind" fn pb_encode(state: LuaState) -> c_int {
 
 extern "C-unwind" fn pb_decode(state: LuaState) -> c_int {
     let cmd_name = unsafe { laux::lua_check_str(state, 1) };
-    let data = unsafe { laux::lua_check_lstring(state, 2) };
+    let data = if let LuaValue::LightUserData(ptr) = LuaValue::from_stack(state, 2) {
+        let len = laux::lua_get(state, 3);
+        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
+    }else {
+        unsafe { laux::lua_check_lstring(state, 2) }
+    };
 
     let pb = match Protobuf::new() {
         Some(p) => p,
@@ -1992,7 +1992,7 @@ mod tests {
             assert(t.b == "hello", "b mismatch: " .. tostring(t.b))
             assert(#t.c == 3 and t.c[1] == 1 and t.c[3] == 3, "repeated mismatch")
 
-            -- proto3 default (zero/empty) fields are omitted but readable via metatable
+            -- proto3 default (zero/empty) fields are set directly on the table
             local empty = pb.decode("test.Foo", pb.encode("test.Foo", {}))
             assert(empty.a == 0, "default int should be 0")
             assert(empty.b == "", "default string should be empty")

@@ -34,7 +34,7 @@ function fs.isdir(path) end
 ---@return string? ext
 function fs.split(path) end
 
---- Get file extension (without dot).
+--- Get file extension (with dot).
 ---@param path string
 ---@return string? ext
 function fs.ext(path) end

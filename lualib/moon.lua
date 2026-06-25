@@ -49,7 +49,7 @@ local _decode          = core.decode
 ---| 3 # LOG_INFO
 ---| 4 # LOG_DEBUG
 
----@class moon : runtime
+---@class moon : moon.core
 local moon             = core
 
 moon.PTYPE_SYSTEM      = 1
@@ -176,7 +176,7 @@ end
 --- @param data? string|buffer_ptr @ The message content (raw data).
 --- @param session? integer @ The session ID for request-response pattern.
 --- @param sender? integer @ The dummy sender's service ID.
---- @return integer @ The session ID used for the message.
+--- @return integer, integer @ The session ID used for the message.
 function moon.raw_send(PTYPE, receiver, data, session, sender)
     local p = protocol[PTYPE]
     if not p then
@@ -232,14 +232,16 @@ end
 --- @param name string @ The name of the object in the environment.
 --- @param ... any @ The Lua object(s) to be packed.
 function moon.env_packed(name, ...)
-    return core.env(name, seri.packs(...))
+    return core.env(name, seri.packstring(...))
 end
 
 --- Retrieves a Lua object stored in the moon's environment and unpacks it.
 --- @param name string @ The name of the object in the environment.
 --- @return any @ The unpacked Lua object.
 function moon.env_unpacked(name)
-    return seri.unpack(core.env(name))
+    local s = core.env(name)
+    if s == nil or s == "" then return nil end
+    return seri.unpack(s)
 end
 
 --- Retrieves the current server UTC timestamp.
@@ -256,7 +258,7 @@ end
 ---
 ---@return string[] @An array of the command-line arguments
 function moon.args()
-    ---@diagnostic disable-next-line: need-check-nil
+    ---@diagnostic disable-next-line: need-check-nil, param-type-not-match
     return load(moon.env("ARG"))()
 end
 
@@ -427,6 +429,7 @@ local function _dispatch(PTYPE, sender, session, m)
         local co = session_id_coroutine[session]
         session_id_coroutine[session] = nil
         if co then
+            ---@diagnostic disable-next-line: param-type-not-match
             coresume(co, m)
             return
         end
@@ -453,6 +456,7 @@ local function _dispatch(PTYPE, sender, session, m)
     end
 end
 
+---@diagnostic disable-next-line: param-type-not-match
 core.callback(_dispatch)
 
 --- Registers a new message protocol.
@@ -540,6 +544,7 @@ system_command._service_exit = function(sender, what)
             local co = session_id_coroutine[k]
             if co then
                 session_id_coroutine[k] = nil
+                ---@diagnostic disable-next-line: param-type-not-match
                 coresume(co, false, what)
                 return
             end
@@ -687,7 +692,7 @@ end
 
 debug_command.state = function()
     local running_num, free_num = moon.coroutine_num()
-    return string.format("coroutine: running %d free %d. cpu:%d", running_num, free_num, moon.cpu())
+    return string.format("coroutine: running %d free %d", running_num, free_num)
 end
 
 reg_protocol {
@@ -696,6 +701,7 @@ reg_protocol {
     pack = moon.pack,
     dispatch = function(sender, session, cmd, ...)
         local func = debug_command[cmd]
+        ---@diagnostic disable-next-line: unnecessary-if
         if func then
             moon.response("debug", sender, session, func(...))
         else

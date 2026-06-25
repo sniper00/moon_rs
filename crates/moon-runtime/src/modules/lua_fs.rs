@@ -124,7 +124,7 @@ extern "C-unwind" fn lfs_ext(state: LuaState) -> c_int {
     let path = Path::new(path);
 
     if let Some(ext) = path.extension() {
-        laux::lua_push(state, ext.to_string_lossy().as_ref());
+        laux::lua_push(state, format!(".{}", ext.to_string_lossy().as_ref()));
     } else {
         laux::lua_pushnil(state);
     }

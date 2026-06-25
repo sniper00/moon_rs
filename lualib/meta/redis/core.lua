@@ -1,11 +1,20 @@
 ---@meta
 -- IDE annotation file only. Do not require this file at runtime.
 
+--- Per-connection pool statistics.
+---@class pool_stats
+---@field pending integer @ Requests dispatched but not yet replied to (current backpressure).
+---@field total integer @ Cumulative requests ever dispatched (lifetime).
+---@field peak integer @ High-water mark of simultaneous pending requests.
+---@field workers integer @ Number of worker tasks backing the connection.
+
 --- Redis connection pool userdata.
 ---@class redis_pool
+local redis_pool = {}
 
 --- Redis pub/sub watch session userdata.
 ---@class redis_watch
+local redis_watch = {}
 
 --- Native Redis driver (`require("redis.core")`).
 ---@class redis.core
@@ -30,8 +39,8 @@ function redis.find_connection(name) end
 ---@return integer session
 function redis.watch(opts) end
 
---- Pending request counts per named pool.
----@return table<string, integer>
+--- Statistics per named pool.
+---@return table<string, pool_stats>
 function redis.stats() end
 
 --- Execute a Redis command asynchronously.

@@ -141,10 +141,6 @@ impl PgPool {
             data,
         }))
     }
-
-    fn pending(&self) -> i64 {
-        self.inner.pending()
-    }
 }
 
 struct PgRequest {
@@ -676,13 +672,7 @@ async fn worker_loop(
                             break;
                         } else {
                             if failed_times == 0 {
-                                log::error!(
-                                    "pg '{}' reconnect failed: {}. retrying. ({}:{})",
-                                    name,
-                                    e,
-                                    file!(),
-                                    line!()
-                                );
+                                log::error!("pg '{}' reconnect failed: {}. retrying.", name, e);
                             }
                             failed_times += 1;
                             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -709,11 +699,9 @@ async fn worker_loop(
                         );
                     } else if let Some(err) = &result.error {
                         log::error!(
-                            "pg '{}' execute error: {} ({}:{})",
+                            "pg '{}' execute error: {}",
                             name,
-                            err.message.as_deref().unwrap_or("unknown"),
-                            file!(),
-                            line!()
+                            err.message.as_deref().unwrap_or("unknown")
                         );
                     }
                     counter.dec();
@@ -733,13 +721,7 @@ async fn worker_loop(
                         break;
                     } else {
                         if failed_times == 0 {
-                            log::error!(
-                                "pg '{}' socket error: {}. retrying. ({}:{})",
-                                name,
-                                e,
-                                file!(),
-                                line!()
-                            );
+                            log::error!("pg '{}' socket error: {}. retrying.", name, e);
                         }
                         failed_times += 1;
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1723,7 +1705,16 @@ extern "C-unwind" fn close(state: LuaState) -> c_int {
 extern "C-unwind" fn stats(state: LuaState) -> c_int {
     let table = LuaTable::new(state, 0, PG_CONNECTIONS.len());
     PG_CONNECTIONS.iter().for_each(|pair| {
-        table.insert(pair.key().as_str(), pair.value().pending());
+        let pool = &pair.value().inner;
+        table.rawset_x(pair.key().as_str(), || {
+            crate::request_pool::push_pool_stats(
+                state,
+                pool.pending(),
+                pool.total(),
+                pool.peak(),
+                pool.worker_count() as i64,
+            );
+        });
     });
     1
 }

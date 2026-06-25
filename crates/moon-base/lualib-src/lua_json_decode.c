@@ -5,7 +5,38 @@
 
 #include "yyjson/yyjson.h"
 
+#include <stdint.h>
+
 #define nullptr NULL
+
+/* Mirror of the Rust `JsonOptions` struct (crates/moon-runtime/src/modules/
+ * lua_json.rs). It is `#[repr(C)]` there and stored in-place inside the shared
+ * `json_options` userdata upvalue, so the field order/types MUST match. */
+typedef struct
+{
+    uint8_t empty_as_array;
+    uint8_t enable_number_key;
+    uint8_t enable_sparse_array;
+    uint8_t has_metatfield;
+    size_t  concat_buffer_size;
+} json_options;
+
+/* Fallback used only if the upvalue is missing; mirrors the defaults set in
+ * `luaopen_json`. */
+static const json_options DEFAULT_JSON_OPTIONS = { 1, 1, 0, 1, 512 };
+
+/* Tag the table on the stack top with the `__object` / `__array`
+ * marker metatable, matching Rust's `set_json_metatable`. `luaL_newmetatable`
+ * keys by name in the registry, so Rust and C share the exact same metatable. */
+static void set_json_metatable(lua_State* L, const char* meta_key)
+{
+    if (luaL_newmetatable(L, meta_key) != 0)
+    {
+        lua_pushboolean(L, 1);
+        lua_setfield(L, -2, meta_key);
+    }
+    lua_setmetatable(L, -2);
+}
 
 #define MAXBY10		((lua_Unsigned)LUA_MAXINTEGER / 10)
 #define MAXLASTD	((int)(LUA_MAXINTEGER % 10))
@@ -41,7 +72,7 @@ static const char *l_str2int(const char *s, size_t len, lua_Integer *result) {
     return s+i;
 }
 
-static void decode_one(lua_State* L, yyjson_val* value)
+static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt)
 {
     yyjson_type type = yyjson_get_type(value);
     switch (type)
@@ -55,9 +86,11 @@ static void decode_one(lua_State* L, yyjson_val* value)
         yyjson_arr_iter_init(value, &iter);
         while (nullptr != (value = yyjson_arr_iter_next(&iter)))
         {
-            decode_one(L, value);
+            decode_one(L, value, opt);
             lua_rawseti(L, -2, pos++);
         }
+        if (opt->has_metatfield)
+            set_json_metatable(L, "__array");
         break;
     }
     case YYJSON_TYPE_OBJ:
@@ -77,7 +110,7 @@ static void decode_one(lua_State* L, yyjson_val* value)
             if (key_len > 0)
             {
                 char c = key_str[0];
-                if ((c == '-' || (c >= '0' && c <= '9')))
+                if (opt->enable_number_key && (c == '-' || (c >= '0' && c <= '9')))
                 {
                     const char* last = key_str + key_len;
                     lua_Integer v = 0;
@@ -91,10 +124,12 @@ static void decode_one(lua_State* L, yyjson_val* value)
                 {
                     lua_pushlstring(L, key_str, key_len);
                 }
-                decode_one(L, val);
+                decode_one(L, val, opt);
                 lua_rawset(L, -3);
             }
         }
+        if (opt->has_metatfield)
+            set_json_metatable(L, "__object");
         break;
     }
     case YYJSON_TYPE_NUM:
@@ -104,7 +139,12 @@ static void decode_one(lua_State* L, yyjson_val* value)
         {
         case YYJSON_SUBTYPE_UINT:
         {
-            lua_pushinteger(L, (int64_t)unsafe_yyjson_get_uint(value));
+            uint64_t uv = unsafe_yyjson_get_uint(value);
+            if (uv > (uint64_t)INT64_MAX) {
+                lua_pushnumber(L, (lua_Number)uv);
+            } else {
+                lua_pushinteger(L, (int64_t)uv);
+            }
             break;
         }
         case YYJSON_SUBTYPE_SINT:
@@ -148,6 +188,7 @@ LUALIB_API int lua_json_decode(lua_State* L)
     }
     else
     {
+        luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);
         str = (const char*)lua_touserdata(L, 1);
         len = luaL_checkinteger(L, 2);
     }
@@ -157,13 +198,20 @@ LUALIB_API int lua_json_decode(lua_State* L)
 
     lua_settop(L, 1);
 
+    /* Shared options live in upvalue 1 (the `json_options` userdata) because all
+     * json.* functions are registered via luaL_setfuncs(..., 1). Fall back to
+     * defaults if this function was somehow registered without the upvalue. */
+    const json_options* opt = (const json_options*)lua_touserdata(L, lua_upvalueindex(1));
+    if (nullptr == opt)
+        opt = &DEFAULT_JSON_OPTIONS;
+
     yyjson_read_err err;
     yyjson_doc* doc = yyjson_read_opts((char*)str, len, 0, nullptr, &err);
     if (nullptr == doc)
     {
         return luaL_error(L, "decode error: %s code: %d at position: %d\n", err.msg, (int)err.code, (int)err.pos);
     }
-    decode_one(L, yyjson_doc_get_root(doc));
+    decode_one(L, yyjson_doc_get_root(doc), opt);
     yyjson_doc_free(doc);
     return 1;
 }

@@ -8,6 +8,7 @@ moon.register_protocol {
 }
 
 ---@class SqlX
+---@field obj sqlx_connection
 local M = {}
 
 ---@nodiscard
@@ -32,10 +33,14 @@ end
 
 ---@nodiscard
 ---@param name string Connection name
+---@return sqlx_connection?
 function M.find_connection(name)
     return c.find_connection(name)
 end
 
+---Statistics (pending/total/peak/workers) per named connection.
+---@nodiscard
+---@return table<string, pool_stats>
 function M.stats()
     return c.stats()
 end
@@ -81,11 +86,11 @@ end
 
 ---@async
 ---@nodiscard
----@param querys table
+---@param queries table @ `{ {sql, p1, ...}, {sql, p1, ...}, ... }`
 ---@return table
-function M:transaction(querys)
+function M:transaction(queries)
     local trans = c.make_transaction()
-    for _, v in ipairs(querys) do
+    for _, v in ipairs(queries) do
         trans:push(table.unpack(v))
     end
     local session = self.obj:transaction(trans)
@@ -95,10 +100,10 @@ function M:transaction(querys)
     return moon.wait(session)
 end
 
----@param querys table
-function M:execute_transaction(querys)
+---@param queries table @ `{ {sql, p1, ...}, {sql, p1, ...}, ... }`
+function M:execute_transaction(queries)
     local trans = c.make_transaction()
-    for _, v in ipairs(querys) do
+    for _, v in ipairs(queries) do
         trans:push(table.unpack(v))
     end
     local res = self.obj:exec_transaction(trans)
@@ -108,6 +113,7 @@ function M:execute_transaction(querys)
 end
 
 ---@async
+---@nodiscard
 ---@param sql string SQL query
 ---@param batch_size? integer Rows per batch (default 100)
 ---@vararg any Query parameters
@@ -118,6 +124,7 @@ end
 function M:query_stream(sql, batch_size, ...)
     local res = self.obj:query_stream(batch_size, sql, ...)
     if type(res) == "table" then
+        ---@diagnostic disable-next-line: return-type-mismatch, missing-return-value
         return nil, res.message or res.kind
     end
     local current_session = res
@@ -135,6 +142,7 @@ function M:query_stream(sql, batch_size, ...)
         end,
     })
 
+    ---@async
     local function iter()
         while true do
             if buffer and idx < #buffer then

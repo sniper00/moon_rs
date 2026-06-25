@@ -1,0 +1,24 @@
+{
+  "$schema": "https://raw.githubusercontent.com/EmmyLuaLs/emmylua-analyzer-rust/refs/heads/main/crates/emmylua_code_analysis/resources/schema.json",
+  "runtime": {
+    "version": "Lua5.5"
+  },
+  "workspace": {
+    "workspaceRoots": [
+      "lualib",
+      "assets"
+    ],
+    "library": [
+      "lualib/meta"
+    ],
+    "ignoreDir": [
+      ".git",
+      "target"
+    ]
+  },
+  "diagnostics": {
+    "globals": [
+      "moon"
+    ]
+  }
+}

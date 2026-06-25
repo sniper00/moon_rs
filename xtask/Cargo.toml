@@ -14,4 +14,4 @@ path = "src/main.rs"
 # light and offline-friendly. Used to parse extensions.toml and read/write the
 # extensions.lock file.
 serde = { version = "1", features = ["derive"] }
-toml = "0.5"
+toml = "1.1"

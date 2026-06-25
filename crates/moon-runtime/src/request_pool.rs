@@ -4,6 +4,7 @@
 //! configurations — allow dead code module-wide rather than annotating each.
 #![allow(dead_code)]
 
+use moon_base::laux::{LuaState, LuaTable};
 use moon_runtime::context::ActorId;
 use std::sync::{
     Arc,
@@ -11,40 +12,104 @@ use std::sync::{
 };
 use tokio::sync::mpsc;
 
+/// Per-worker request accounting shared between the Lua/actor thread (which
+/// enqueues) and the worker task (which dequeues). Tracks the live in-flight
+/// count plus lifetime totals and a high-water mark for `stats()`.
+struct CounterInner {
+    /// Requests dispatched but not yet replied to (current backpressure).
+    pending: AtomicI64,
+    /// Cumulative number of requests ever dispatched (monotonic).
+    total: AtomicI64,
+    /// Highest `pending` value ever observed (monotonic high-water mark).
+    peak: AtomicI64,
+}
+
 #[derive(Clone)]
 pub(crate) struct PendingCounter {
-    inner: Arc<AtomicI64>,
+    inner: Arc<CounterInner>,
 }
 
 impl PendingCounter {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Arc::new(AtomicI64::new(0)),
+            inner: Arc::new(CounterInner {
+                pending: AtomicI64::new(0),
+                total: AtomicI64::new(0),
+                peak: AtomicI64::new(0),
+            }),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_value(value: i64) -> Self {
         Self {
-            inner: Arc::new(AtomicI64::new(value)),
+            inner: Arc::new(CounterInner {
+                pending: AtomicI64::new(value),
+                total: AtomicI64::new(value),
+                peak: AtomicI64::new(value),
+            }),
         }
     }
 
     pub(crate) fn inc(&self) {
-        self.inner.fetch_add(1, Ordering::Release);
+        let pending = self.inner.pending.fetch_add(1, Ordering::Release) + 1;
+        self.inner.total.fetch_add(1, Ordering::Release);
+        // Best-effort high-water mark: bump `peak` up to the new pending value.
+        let mut peak = self.inner.peak.load(Ordering::Relaxed);
+        while pending > peak {
+            match self.inner.peak.compare_exchange_weak(
+                peak,
+                pending,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => peak = observed,
+            }
+        }
     }
 
     pub(crate) fn dec(&self) {
-        self.inner.fetch_sub(1, Ordering::Release);
+        self.inner.pending.fetch_sub(1, Ordering::Release);
     }
 
     pub(crate) fn load(&self) -> i64 {
-        self.inner.load(Ordering::Acquire)
+        self.inner.pending.load(Ordering::Acquire)
+    }
+
+    /// Cumulative requests ever dispatched on this counter.
+    pub(crate) fn total(&self) -> i64 {
+        self.inner.total.load(Ordering::Acquire)
+    }
+
+    /// Highest simultaneous `pending` ever observed on this counter.
+    pub(crate) fn peak(&self) -> i64 {
+        self.inner.peak.load(Ordering::Acquire)
     }
 
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
+}
+
+/// Build a per-connection stats table and leave it on top of the Lua stack.
+///
+/// Shared by every DB-backed module's `stats()` so the shape stays consistent:
+/// `{ pending, total, peak, workers }`. For pooled drivers (redis/pg) the
+/// values are summed across workers, so `peak` is the sum of per-worker
+/// high-water marks (an upper bound on true simultaneous peak).
+pub(crate) fn push_pool_stats(
+    state: LuaState,
+    pending: i64,
+    total: i64,
+    peak: i64,
+    workers: i64,
+) {
+    let t = LuaTable::new(state, 0, 4);
+    t.insert("pending", pending);
+    t.insert("total", total);
+    t.insert("peak", peak);
+    t.insert("workers", workers);
 }
 
 impl Default for PendingCounter {
@@ -129,12 +194,26 @@ impl<M> WorkerSet<M> {
                 worker.counter.inc();
                 Ok(())
             }
-            Err(err) => Err(err.to_string()),
+            Err(err) => Err(format!("{}: failed to send message to worker: {}", self.name, err)),
         }
     }
 
     pub(crate) fn pending(&self) -> i64 {
         self.workers.iter().map(|w| w.counter.load()).sum()
+    }
+
+    /// Cumulative requests dispatched across all workers (lifetime).
+    pub(crate) fn total(&self) -> i64 {
+        self.workers.iter().map(|w| w.counter.total()).sum()
+    }
+
+    /// Sum of per-worker pending high-water marks.
+    pub(crate) fn peak(&self) -> i64 {
+        self.workers.iter().map(|w| w.counter.peak()).sum()
+    }
+
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers.len()
     }
 }
 

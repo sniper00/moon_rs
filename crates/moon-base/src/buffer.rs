@@ -336,6 +336,15 @@ impl Buffer {
         assert!(offset + len <= self.data.len());
         &mut self.data[offset..offset + len]
     }
+
+    pub fn into_vec(mut self) -> Vec<u8> {
+        if self.rpos == 0 {
+            self.data
+        } else {
+            self.data.drain(..self.rpos);
+            self.data
+        }
+    }
 }
 
 impl From<Vec<u8>> for Buffer {

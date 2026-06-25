@@ -23,22 +23,18 @@ local core = {}
 ---@return number
 function core.clock() end
 
---- Convert a C string pointer + length to a Lua string.
----@param sz cstring_ptr
----@param len integer
----@return string
-function core.tostring(sz, len) end
-
---- Set or get an environment variable.
+--- Set or get an environment variable. With `value`, stores it and returns nothing;
+--- otherwise returns the stored value, or `nil` when the key is unset.
 ---@param key string
 ---@param value? string
----@return string
+---@return string?
 function core.env(key, value) end
 
---- Print a log message. First argument is log level string: `DBUG`, `INFO`, `WARN`, `EROR`.
----@param loglv string
----@vararg any
-function core.log(loglv, ...) end
+--- Print a log message.
+---@param loglv integer @ Log level (`LOG_DEBUG`/`LOG_INFO`/`LOG_WARN`/`LOG_ERROR`)
+---@param stack_level integer @ `lua_getstack` level used to attach the source location
+---@vararg any @ Values to log; each is serialized and joined with spaces
+function core.log(loglv, stack_level, ...) end
 
 --- Get or set the global log level.
 ---@param lv? string @ `DBUG`, `INFO`, `WARN`, `EROR`
@@ -52,7 +48,8 @@ function core.loglevel(lv) end
 function core.new_service(opts, params) end
 
 --- Look up a unique service id by name. Returns `0` if not found.
----@param name string
+--- An integer argument is returned unchanged (treated as an already-resolved id).
+---@param name string|integer
 ---@return integer
 function core.query(name) end
 
@@ -65,7 +62,7 @@ function core.kill(addr) end
 --- Send a message to another service.
 ---@param ptype integer @ Message type (`PTYPE_*`, must be > 0)
 ---@param to integer @ Receiver actor id
----@param data buffer_ptr|string @ Message body
+---@param data? buffer_ptr|string @ Message body
 ---@param session? integer @ Defaults to `next_session()`
 ---@param from? integer @ Defaults to current service id
 ---@return integer session
@@ -89,20 +86,52 @@ function core.next_session() end
 ---@param exitcode integer
 function core.exit(exitcode) end
 
---- Server timestamp in milliseconds.
+--- Server UTC timestamp. Returns `timestamp_millis / unit`, so `now(1)` is
+--- milliseconds and `now(1000)` is seconds.
+---@param unit? integer @ Divisor applied to the millisecond timestamp; defaults to `1` (clamped to `>= 1`)
 ---@return integer
-function core.now() end
+function core.now(unit) end
+
+--- Query runtime statistics.
+---
+--- Called with no argument, returns a JSON string snapshot keyed by the same
+--- names below. Called with a `key`, returns the matching scalar counter:
+--- - `"service.count"` live actor count
+--- - `"service.registered"` routing entries (includes pseudo-actors)
+--- - `"service.unique"` unique/named services
+--- - `"service.created"` total actors ever created
+--- - `"log.error_count"` total error-level logs
+--- - `"log.queue"` log lines enqueued but not yet flushed by the logger thread
+--- - `"timer.count"` scheduled-but-unfired timers
+--- - `"env.count"` runtime env vars
+--- - `"time.offset"` simulated-clock offset (ms)
+--- - `"time.now"` server timestamp (ms)
+--- - `"uptime"` process uptime (s)
+--- - `"memory.total"` total Lua memory across all actors (bytes)
+--- - `"message.total"` total messages dispatched across all actors
+--- - `"cpu.total_ms"` total dispatch time across all actors (ms)
+---
+--- The JSON snapshot additionally contains a `services` array with one entry per
+--- actor: `{ id, name, memory, messages, cpu_ms }` (per-actor stats tracked on
+--- each actor's watchdog).
+---@param key? string @ Counter name; omit to get the full JSON snapshot
+---@return string|integer @ JSON string when `key` is omitted; an integer (`0` for unknown keys) otherwise
+function core.server_stats(key) end
 
 --- Decode fields from a runtime message.
 ---
---- Pattern characters:
+--- Pattern characters (one return value each, except `'C'` which returns two):
+--- - `'T'` message type (`PTYPE_*`)
 --- - `'S'` sender id
 --- - `'R'` receiver id
 --- - `'E'` session id
---- - `'Z'` message bytes as string
---- - `'N'` message size
---- - `'B'` message buffer lightuserdata
---- - `'C'` buffer data pointer + size
+--- - `'Z'` message bytes as string (`nil` if no buffer)
+--- - `'N'` message size (`0` if no buffer)
+--- - `'B'` message buffer lightuserdata (`nil` if no buffer)
+--- - `'C'` buffer data pointer + size (null pointer + `0` if no buffer)
+--- - `'L'` transfers buffer ownership to Lua as a lightuserdata; the receiver
+---   must release it (`buffer.drop` / `buffer.into_arc_buffer`) or forward it
+---   via `moon.send` (`nil` if no buffer)
 ---@param msg message_ptr
 ---@param pattern string
 ---@return ...

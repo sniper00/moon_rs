@@ -3,6 +3,7 @@
 
 --- WebSocket connection userdata.
 ---@class ws_connection
+local ws_connection = {}
 
 --- Native WebSocket module (`require("ws.core")`).
 ---@class ws.core

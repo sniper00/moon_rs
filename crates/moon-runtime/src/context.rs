@@ -6,7 +6,10 @@ use std::{
     ffi::c_void,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        atomic::{
+            AtomicI32, AtomicI64, AtomicIsize, AtomicPtr, AtomicU8, AtomicU32, AtomicU64,
+            AtomicUsize, Ordering,
+        },
     },
     thread,
     time::{Duration, Instant},
@@ -48,6 +51,7 @@ pub const PTYPE_REDIS: u8 = 20;
 pub type ActorId = u32;
 
 pub const BOOTSTRAP_ACTOR_ADDR: ActorId = 1;
+pub const CLUSTER_ACTOR_ADDR: ActorId = 2;
 const ACTOR_ID_WRAP_START: u32 = 1000;
 
 lazy_static! {
@@ -63,6 +67,8 @@ lazy_static! {
             actor_uuid: AtomicU32::new(1),
             actor_counter: AtomicU32::new(0),
             exit_code: AtomicI32::new(i32::MAX),
+            error_count: AtomicUsize::new(0),
+            pending_timers: AtomicUsize::new(0),
             actors: DashMap::new(),
             unique_actors: DashMap::new(),
             clock: Instant::now(),
@@ -211,6 +217,18 @@ pub struct Watchdog {
     pub trap: AtomicI32,
     /// Number of consecutive timeout detections. Interrupt only fires after 3.
     pub timeout_count: AtomicU32,
+
+    /// Per-actor statistics, published by the actor thread after each dispatch
+    /// (`record_dispatch`) and read by `CONTEXT` (e.g. `server_stats`) through
+    /// the shared `Arc<Watchdog>` in `ActorEntry`. All plain atomics, so reads
+    /// from the monitor/stats path never touch the actor's live Lua memory.
+    ///
+    /// Total messages this actor has finished dispatching.
+    message_total: AtomicU64,
+    /// Cumulative time spent inside message dispatch, in milliseconds.
+    cpu_ms_total: AtomicU64,
+    /// Last observed Lua memory footprint of the actor, in bytes.
+    memory: AtomicIsize,
 }
 
 impl Watchdog {
@@ -224,6 +242,9 @@ impl Watchdog {
             active_l: AtomicPtr::new(std::ptr::null_mut()),
             trap: AtomicI32::new(0),
             timeout_count: AtomicU32::new(0),
+            message_total: AtomicU64::new(0),
+            cpu_ms_total: AtomicU64::new(0),
+            memory: AtomicIsize::new(0),
         }
     }
 
@@ -257,6 +278,32 @@ impl Watchdog {
     pub fn set_active_l(&self, l: *mut c_void) {
         self.active_l.store(l, Ordering::Release);
     }
+
+    /// Publish per-dispatch statistics. Called by the actor thread right after a
+    /// message has been handled: bumps the message counter, accumulates the
+    /// elapsed dispatch time, and snapshots the actor's current memory usage.
+    #[inline]
+    pub fn record_dispatch(&self, begin_ms: u64, end_ms: u64, memory: isize) {
+        self.message_total.fetch_add(1, Ordering::Relaxed);
+        self.cpu_ms_total
+            .fetch_add(end_ms.saturating_sub(begin_ms), Ordering::Relaxed);
+        self.memory.store(memory, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn message_total(&self) -> u64 {
+        self.message_total.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn cpu_ms_total(&self) -> u64 {
+        self.cpu_ms_total.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn memory(&self) -> isize {
+        self.memory.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for Watchdog {
@@ -274,10 +321,15 @@ pub struct LuaActorServer {
     actor_uuid: AtomicU32,
     actor_counter: AtomicU32,
     exit_code: AtomicI32,
+    error_count: AtomicUsize,
+    /// Timers that have been scheduled (`insert_timer`) but not yet fired by the
+    /// `run_timer` task. The actual `BTreeSet` lives inside that task, so this
+    /// atomic mirror is the only process-wide view of "alive" timers.
+    pending_timers: AtomicUsize,
     actors: DashMap<ActorId, ActorEntry>,
     unique_actors: DashMap<String, ActorId>,
     clock: Instant,
-    env: DashMap<String, Arc<String>>,
+    env: DashMap<String, Arc<Vec<u8>>>,
     /// The timer channel is created in `run_timer`, which keeps the receiver in
     /// its task and publishes the sender here. Only the sender lives in the
     /// global, and `send` needs just `&self`, so `OnceLock` fits exactly. The
@@ -388,12 +440,12 @@ impl LuaActorServer {
         });
     }
 
-    pub fn set_env(&self, key: &str, value: &str) {
+    pub fn set_env(&self, key: &str, value: &[u8]) {
         self.env
-            .insert(key.to_string(), Arc::new(value.to_string()));
+            .insert(key.to_string(), Arc::new(value.to_vec()));
     }
 
-    pub fn get_env(&self, key: &str) -> Option<Arc<String>> {
+    pub fn get_env(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         self.env.get(key).map(|v| v.value().clone())
     }
 
@@ -403,6 +455,30 @@ impl LuaActorServer {
 
     pub fn stopped(&self) -> bool {
         self.actor_counter.load(Ordering::Acquire) == 0
+    }
+
+    /// Returns a human-readable description of every actor still registered.
+    /// Each entry is the actor id (`0x{:08X}`); unique actors additionally
+    /// include their name. Used while waiting for shutdown to report which
+    /// actors are still running.
+    pub fn running_actors(&self) -> Vec<String> {
+        // Collect actor IDs first (releasing the `actors` shard locks), then
+        // look up unique names — avoids AB-BA deadlock with callers that hold
+        // `unique_actors` → `actors` (e.g. broadcast_system / remove_actor).
+        let ids: Vec<ActorId> = self.actors.iter().map(|e| *e.key()).collect();
+        ids.into_iter()
+            .map(|id| {
+                let name = self
+                    .unique_actors
+                    .iter()
+                    .find(|u| *u.value() == id)
+                    .map(|u| u.key().clone());
+                match name {
+                    Some(name) => format!("0x{:08X} ({})", id, name),
+                    None => format!("0x{:08X}", id),
+                }
+            })
+            .collect()
     }
 
     pub fn shutdown(&self, exit_code: i32) {
@@ -416,12 +492,7 @@ impl LuaActorServer {
             return;
         }
 
-        log::warn!(
-            "receive shutdown event, exit code: {}. ({}:{})",
-            exit_code,
-            file!(),
-            line!()
-        );
+        log::warn!("receive shutdown event, exit code: {}.", exit_code);
         self.actors.iter().for_each(|v| {
             let _ = v.value().tx.send(Message {
                 from: 0,
@@ -502,7 +573,7 @@ impl LuaActorServer {
 
     pub fn response_error(&self, from: ActorId, to: ActorId, session: i64, err: String) {
         if session >= 0 {
-            log::error!("{}. ({}:{})", err, file!(), line!());
+            log::error!("{}.", err);
         } else {
             let _ = self.send(Message {
                 from,
@@ -588,6 +659,111 @@ impl LuaActorServer {
             .get()
             .expect("main runtime not initialized")
     }
+
+    pub fn actor_count(&self) -> u32 {
+        self.actor_counter.load(Ordering::Acquire)
+    }
+
+    /// Number of routing entries currently registered, including pseudo-actors
+    /// (e.g. the cluster endpoint) that do not bump `actor_counter`.
+    pub fn registered_actor_count(&self) -> usize {
+        self.actors.len()
+    }
+
+    /// Number of unique (named) services currently alive.
+    pub fn unique_actor_count(&self) -> usize {
+        self.unique_actors.len()
+    }
+
+    /// Total number of actors ever created since process start. `actor_uuid`
+    /// is the next id to hand out and starts at 1, so subtract 1.
+    pub fn total_actor_created(&self) -> u32 {
+        self.actor_uuid.load(Ordering::Acquire).saturating_sub(1)
+    }
+
+    /// Number of timers scheduled but not yet fired.
+    pub fn timer_count(&self) -> usize {
+        self.pending_timers.load(Ordering::Acquire)
+    }
+
+    /// Number of environment variables stored in the registry.
+    pub fn env_count(&self) -> usize {
+        self.env.len()
+    }
+
+    /// Accumulated simulated-clock offset, in milliseconds.
+    pub fn time_offset(&self) -> u64 {
+        self.time_offset.load(Ordering::Acquire)
+    }
+
+    /// Process uptime in seconds.
+    pub fn uptime_secs(&self) -> u64 {
+        self.clock.elapsed().as_secs()
+    }
+
+    /// Aggregate Lua memory across all actors, in bytes (last observed values).
+    pub fn total_memory(&self) -> i64 {
+        self.actors
+            .iter()
+            .map(|e| e.value().watchdog.memory() as i64)
+            .sum()
+    }
+
+    /// Total messages dispatched across all actors.
+    pub fn total_messages(&self) -> u64 {
+        self.actors
+            .iter()
+            .map(|e| e.value().watchdog.message_total())
+            .sum()
+    }
+
+    /// Aggregate dispatch time across all actors, in milliseconds.
+    pub fn total_cpu_ms(&self) -> u64 {
+        self.actors
+            .iter()
+            .map(|e| e.value().watchdog.cpu_ms_total())
+            .sum()
+    }
+
+    /// Per-actor statistics snapshot, one entry per registered actor.
+    pub fn actor_stats(&self) -> Vec<ActorStat> {
+        // Collect watchdog data first (releasing the `actors` shard locks), then
+        // look up unique names — avoids AB-BA deadlock with callers that hold
+        // `unique_actors` → `actors` (e.g. broadcast_system / remove_actor).
+        let entries: Vec<(ActorId, u64, u64, u64)> = self
+            .actors
+            .iter()
+            .map(|e| {
+                let wd = &e.value().watchdog;
+                (*e.key(), wd.memory() as u64, wd.message_total(), wd.cpu_ms_total())
+            })
+            .collect();
+        entries
+            .into_iter()
+            .map(|(id, memory, messages, cpu_ms)| {
+                let name = self
+                    .unique_actors
+                    .iter()
+                    .find(|u| *u.value() == id)
+                    .map(|u| u.key().clone());
+                ActorStat {
+                    id,
+                    name,
+                    memory: memory as i64,
+                    messages,
+                    cpu_ms,
+                }
+            })
+            .collect()
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.error_count.load(Ordering::Acquire)
+    }
+
+    pub fn increment_error_count(&self) {
+        self.error_count.fetch_add(1, Ordering::Release);
+    }
 }
 
 pub fn run_monitor() {
@@ -615,11 +791,16 @@ pub fn insert_timer(owner: ActorId, timer_id: i64, interval: u64) {
         log::error!("insert_timer called before run_timer started");
         return;
     };
-    let _ = timer_tx.send(Timer {
-        timer_id,
-        expiry_clock: expiry_clock.as_millis() as i64,
-        owner,
-    });
+    if timer_tx
+        .send(Timer {
+            timer_id,
+            expiry_clock: expiry_clock.as_millis() as i64,
+            owner,
+        })
+        .is_ok()
+    {
+        CONTEXT.pending_timers.fetch_add(1, Ordering::Release);
+    }
 }
 
 pub fn run_timer() {
@@ -635,14 +816,14 @@ pub fn run_timer() {
         let mut btree_map = BTreeSet::new();
         let mut wait_time = 1000;
         loop {
-            // Terminate cooperatively once shutdown has been requested. The
-            // global `timer_tx` sender lives in `CONTEXT` and never drops, so
-            // `rc.recv()` alone would never return `None` and this task would
-            // otherwise keep the IO runtime alive forever. The ≤1s `wait_time`
-            // bounds how long after shutdown we take to notice.
-            if CONTEXT.exit_code() != i32::MAX {
-                break;
-            }
+            // // Terminate cooperatively once shutdown has been requested. The
+            // // global `timer_tx` sender lives in `CONTEXT` and never drops, so
+            // // `rc.recv()` alone would never return `None` and this task would
+            // // otherwise keep the IO runtime alive forever. The ≤1s `wait_time`
+            // // bounds how long after shutdown we take to notice.
+            // if CONTEXT.exit_code() != i32::MAX {
+            //     break;
+            // }
             match timeout(Duration::from_millis(wait_time), rc.recv()).await {
                 Ok(Some(timer)) => {
                     //println!("insert timer: {:?} {:?}", timer, CONTEXT.now_clock());
@@ -667,6 +848,7 @@ pub fn run_timer() {
                         data: MessageBody::ISize(PTYPE_TIMER, timer.timer_id as isize),
                     });
                     btree_map.pop_first();
+                    CONTEXT.pending_timers.fetch_sub(1, Ordering::Release);
                 } else {
                     wait_time = diff as u64;
                     break;
@@ -674,6 +856,19 @@ pub fn run_timer() {
             }
         }
     });
+}
+
+/// Per-actor statistics snapshot produced by [`LuaActorServer::actor_stats`].
+pub struct ActorStat {
+    pub id: ActorId,
+    /// Service name, only present for unique/named actors.
+    pub name: Option<String>,
+    /// Last observed Lua memory footprint, in bytes.
+    pub memory: i64,
+    /// Total messages dispatched.
+    pub messages: u64,
+    /// Cumulative dispatch time, in milliseconds.
+    pub cpu_ms: u64,
 }
 
 pub struct LuaActorParam {

@@ -159,7 +159,7 @@ do
     assert(t2[2]==2)
     assert(t2[3]==3)
 
-    assert(getmetatable(t2).__json_object)
+    assert(getmetatable(t2).__object)
     str = json.encode(t2) -- {"1":1,"2":2,"3":3}
     assert(string.sub(str,1,1)=="{")
 end
@@ -233,10 +233,10 @@ end
 
 do
     local arr = json.decode("[1,2,3]")
-    assert(getmetatable(arr).__json_array)
+    assert(getmetatable(arr).__array)
 
     local obj = json.decode('{"a":1}')
-    assert(getmetatable(obj).__json_object)
+    assert(getmetatable(obj).__object)
 
     local old_options = json.options('has_metatfield', false)
     arr = json.decode("[1,2,3]")
