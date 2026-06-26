@@ -5,7 +5,7 @@ use std::{
     collections::BTreeSet,
     ffi::c_void,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{
             AtomicI32, AtomicI64, AtomicIsize, AtomicPtr, AtomicU8, AtomicU32, AtomicU64,
             AtomicUsize, Ordering,
@@ -78,6 +78,7 @@ lazy_static! {
             time_offset: AtomicU64::new(0),
             io_runtime,
             main_handle: std::sync::OnceLock::new(),
+            unique_threads: Mutex::new(Vec::new()),
         }
     };
     pub static ref LOGGER: Logger = Logger::new();
@@ -339,6 +340,14 @@ pub struct LuaActorServer {
     time_offset: AtomicU64,
     io_runtime: tokio::runtime::Runtime,
     main_handle: std::sync::OnceLock<tokio::runtime::Handle>,
+    /// Join handles for unique actors, which each run on a dedicated OS thread.
+    /// These threads must be joined before the process exits: a unique actor
+    /// signals `stopped()` (via `remove_actor`) *before* its thread function
+    /// returns, so without an explicit join the main thread can race ahead into
+    /// libc's exit path (and mimalloc's process teardown) while an actor thread
+    /// is still running its per-thread allocator cleanup (`_mi_thread_done`),
+    /// corrupting mimalloc's global heap state and segfaulting.
+    unique_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 impl LuaActorServer {
@@ -652,6 +661,39 @@ impl LuaActorServer {
 
     pub fn set_main_handle(&self, handle: tokio::runtime::Handle) {
         self.main_handle.set(handle).ok();
+    }
+
+    /// Track a unique actor's dedicated OS thread so it can be joined at
+    /// shutdown. Opportunistically reaps already-finished threads first so the
+    /// vector does not grow without bound on servers that create and destroy
+    /// many unique services over their lifetime. Joining a thread that already
+    /// reports `is_finished()` returns immediately and guarantees its
+    /// thread-local teardown has completed.
+    pub fn register_unique_thread(&self, handle: thread::JoinHandle<()>) {
+        let mut guard = self.unique_threads.lock().unwrap();
+        let mut i = 0;
+        while i < guard.len() {
+            if guard[i].is_finished() {
+                let h = guard.swap_remove(i);
+                let _ = h.join();
+            } else {
+                i += 1;
+            }
+        }
+        guard.push(handle);
+    }
+
+    /// Block until every registered unique-actor thread has fully terminated
+    /// (including its per-thread allocator cleanup). Must be called from the
+    /// main thread on the shutdown path, before the process exits.
+    pub fn join_unique_threads(&self) {
+        let handles: Vec<_> = {
+            let mut guard = self.unique_threads.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for h in handles {
+            let _ = h.join();
+        }
     }
 
     pub fn main_handle(&self) -> &tokio::runtime::Handle {

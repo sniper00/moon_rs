@@ -365,6 +365,14 @@ async fn async_main() -> Result<()> {
         }
     }
 
+    // Join every unique-actor OS thread before the process exits. A unique
+    // actor flips `stopped()` (the loop's exit condition) from inside
+    // `remove_actor`, which runs *before* its thread function returns. Without
+    // this join the main thread races ahead into the process-exit path while an
+    // actor thread is still executing its per-thread mimalloc cleanup
+    // (`_mi_thread_done`), corrupting the allocator's global state and crashing.
+    CONTEXT.join_unique_threads();
+
     let error_code = CONTEXT.exit_code();
 
     log::info!(

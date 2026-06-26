@@ -273,12 +273,13 @@ pub fn new_actor(params: LuaActorParam) {
     let (tx, rx) = mpsc::unbounded_channel();
 
     if params.unique {
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("actor-{}", params.name))
             .spawn(move || {
                 run_actor_blocking(params, tx, rx);
             })
             .expect("failed to spawn exclusive thread");
+        CONTEXT.register_unique_thread(handle);
     } else {
         CONTEXT.main_handle().spawn(async move {
             run_actor_async(params, tx, rx).await;
