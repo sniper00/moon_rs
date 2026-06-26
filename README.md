@@ -44,7 +44,6 @@ flowchart LR
 | `crates/moon-app` | binary entry point, bootstrap, signal handling |
 | `crates/moon-runtime` | actor runtime (context, messages, timer, logger) + all Rust→Lua native bindings |
 | `crates/moon-base` | foundation: embedded Lua 5.5 sources, Rust FFI, helper macros, shared Buffer |
-| `crates/moon-thrift` | standalone Lua C extension example (cdylib), built separately |
 | `lualib/` | user-facing Lua APIs and wrappers |
 | `assets/` | examples, benchmarks, integration-style test scripts |
 | `docs/` | module-focused documentation |
