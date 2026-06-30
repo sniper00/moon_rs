@@ -8,6 +8,7 @@ members = [
     "crates/moon-base",
     "crates/moon-runtime",
     "crates/moon-app",
+    "crates/moon-game",
     "xtask",
 ]
 exclude = [

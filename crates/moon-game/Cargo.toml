@@ -1,0 +1,28 @@
+[package]
+name = "moon-game"
+version = "0.1.0"
+edition = "2024"
+# Collection of pure-Rust gameplay algorithms for moon_rs (no Lua / FFI deps).
+# Currently hosts the grid-based AOI (Area of Interest) system; more game
+# algorithms (pathfinding, spatial queries, etc.) will live here over time.
+
+[lib]
+doctest = false
+
+[features]
+# Profiling aid only: forces `#[inline(never)]` on the per-element geometry
+# helpers and the big emit/scan functions so a sampling profiler can attribute
+# self-time to them (they are otherwise fully inlined into update/fire_event).
+# Never enable for real benchmarks — it pessimizes the hot paths.
+prof_noinline = []
+
+[dependencies]
+rustc-hash = "2.1.2"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+pprof = { version = "0.15.0", features = ["flamegraph"] }
+
+[[bench]]
+name = "stress_aoi"
+harness = false
