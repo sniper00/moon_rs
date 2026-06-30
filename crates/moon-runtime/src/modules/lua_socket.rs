@@ -875,7 +875,9 @@ extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
                 );
             }
         };
-        let max_size = laux::lua_opt(state, 3).unwrap_or(crate::LIMITS.max_network_read_bytes);
+        let max_size = laux::lua_opt(state, 3)
+            .unwrap_or(crate::LIMITS.max_network_read_bytes)
+            .min(crate::LIMITS.max_network_read_bytes);
         let read_timeout: u64 = laux::lua_opt(state, 4).unwrap_or(0);
         if let Some(channel) = NET.get(&fd) {
             let actor = LuaActor::from_lua_state(state);

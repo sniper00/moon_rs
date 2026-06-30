@@ -167,6 +167,7 @@ pub mod lua_coroutine;
 mod lua_excel;
 #[path = "modules/lua_fs.rs"]
 mod lua_fs;
+
 #[cfg(feature = "httpc")]
 #[path = "modules/lua_httpc.rs"]
 mod lua_httpc;
@@ -210,6 +211,81 @@ mod request_pool;
 pub mod lua_actor;
 #[path = "modules/lua_json.rs"]
 pub mod lua_json;
+
+/// Fast, non-cryptographic hashing for internal maps keyed by trusted data.
+///
+/// std's default `HashMap` uses SipHash (DoS-resistant but slow). Several native
+/// modules key hot-path lookup tables by trusted, non-attacker-controlled data —
+/// protobuf descriptor names/numbers loaded from a build artifact, zset player
+/// ids — where collision-DoS resistance is unneeded. They share this single
+/// FxHash implementation (the same fast hash rustc uses internally) instead of
+/// each rolling their own.
+pub(crate) mod hash {
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasherDefault, Hasher};
+
+    /// FxHash: `hash = (hash.rotate_left(5) ^ word) * SEED`, processing 8 bytes
+    /// at a time. Handles both string and integer keys.
+    #[derive(Default)]
+    pub(crate) struct FxHasher {
+        hash: u64,
+    }
+
+    impl FxHasher {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+        #[inline]
+        fn add(&mut self, word: u64) {
+            self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(Self::SEED);
+        }
+    }
+
+    impl Hasher for FxHasher {
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            let mut chunks = bytes.chunks_exact(8);
+            for c in &mut chunks {
+                self.add(u64::from_le_bytes(c.try_into().unwrap()));
+            }
+            let rem = chunks.remainder();
+            if !rem.is_empty() {
+                let mut buf = [0u8; 8];
+                buf[..rem.len()].copy_from_slice(rem);
+                self.add(u64::from_le_bytes(buf));
+            }
+        }
+
+        #[inline]
+        fn write_u8(&mut self, i: u8) {
+            self.add(i as u64);
+        }
+
+        #[inline]
+        fn write_u32(&mut self, i: u32) {
+            self.add(i as u64);
+        }
+
+        #[inline]
+        fn write_u64(&mut self, i: u64) {
+            self.add(i);
+        }
+
+        #[inline]
+        fn write_usize(&mut self, i: usize) {
+            self.add(i as u64);
+        }
+
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.hash
+        }
+    }
+
+    pub(crate) type FxBuildHasher = BuildHasherDefault<FxHasher>;
+    pub(crate) type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+    #[allow(dead_code)]
+    pub(crate) type FxHashSet<T> = HashSet<T, FxBuildHasher>;
+}
 
 /// Shared hardening limits used by native modules.
 ///
@@ -275,6 +351,12 @@ pub(crate) struct Limits {
     /// Maximum RESP array item count accepted from Redis. Protects nested array
     /// decoding from allocating a huge vector based on a wire-provided count.
     pub redis_array_items: usize,
+    /// Maximum number of elements a single `zset:range()` call may return.
+    /// Bounds the per-call allocation (8 bytes/element) for an in-memory ordered
+    /// set. Intentionally larger than `db_query_rows` because a zset is an
+    /// in-process structure with no I/O or driver buffering, but kept in this
+    /// central catalog so the ceiling is discoverable alongside the DB caps.
+    pub zset_range_len: usize,
     /// Default DB pool size for modules that expose `max_connections`. Redis has
     /// its own historical default, but PG/sqlx use this shared baseline.
     pub db_pool_size: u32,
@@ -300,6 +382,7 @@ impl Limits {
             http_static_cache_entries: 10_000,
             db_wire_message_bytes: 64 * 1024 * 1024,
             redis_array_items: 1024 * 1024,
+            zset_range_len: 1_000_000,
             db_pool_size: 5,
             db_read_timeout_ms: 10_000,
         }
@@ -479,7 +562,6 @@ fn build_decoders() -> [message_decode::MessageDecodeFn; 256] {
     {
         decoders[PTYPE_REDIS as usize] = lua_redis::decode_redis_message;
     }
-
     decoders
 }
 

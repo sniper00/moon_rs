@@ -47,6 +47,7 @@ pub const PTYPE_WEBSOCKET: u8 = 17;
 pub const PTYPE_HTTPD: u8 = 18;
 pub const PTYPE_PG: u8 = 19;
 pub const PTYPE_REDIS: u8 = 20;
+pub const PTYPE_GRPC: u8 = 21;
 
 pub type ActorId = u32;
 
@@ -475,17 +476,18 @@ impl LuaActorServer {
         // look up unique names — avoids AB-BA deadlock with callers that hold
         // `unique_actors` → `actors` (e.g. broadcast_system / remove_actor).
         let ids: Vec<ActorId> = self.actors.iter().map(|e| *e.key()).collect();
+        // Build an O(1) reverse lookup: ActorId → name. unique_actors is
+        // typically small (a few dozen entries), so cloning the names is cheap
+        // and avoids the O(N×M) inner scan that `find()` would otherwise do.
+        let id_to_name: std::collections::HashMap<ActorId, String> = self
+            .unique_actors
+            .iter()
+            .map(|u| (*u.value(), u.key().clone()))
+            .collect();
         ids.into_iter()
-            .map(|id| {
-                let name = self
-                    .unique_actors
-                    .iter()
-                    .find(|u| *u.value() == id)
-                    .map(|u| u.key().clone());
-                match name {
-                    Some(name) => format!("0x{:08X} ({})", id, name),
-                    None => format!("0x{:08X}", id),
-                }
+            .map(|id| match id_to_name.get(&id) {
+                Some(name) => format!("0x{:08X} ({})", id, name),
+                None => format!("0x{:08X}", id),
             })
             .collect()
     }
@@ -743,28 +745,35 @@ impl LuaActorServer {
         self.clock.elapsed().as_secs()
     }
 
-    /// Aggregate Lua memory across all actors, in bytes (last observed values).
-    pub fn total_memory(&self) -> i64 {
+    /// Aggregate watchdog stats across all actors in a single pass, so the three
+    /// public accessors (`total_memory`, `total_messages`, `total_cpu_ms`) share
+    /// one DashMap iteration instead of three.
+    fn aggregate_watchdog_stats(&self) -> (i64, u64, u64) {
         self.actors
             .iter()
-            .map(|e| e.value().watchdog.memory() as i64)
-            .sum()
+            .fold((0i64, 0u64, 0u64), |(mem, msgs, cpu), e| {
+                let wd = &e.value().watchdog;
+                (
+                    mem + wd.memory() as i64,
+                    msgs + wd.message_total(),
+                    cpu + wd.cpu_ms_total(),
+                )
+            })
+    }
+
+    /// Aggregate Lua memory across all actors, in bytes (last observed values).
+    pub fn total_memory(&self) -> i64 {
+        self.aggregate_watchdog_stats().0
     }
 
     /// Total messages dispatched across all actors.
     pub fn total_messages(&self) -> u64 {
-        self.actors
-            .iter()
-            .map(|e| e.value().watchdog.message_total())
-            .sum()
+        self.aggregate_watchdog_stats().1
     }
 
     /// Aggregate dispatch time across all actors, in milliseconds.
     pub fn total_cpu_ms(&self) -> u64 {
-        self.actors
-            .iter()
-            .map(|e| e.value().watchdog.cpu_ms_total())
-            .sum()
+        self.aggregate_watchdog_stats().2
     }
 
     /// Per-actor statistics snapshot, one entry per registered actor.
@@ -780,21 +789,20 @@ impl LuaActorServer {
                 (*e.key(), wd.memory() as u64, wd.message_total(), wd.cpu_ms_total())
             })
             .collect();
+        // O(1) reverse lookup instead of O(N×M) inner scan per actor.
+        let id_to_name: std::collections::HashMap<ActorId, String> = self
+            .unique_actors
+            .iter()
+            .map(|u| (*u.value(), u.key().clone()))
+            .collect();
         entries
             .into_iter()
-            .map(|(id, memory, messages, cpu_ms)| {
-                let name = self
-                    .unique_actors
-                    .iter()
-                    .find(|u| *u.value() == id)
-                    .map(|u| u.key().clone());
-                ActorStat {
-                    id,
-                    name,
-                    memory: memory as i64,
-                    messages,
-                    cpu_ms,
-                }
+            .map(|(id, memory, messages, cpu_ms)| ActorStat {
+                id,
+                name: id_to_name.get(&id).cloned(),
+                memory: memory as i64,
+                messages,
+                cpu_ms,
             })
             .collect()
     }

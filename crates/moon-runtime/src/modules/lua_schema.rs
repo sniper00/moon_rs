@@ -575,6 +575,9 @@ fn verify_object(
     for (k, _v) in t.iter() {
         // An object whose first key is integer 1 is ambiguous with an array, so
         // it must opt in via the `__object` metafield (mirrors the C++ rule).
+        // The let-chain short-circuits: `getmetafield` only runs for the single
+        // entry whose key is integer 1 (if any), not once per entry, so a map
+        // without that key pays nothing.
         if let LuaValue::Integer(1) = k
             && t.getmetafield(cstr!("__object")).is_none()
         {
@@ -584,14 +587,17 @@ fn verify_object(
             ));
         }
 
-        trace.push(Seg::Key(k.to_string()));
+        let key_string = k.to_string();
+        trace.push(Seg::Key(key_string));
         if !key_prim.accepts(&k) {
-            return Err(format!(
+            let msg = format!(
                 "$key {} expected, got {}. trace: {}",
                 key_prim.name(),
                 k.name(),
                 join(trace)
-            ));
+            );
+            trace.pop();
+            return Err(msg);
         }
         let vidx = laux::lua_absindex(state, -1);
         let r = check_value(state, schema, vidx, field, trace, depth);

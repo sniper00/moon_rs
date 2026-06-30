@@ -12,10 +12,9 @@
 //! runtime, so it follows the simpler `lua_thrift2.rs` shape rather than the
 //! async session/pool pattern.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::c_int;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use moon_base::laux::LuaValue;
@@ -44,71 +43,12 @@ const MAX_VARINT_LENGTH: usize = 10;
 // The descriptor lookup tables (`fields_by_name`, `fields_by_number`,
 // `messages`, `enums`) are keyed by short, trusted strings/integers and are
 // hit on the encode/decode hot path (e.g. `find_field_by_name` per Lua table
-// key). std's default SipHash is overkill there, so we use FxHash — the same
-// fast, non-cryptographic hash rustc uses internally. These keys are never
-// attacker-controlled in a way that matters (the descriptor is loaded from a
-// trusted `.proto` build artifact), so collision-DoS resistance is unneeded.
-
-/// FxHash: `hash = (hash.rotate_left(5) ^ word) * SEED`, processing 8 bytes at
-/// a time.
-#[derive(Default)]
-struct FxHasher {
-    hash: u64,
-}
-
-impl FxHasher {
-    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-
-    #[inline]
-    fn add(&mut self, word: u64) {
-        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(Self::SEED);
-    }
-}
-
-impl Hasher for FxHasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            self.add(u64::from_le_bytes(c.try_into().unwrap()));
-        }
-        let rem = chunks.remainder();
-        if !rem.is_empty() {
-            let mut buf = [0u8; 8];
-            buf[..rem.len()].copy_from_slice(rem);
-            self.add(u64::from_le_bytes(buf));
-        }
-    }
-
-    #[inline]
-    fn write_u8(&mut self, i: u8) {
-        self.add(i as u64);
-    }
-
-    #[inline]
-    fn write_u32(&mut self, i: u32) {
-        self.add(i as u64);
-    }
-
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.add(i);
-    }
-
-    #[inline]
-    fn write_usize(&mut self, i: usize) {
-        self.add(i as u64);
-    }
-
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-}
-
-type FxBuildHasher = BuildHasherDefault<FxHasher>;
-type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
-type FxHashSet<T> = HashSet<T, FxBuildHasher>;
+// key). std's default SipHash is overkill there, so we use the crate-wide
+// FxHash (`crate::hash`) — the same fast, non-cryptographic hash rustc uses
+// internally. These keys are never attacker-controlled in a way that matters
+// (the descriptor is loaded from a trusted `.proto` build artifact), so
+// collision-DoS resistance is unneeded.
+use crate::hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 // =========================================================================
 // Wire / field type enums (values match descriptor.proto)

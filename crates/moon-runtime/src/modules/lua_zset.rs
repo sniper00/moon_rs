@@ -18,10 +18,15 @@ use moon_base::{cstr, ffi, laux, lreg, lreg_null, luaL_newlib};
 use rand::RngExt;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int};
-use std::hash::{BuildHasherDefault, Hasher};
+use crate::hash::FxBuildHasher;
 
 const MAXLEVEL: usize = 32;
 const NIL: u32 = u32::MAX;
+
+/// Cap range length to prevent accidental or malicious OOM from a single range
+/// query (8 bytes/element). Sourced from the crate-wide [`crate::LIMITS`] catalog
+/// so it stays discoverable alongside the DB result-set caps.
+const MAX_RANGE_LEN: i64 = crate::LIMITS.zset_range_len as i64;
 
 const ZSET_META: *const c_char = cstr!("lzet");
 
@@ -460,48 +465,17 @@ impl SkipList {
     }
 }
 
-/// Fast hasher for the `i64` keys in the dict. `std`'s default `HashMap` uses
-/// SipHash (DoS-resistant but slow); these keys are trusted internal player ids,
-/// so a single multiply + xorshift mix (FxHash/splitmix style) is plenty and
-/// roughly matches the C++ `unordered_map`'s near-identity integer hash.
-#[derive(Default)]
-struct IntHasher(u64);
-
-impl Hasher for IntHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        // Generic fallback; the dict only ever hashes `i64` keys (write_i64).
-        for &b in bytes {
-            self.write_u64(b as u64);
-        }
-    }
-
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        x ^= x >> 32;
-        self.0 = x;
-    }
-
-    #[inline]
-    fn write_i64(&mut self, i: i64) {
-        self.write_u64(i as u64);
-    }
-}
-
-type IntBuildHasher = BuildHasherDefault<IntHasher>;
-
 /// The ordered set: a skiplist for ordering plus a dictionary for O(1) lookup.
+///
+/// The dict is keyed by trusted internal `i64` player ids, so it uses the
+/// crate-wide FxHash (`crate::hash`) instead of std's DoS-resistant-but-slow
+/// SipHash, roughly matching the C++ `unordered_map`'s near-identity integer
+/// hash.
 struct ZSet {
     reverse: bool,
     max_count: usize,
     zsl: SkipList,
-    dict: HashMap<i64, u32, IntBuildHasher>,
+    dict: HashMap<i64, u32, FxBuildHasher>,
 }
 
 impl ZSet {
@@ -515,7 +489,7 @@ impl ZSet {
             reverse,
             max_count,
             zsl: SkipList::new(hint),
-            dict: HashMap::with_capacity_and_hasher(hint.min(1 << 20), IntBuildHasher::default()),
+            dict: HashMap::with_capacity_and_hasher(hint.min(1 << 20), FxBuildHasher::default()),
         }
     }
 
@@ -659,9 +633,6 @@ impl ZSet {
         }
 
         let rangelen = end - start + 1;
-        // Cap range length to prevent accidental or malicious OOM from a
-        // single range query (1 000 000 × 8 bytes = 8 MB per call).
-        const MAX_RANGE_LEN: i64 = 1_000_000;
         if rangelen > MAX_RANGE_LEN {
             return Err(rangelen);
         }
@@ -800,8 +771,7 @@ extern "C-unwind" fn range(state: LuaState) -> c_int {
             state,
             format!(
                 "zset.range: range length exceeds maximum supported size (requested={}, max={})",
-                rangelen,
-                i32::MAX - 1
+                rangelen, MAX_RANGE_LEN
             ),
         ),
     }
