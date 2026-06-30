@@ -3,6 +3,7 @@ local buffer = require("buffer")
 local fs = require("fs")
 local socket = require("moon.socket")
 local internal = require("moon.http.internal")
+local httpc = require("httpc.core")
 
 local assert = assert
 local http_response = internal.http_response
@@ -73,14 +74,11 @@ local function request_handler(fd, request)
     end
 
     -- 为 request 添加 parse_query 方法 (request.query_string 已提供)
+    -- 委托给 internal.lua 设置的 request.query (基于 Rust c.form_urldecode),
+    -- 以正确处理百分号编码 (%20, %E2%82%AC 等)。
     if not request.parse_query then
         function request:parse_query()
-            local q = {}
-            local qs = self.query_string or ""
-            for k, v in qs:gmatch("([^&=]+)=([^&=]*)") do
-                q[k] = v
-            end
-            return q
+            return httpc.form_urldecode(self.query_string or "")
         end
     end
 
