@@ -70,6 +70,7 @@ moon.PTYPE_WEBSOCKET   = 17
 moon.PTYPE_HTTPD       = 18
 moon.PTYPE_PG          = 19
 moon.PTYPE_REDIS       = 20
+moon.PTYPE_GRPC        = 21
 
 --- Checks if debug logging is enabled
 --- @return boolean

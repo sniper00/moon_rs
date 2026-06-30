@@ -168,6 +168,9 @@ mod lua_excel;
 #[path = "modules/lua_fs.rs"]
 mod lua_fs;
 
+#[cfg(feature = "grpc")]
+#[path = "modules/lua_grpc.rs"]
+mod lua_grpc;
 #[cfg(feature = "httpc")]
 #[path = "modules/lua_httpc.rs"]
 mod lua_httpc;
@@ -470,6 +473,8 @@ pub fn luaopen_custom_libs(state: LuaState) {
     lua_require!(state, "ws.core", lua_websocket::luaopen_websocket);
     #[cfg(feature = "cluster")]
     lua_require!(state, "cluster.core", lua_cluster::luaopen_cluster);
+    #[cfg(feature = "grpc")]
+    lua_require!(state, "grpc.core", lua_grpc::luaopen_grpc);
     unsafe {
         ffi::luaL_requiref(
             state.as_ptr(),
@@ -518,6 +523,8 @@ fn build_decoders() -> [message_decode::MessageDecodeFn; 256] {
     use moon_runtime::context::PTYPE_PG;
     #[cfg(feature = "redis")]
     use moon_runtime::context::PTYPE_REDIS;
+    #[cfg(feature = "grpc")]
+    use moon_runtime::context::PTYPE_GRPC;
     #[cfg(feature = "sqlx")]
     use moon_runtime::context::PTYPE_SQLX;
     #[cfg(feature = "websocket")]
@@ -562,6 +569,11 @@ fn build_decoders() -> [message_decode::MessageDecodeFn; 256] {
     {
         decoders[PTYPE_REDIS as usize] = lua_redis::decode_redis_message;
     }
+    #[cfg(feature = "grpc")]
+    {
+        decoders[PTYPE_GRPC as usize] = lua_grpc::decode_grpc_message;
+    }
+
     decoders
 }
 

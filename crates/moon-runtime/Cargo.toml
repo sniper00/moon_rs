@@ -9,7 +9,7 @@ edition = "2024"
 doctest = false
 
 [features]
-default = ["excel", "httpc", "httpd", "websocket", "pg", "redis", "cluster", "protobuf", "sqlx", "mongodb"]
+default = ["excel", "httpc", "httpd", "websocket", "pg", "redis", "cluster", "protobuf", "sqlx", "mongodb", "grpc"]
 excel = ["dep:calamine", "dep:csv"]
 httpc = ["dep:reqwest", "dep:httparse", "dep:percent-encoding", "dep:url"]
 httpd = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-util", "dep:futures-util", "dep:httpdate"]
@@ -18,6 +18,18 @@ mongodb = ["dep:mongodb", "dep:futures-util"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 pg = ["dep:url"]
 redis = []
+# gRPC client + server over HTTP/2 (tonic codec/framing on a hyper http2 listener);
+# protobuf encode/decode stays in lua_protobuf.
+grpc = [
+    "dep:tonic",
+    "dep:tokio-stream",
+    "dep:http",
+    "dep:futures-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:tokio-util",
+]
 cluster = ["httpc"]
 # Pure-Rust serializers (no optional crate deps); feature flags just gate the modules.
 protobuf = []
@@ -79,6 +91,11 @@ httpdate = { workspace = true, optional = true }
 # Optional: WebSocket
 tokio-tungstenite = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+
+# Optional: gRPC client
+tonic = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 
 [dev-dependencies]
 serial_test = "3.5.0"
