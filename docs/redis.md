@@ -44,13 +44,9 @@ High-performance native Redis driver with RESP protocol implementation in Rust.
 ```lua
 local redis = require("moon.db.redis")
 
--- Connect (creates a named pool, async)
-local rdb, err = redis.connect({
-    host = "127.0.0.1",
-    port = 6379,
-    auth = "password",   -- optional
-    db = 0,              -- optional, default 0
-}, "default", 5000, 4)  -- name, timeout_ms, pool_size, queue_capacity?
+-- Connect (creates a named pool, async). All settings live in the URL; pool
+-- options are supplied as ?param=value query parameters.
+local rdb, err = redis.connect("redis://:password@127.0.0.1:6379/0?name=default&pool_size=4")
 
 -- Or find existing pool
 local rdb = redis.find_connection("default")
@@ -90,7 +86,7 @@ local total = redis.stats()      -- total pending across all pools
 rdb:close()
 
 -- Pub/Sub watch (dedicated socket, not pooled)
-local watch = redis.watch({ host = "127.0.0.1", port = 6379, timeout = 5000 })
+local watch = redis.watch("redis://127.0.0.1:6379/0?connect_timeout=5000")
 watch:subscribe("my-channel")
 moon.async(function()
     local message, channel = watch:message()
@@ -144,23 +140,30 @@ local r = rdb:pipeline({
 { code = "REDIS", message = "WRONGTYPE Operation against a key holding..." }
 ```
 
-## Connection Options
+## Connection URL Format
 
-```lua
-{
-    host = "127.0.0.1",    -- Redis server host
-    port = 6379,           -- Redis server port
-    auth = "",             -- AUTH password (empty = no auth)
-    db = 0,               -- SELECT database number
-}
+```
+redis://username:password@host:port/db?param=value&...
 ```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `name` | `"default"` | Pool name for lookup |
-| `timeout` | 5000ms | Connect timeout |
-| `pool_size` | 1 | Number of worker connections |
+The authority/path carry the wire params (`username`/`password` for `AUTH`,
+`host:port`, and the `/db` number for `SELECT`). The `/db` segment is optional
+and defaults to `0`. Pool settings are supplied as `?param=value` query
+parameters:
+
+| Query param | Default | Description |
+|-------------|---------|-------------|
+| `name` | `"default"` | Pool name for `find_connection` |
+| `connect_timeout` | 5000ms | Connect timeout |
+| `pool_size` / `max_connections` | 1 | Number of worker connections |
+| `read_timeout` | 10000ms | Response read timeout |
 | `queue_capacity` | 1024 | Per-worker bounded request queue capacity |
+
+Example (password-only auth, db 0, 4 workers):
+
+```
+redis://:secret@127.0.0.1:6379/0?name=cache&pool_size=4
+```
 
 ## Worker Lifecycle
 

@@ -45,8 +45,9 @@ High-performance native PostgreSQL driver implementing the v3 wire protocol in R
 ```lua
 local pg = require("moon.db.pg")
 
--- Connect (creates a named pool, async)
-local db = pg.connect("postgres://user:pass@host:5432/dbname", "main", 5000, 5)
+-- Connect (creates a named pool, async). All settings live in the URL; pool
+-- options are supplied as ?param=value query parameters (name is required).
+local db = pg.connect("postgres://user:pass@host:5432/dbname?name=main&max_connections=5")
 
 -- Or find an existing pool by name
 local db = pg.find_connection("main")
@@ -139,19 +140,26 @@ Pipeline result (array of results per statement):
 ## Connection URL Format
 
 ```
-postgres://username:password@host:port/database?option=value
+postgresql://username:password@host:port/database?param=value&...
 ```
 
-Options: `connect_timeout`, `application_name`, `sslmode` (not yet implemented).
+All connect settings are carried in the single URL. The pool settings are
+supplied as `?param=value` query parameters:
 
-## Configuration
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `timeout` | 5000ms | Connect timeout |
-| `max_connections` | 5 | Pool size (worker count) |
+| Query param | Default | Description |
+|-------------|---------|-------------|
+| `name` | *(required)* | Pool name for `find_connection` |
+| `application_name` | `moon` | PostgreSQL `application_name` |
+| `connect_timeout` | 5000ms | Connect timeout |
+| `max_connections` / `pool_size` | 5 | Pool size (worker count) |
 | `read_timeout` | 10000ms | Response read timeout |
 | `queue_capacity` | 1024 | Per-worker bounded request queue capacity |
+
+Example:
+
+```
+postgres://postgres:123456@127.0.0.1:5432/postgres?name=main&max_connections=8&read_timeout=20000
+```
 
 ## Wire Protocol Details
 
