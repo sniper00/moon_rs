@@ -35,21 +35,28 @@ function M.find_connection(name)
 end
 
 ---Connect and register a named pool.
+---
+---All parameters live in a single connection URL of the form
+---`redis://username:password@host:port/db?param=value&...`.
+---The `/db` segment is optional and defaults to `0`.
+---The pool settings are supplied as `?param=value` query parameters:
+---  * `name` — pool name for `find_connection` (default "default")
+---  * `connect_timeout` — connect timeout in ms (default 5000)
+---  * `pool_size`/`max_connections` — pool size (default 1)
+---  * `read_timeout` — read timeout in ms (default 10000)
+---  * `queue_capacity` — per-worker request queue capacity (default 1024)
+---
+---e.g. `"redis://:123456@127.0.0.1:6379/0?name=main&pool_size=2"`
 ---@async
----@param opts table @ `{ host = "127.0.0.1", port = 6379, auth = "password", db = 0 }`
----@param name? string @ Pool name for lookup (default "default")
----@param timeout? integer @ Connect timeout in milliseconds (default 5000)
----@param pool_size? integer @ Pool size (default 1)
----@param queue_capacity? integer @ Per-worker request queue capacity (default 1024)
+---@param url string connection URL (`redis://user:pass@host:port/db?param=value`)
 ---@return redis|nil @ connection object, or nil on error
 ---@return string|nil @ error message on failure
-function M.connect(opts, name, timeout, pool_size, queue_capacity)
-    ---@diagnostic disable-next-line: redundant-parameter
-    local res = moon.wait(c.connect(opts, name, timeout, pool_size, queue_capacity))
+function M.connect(url)
+    local res = moon.wait(c.connect(url))
     if res.code then
         return nil, res.message
     end
-    return M.find_connection(name or "default")
+    return M.find_connection(res.name)
 end
 
 ---Pending request count per pool worker (async queue lengths).
@@ -191,12 +198,14 @@ function watch_meta:message()
 end
 
 ---Create a dedicated pub/sub connection (Rust `redis.core.watch`).
+---Accepts the same `redis://...` URL as `connect` (pool-only params such as
+---`name`/`pool_size` are ignored).
 ---@async
----@param db_conf table @ `{ host, port?, auth?, db?, timeout? }`
+---@param url string @ connection URL, e.g. `"redis://127.0.0.1:6379/0"`
 ---@return redis_watcher|nil watcher
 ---@return string|nil err
-function M.watch(db_conf)
-    local session = c.watch(db_conf)
+function M.watch(url)
+    local session = c.watch(url)
     local res = moon.wait(session)
     if type(res) == "table" and res.code then
         return nil, res.message

@@ -49,21 +49,27 @@ function M.find_connection(name)
 end
 
 ---Connect and register a named pool.
+---
+---All parameters live in a single connection URL of the form
+---`postgresql://username:password@host:port/database?param=value&...`.
+---The pool settings are supplied as `?param=value` query parameters:
+---  * `name` (**required**) — pool name for `find_connection`
+---  * `application_name` (default "moon")
+---  * `connect_timeout` — connect timeout in ms (default 5000)
+---  * `max_connections`/`pool_size` — pool size (default 5)
+---  * `read_timeout` — read timeout in ms (default 10000)
+---  * `queue_capacity` — per-worker request queue capacity (default 1024)
+---
+---e.g. `"postgres://postgres:123456@127.0.0.1:5432/postgres?name=main&max_connections=5"`
 ---@async
----@param database_url string e.g. "postgres://postgres:123456@127.0.0.1:5432/postgres"
----@param name string Connection name for lookup by other services
----@param timeout? integer Connect timeout in milliseconds (default 5000)
----@param max_connections? integer Pool size (default 5)
----@param read_timeout? integer Read timeout in milliseconds (default 10000)
----@param queue_capacity? integer Per-worker request queue capacity (default 1024)
+---@param database_url string connection URL (`postgres://.../db?name=...&param=value`)
 ---@return pg|pg_result @ connection object, or an error table (check `.code`)
-function M.connect(database_url, name, timeout, max_connections, read_timeout, queue_capacity)
-    ---@diagnostic disable-next-line: redundant-parameter
-    local res = moon.wait(c.connect(database_url, name, timeout, max_connections, read_timeout, queue_capacity))
+function M.connect(database_url)
+    local res = moon.wait(c.connect(database_url))
     if res.code then
         return res
     end
-    return M.find_connection(name)
+    return M.find_connection(res.name)
 end
 
 ---Pending request count per pool worker (async queue lengths).

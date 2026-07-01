@@ -21,13 +21,14 @@ local redis_watch = {}
 local redis = {}
 
 --- Connect and register a named connection pool asynchronously.
----@param opts table @ `{ host?, port?, auth?, db? }`
----@param name? string @ Pool name (default `"default"`)
----@param timeout? integer @ Connect timeout in ms (default 5000)
----@param pool_size? integer @ Pool size (default 1)
----@param queue_capacity? integer @ Per-worker request queue capacity (default 1024)
+--- All settings are carried in a single connection URL of the form
+--- `redis://username:password@host:port/db?param=value&...`, e.g.
+--- `"redis://:123456@127.0.0.1:6379/0?name=main&pool_size=2"`.
+--- Pool query params: `name` (default "default"), `connect_timeout` (ms),
+--- `pool_size`/`max_connections`, `read_timeout` (ms), `queue_capacity`.
+---@param url string @ connection URL with `?param=value` pool settings
 ---@return integer session
-function redis.connect(opts, name, timeout, pool_size, queue_capacity) end
+function redis.connect(url) end
 
 --- Look up a registered pool by name.
 ---@param name string
@@ -35,9 +36,10 @@ function redis.connect(opts, name, timeout, pool_size, queue_capacity) end
 function redis.find_connection(name) end
 
 --- Open a dedicated pub/sub connection asynchronously.
----@param opts table @ `{ host?, port?, auth?, db?, timeout? }`
+--- Accepts the same `redis://...` URL as `connect`.
+---@param url string @ connection URL, e.g. `"redis://127.0.0.1:6379/0"`
 ---@return integer session
-function redis.watch(opts) end
+function redis.watch(url) end
 
 --- Statistics per named pool.
 ---@return table<string, pool_stats>

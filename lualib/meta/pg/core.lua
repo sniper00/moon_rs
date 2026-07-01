@@ -10,14 +10,15 @@ local pg_pool = {}
 local pg = {}
 
 --- Connect and register a named pool asynchronously.
----@param database_url string @ PostgreSQL connection URL
----@param name string @ Pool name
----@param timeout? integer @ Connect timeout in ms (default 5000)
----@param max_connections? integer @ Pool size (default 5)
----@param read_timeout? integer @ Query read timeout in ms (default 10000)
----@param queue_capacity? integer @ Per-worker request queue capacity (default 1024)
+--- All settings are carried in a single connection URL of the form
+--- `postgresql://user:password@host:port/database?param=value&...`, e.g.
+--- `"postgres://postgres:123456@127.0.0.1:5432/postgres?name=main&max_connections=5"`.
+--- Pool query params: `name` (required, pool name), `application_name`,
+--- `connect_timeout` (ms), `max_connections`/`pool_size`, `read_timeout` (ms),
+--- `queue_capacity`.
+---@param database_url string @ connection URL with `?param=value` pool settings
 ---@return integer session
-function pg.connect(database_url, name, timeout, max_connections, read_timeout, queue_capacity) end
+function pg.connect(database_url) end
 
 --- Look up a registered pool by name.
 ---@param name string
