@@ -228,7 +228,7 @@ end
 ---------------------------------------------------------------------------
 
 moon.async(function()
-    local db = pg.connect(PG_URL, "namesearch_bench", 5000, 1)
+    local db = pg.connect(PG_URL .. "?name=namesearch_bench&connect_timeout=5000&max_connections=1")
     if type(db) == "table" and db.code then
         moon.error("pg connect failed: " .. tostring(db.message))
         moon.exit(-1)

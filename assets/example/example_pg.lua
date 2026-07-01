@@ -21,7 +21,8 @@ local DB_URL = "postgres://postgres:123456@127.0.0.1:5432/postgres"
 local _seq = 0
 local function connect(pool_size)
     _seq = _seq + 1
-    return pg.connect(DB_URL, "example_" .. _seq, 5000, pool_size or 1)
+    return pg.connect(string.format("%s?name=example_%d&connect_timeout=5000&max_connections=%d",
+        DB_URL, _seq, pool_size or 1))
 end
 
 local function assert_ok(res, msg)

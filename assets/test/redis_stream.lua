@@ -2,7 +2,7 @@ local moon = require("moon")
 local redis = require("moon.db.redis")
 
 ---@class RedisStream
----@field private options table
+---@field private url string
 ---@field private pool_name string
 ---@field private db table?
 local RedisStream = {}
@@ -17,12 +17,12 @@ local function is_socket_error(res)
     return type(res) == "table" and res.code == "SOCKET"
 end
 
----@param options table @ `{ host, port, auth?, db? }`
+---@param url string @ base connection URL, e.g. `"redis://127.0.0.1:6379/0"`
 ---@param pool_name? string
 ---@return RedisStream
-function RedisStream.new(options, pool_name)
+function RedisStream.new(url, pool_name)
     return setmetatable({
-        options = options,
+        url = url,
         pool_name = pool_name or "redis_stream",
         db = nil,
     }, { __index = RedisStream })
@@ -57,7 +57,8 @@ function RedisStream:exec(cmd, ...)
                     "Failed to connect to Redis after %d attempts: %s",
                     failed_times, err or "unknown error"))
             end
-            self.db, err = redis.connect(self.options, self.pool_name, 5000, 1)
+            self.db, err = redis.connect(string.format("%s?name=%s&connect_timeout=5000&pool_size=1",
+                self.url, self.pool_name))
             if not self.db then
                 failed_times = failed_times + 1
                 moon.sleep(1000)

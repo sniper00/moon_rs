@@ -40,9 +40,10 @@ local function print_final_table()
         { key = "incr",              label = "INCR" },
         { key = "hset",              label = "HSET" },
         { key = "lpush",             label = "LPUSH" },
-        { key = "stream_xadd",       label = "Stream XADD" },
-        { key = "stream_pipe_xadd",  label = "Stream Pipe XADD" },
-        { key = "stream_consume",    label = "Stream XREADGROUP+XACK" },
+        { key = "stream_xadd",         label = "Stream XADD" },
+        { key = "stream_pipe_xadd",    label = "Stream Pipe XADD" },
+        { key = "stream_consume",      label = "XREADGROUP+XACK (1x)" },
+        { key = "stream_consume_batch", label = "XREADGROUP+XACK (x100)" },
     }
 
     local W = { 22, 7, 10, 10, 8 }
@@ -107,7 +108,8 @@ end
 moon.async(function()
     print("Connecting...")
 
-    local db, err = redis.connect({ host = HOST, port = PORT }, "bench_redis", 5000, 1)
+    local db, err = redis.connect(string.format("redis://%s:%d/0?name=bench_redis&connect_timeout=5000&pool_size=1",
+        HOST, PORT))
     if not db then
         print("connect failed:", err)
         moon.exit(-1)
@@ -282,6 +284,43 @@ moon.async(function()
             db:xack(consume_stream, consume_group, id)
         end
         record("stream_consume", N_SINGLE, moon.clock() - bt)
+        io.write("."); io.flush()
+    end
+
+    -----------------------------------------------------------
+    -- 12. Stream XREADGROUP + XACK, batched (COUNT=100, one XACK per batch)
+    --     Reads up to BATCH messages per round-trip and acks them all in a
+    --     single XACK, amortizing the per-message RTT of test 11.
+    -----------------------------------------------------------
+    do
+        local consume_stream = STREAM_KEY .. ":consume_batch"
+        local consume_group = STREAM_GROUP .. "_cb"
+        local consumer = "bench_consumer_b"
+        local BATCH = 100
+
+        db:xgroup("CREATE", consume_stream, consume_group, "0", "MKSTREAM")
+        -- Preload via one pipeline so setup isn't the bottleneck.
+        local seed = {}
+        for i = 1, N_SINGLE do
+            seed[i] = { "XADD", consume_stream, "*", "c", tostring(i) }
+        end
+        db:pipeline(seed)
+
+        local bt = moon.clock()
+        local consumed = 0
+        while consumed < N_SINGLE do
+            local r = db:xreadgroup("GROUP", consume_group, consumer,
+                "COUNT", tostring(BATCH), "STREAMS", consume_stream, ">")
+            local msgs = r and r[1] and r[1][2]
+            if not msgs or #msgs == 0 then break end
+            local ids = {}
+            for j = 1, #msgs do
+                ids[j] = msgs[j][1]
+            end
+            db:xack(consume_stream, consume_group, table.unpack(ids))
+            consumed = consumed + #msgs
+        end
+        record("stream_consume_batch", consumed, moon.clock() - bt)
         io.write("."); io.flush()
     end
 

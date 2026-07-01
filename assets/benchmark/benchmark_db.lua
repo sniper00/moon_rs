@@ -148,7 +148,7 @@ local function load_pg()
     if not ok then return false end
     local _seq = 0
     _seq = _seq + 1
-    local db = pg.connect(PG_URL, "bench_pg_" .. _seq, 5000, 1)
+    local db = pg.connect(PG_URL .. "?name=bench_pg_" .. _seq .. "&connect_timeout=5000&max_connections=1")
     if type(db) == "table" and db.code then
         print("  [pg] connect failed: " .. tostring(db.message))
         return false
@@ -211,7 +211,7 @@ end
 local function load_redis()
     local ok, redis = pcall(require, "moon.db.redis")
     if not ok then return false end
-    local db, err = redis.connect({ host = REDIS_HOST, port = REDIS_PORT, timeout = 2000 })
+    local db, err = redis.connect(string.format("redis://%s:%d/0?connect_timeout=2000", REDIS_HOST, REDIS_PORT))
     if not db then
         print("  [redis] connect failed: " .. tostring(err))
         return false
@@ -462,7 +462,7 @@ local function bench_pg_specific(N)
 
     -- fire-and-forget vs await — use a larger pool to avoid channel overflow
     local pg = require("moon.db.pg")
-    local ff_db = pg.connect(PG_URL, "bench_pg_ff", 5000, 5)
+    local ff_db = pg.connect(PG_URL .. "?name=bench_pg_ff&connect_timeout=5000&max_connections=5")
     if type(ff_db) ~= "table" or not ff_db.code then
         ff_db:query("DROP TABLE IF EXISTS bench_kv_ff")
         ff_db:query("CREATE TABLE bench_kv_ff (id bigint PRIMARY KEY, name text, info text)")

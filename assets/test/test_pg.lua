@@ -60,7 +60,8 @@ end
 local _seq = 0
 local function new_conn(pool_size)
     _seq = _seq + 1
-    return pg.connect(DB_URL, "test_" .. _seq, 5000, pool_size or 1)
+    return pg.connect(string.format("%s?name=test_%d&connect_timeout=5000&max_connections=%d",
+        DB_URL, _seq, pool_size or 1))
 end
 
 ---------------------------------------------------------------------------
@@ -101,22 +102,25 @@ local function test_connection()
     current_category = "Connection"
 
     test("connect with bad host (timeout)", function()
-        local res = pg.connect("postgres://postgres:123456@192.0.2.1:5432/postgres", "bad_host", 1000, 1)
+        local res = pg.connect(
+            "postgres://postgres:123456@192.0.2.1:5432/postgres?name=bad_host&connect_timeout=1000&max_connections=1")
         assert(res.code, "expected connection error")
     end)
 
     test("connect with bad password", function()
-        local res = pg.connect("postgres://postgres:wrong_password@127.0.0.1:5432/postgres", "bad_pw", 2000, 1)
+        local res = pg.connect(
+            "postgres://postgres:wrong_password@127.0.0.1:5432/postgres?name=bad_pw&connect_timeout=2000&max_connections=1")
         assert(res.code, "expected auth error")
     end)
 
     test("connect with bad database", function()
-        local res = pg.connect("postgres://postgres:123456@127.0.0.1:5432/nonexistent_db_xyz", "bad_db", 2000, 1)
+        local res = pg.connect(
+            "postgres://postgres:123456@127.0.0.1:5432/nonexistent_db_xyz?name=bad_db&connect_timeout=2000&max_connections=1")
         assert(res.code, "expected database error")
     end)
 
     test("connect with invalid URL", function()
-        local res = pg.connect("not_a_url", "bad_url", 1000, 1)
+        local res = pg.connect("not_a_url?name=bad_url")
         assert(res.code, "expected parse error")
     end)
 

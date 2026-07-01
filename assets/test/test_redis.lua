@@ -54,13 +54,14 @@ local function wait_until(cond_fn, timeout_s)
 end
 
 local function redis_conf()
-    return { host = HOST, port = PORT }
+    return string.format("redis://%s:%d", HOST, PORT)
 end
 
 moon.async(function()
     print("=== Redis tests (prefix: " .. test_prefix .. ") ===\n")
 
-    local db, err = redis.connect(redis_conf(), "test_redis", TIMEOUT, 1)
+    local db, err = redis.connect(string.format("%s?name=test_redis&connect_timeout=%d&pool_size=1",
+        redis_conf(), TIMEOUT))
     if not db then
         print("connect failed:", err)
         moon.exit(-1)
@@ -98,7 +99,7 @@ moon.async(function()
     print("\n--- Pub/Sub watch ---")
 
     local channel = test_prefix .. ":pub"
-    local watcher, werr = redis.watch({ host = HOST, port = PORT, timeout = TIMEOUT })
+    local watcher, werr = redis.watch(string.format("%s?connect_timeout=%d", redis_conf(), TIMEOUT))
     if not watcher then
         print("watch connect failed:", werr)
         moon.exit(-1)

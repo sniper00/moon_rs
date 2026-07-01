@@ -16,7 +16,8 @@ moon.async(function()
     -----------------------------------------------------------
     -- 1. Connect
     -----------------------------------------------------------
-    local db, err = redis.connect({ host = HOST, port = PORT }, "example", 5000, 1)
+    local db, err = redis.connect(string.format("redis://%s:%d/0?name=example&connect_timeout=5000&pool_size=1",
+        HOST, PORT))
     if not db then
         print("connect failed:", err)
         moon.exit(-1)
