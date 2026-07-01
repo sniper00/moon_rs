@@ -512,6 +512,24 @@ impl LuaActorServer {
                 data: MessageBody::None(PTYPE_SHUTDOWN),
             });
         });
+
+        // When the exit code is negative the shutdown is triggered by an
+        // unrecoverable error, not a graceful stop. Actors may fail to call
+        // `moon.quit()` during their PTYPE_SHUTDOWN handler (e.g. because the
+        // error happened during service initialisation), which would leave
+        // unique-actor threads stuck in `blocking_recv_many` and prevent
+        // `join_unique_threads` from ever returning. Force-quit every actor
+        // so the process can terminate without external intervention.
+        if exit_code < 0 {
+            self.actors.iter().for_each(|v| {
+                let _ = v.value().tx.send(Message {
+                    from: 0,
+                    to: 0,
+                    session: 0,
+                    data: MessageBody::None(PTYPE_QUIT),
+                });
+            });
+        }
     }
 
     #[must_use]
