@@ -42,7 +42,7 @@ lazy_static! {
 }
 
 // ---------------------------------------------------------------------------
-// Connection parameters (parsed from a sqlx-style URL)
+// Connection parameters (parsed from a sqlx-style URL, incl. pool query params)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -55,7 +55,29 @@ struct ConnParams {
     application_name: String,
 }
 
-impl ConnParams {
+/// Everything `connect` needs, parsed from a single connection URL. The
+/// wire-protocol params come from the URL authority/path; the pool settings
+/// come from the `?key=value` query string.
+struct ConnectConfig {
+    params: ConnParams,
+    /// Pool name used for registry lookup (`find_connection`).
+    name: String,
+    connect_timeout_ms: u64,
+    max_connections: usize,
+    read_timeout_ms: u64,
+    queue_capacity: usize,
+}
+
+impl ConnectConfig {
+    /// Parse `postgresql://user:password@host:port/database?param=value&...`.
+    ///
+    /// Query params (all optional except `name`):
+    ///   * `name` (**required**) — pool name for `find_connection`
+    ///   * `application_name` (default "moon")
+    ///   * `connect_timeout` — connect timeout in ms (default 5000)
+    ///   * `max_connections`/`pool_size` — pool size (default 5)
+    ///   * `read_timeout` — read timeout in ms (default 10000)
+    ///   * `queue_capacity` — per-worker request queue capacity (default 1024)
     fn parse(database_url: &str) -> Result<Self, String> {
         let url =
             url::Url::parse(database_url).map_err(|e| format!("invalid connection url: {}", e))?;
@@ -78,21 +100,56 @@ impl ConnParams {
             return Err("missing database in connection url".to_string());
         }
 
-        let application_name = url
-            .query_pairs()
-            .find(|(k, _)| k == "application_name")
-            .map(|(_, v)| v.into_owned())
-            .unwrap_or_else(|| "moon".to_string());
+        let mut application_name: Option<String> = None;
+        let mut name: Option<String> = None;
+        let mut connect_timeout_ms: u64 = 5000;
+        let mut max_connections: usize = crate::LIMITS.db_pool_size as usize;
+        let mut read_timeout_ms: u64 = crate::LIMITS.db_read_timeout_ms;
+        let mut queue_capacity: usize = crate::LIMITS.request_queue_capacity;
 
-        Ok(ConnParams {
-            host,
-            port,
-            user,
-            password,
-            database,
-            application_name,
+        for (k, v) in url.query_pairs() {
+            match k.as_ref() {
+                "application_name" => application_name = Some(v.into_owned()),
+                "name" => name = Some(v.into_owned()),
+                "connect_timeout" => connect_timeout_ms = parse_num("connect_timeout", &v)?,
+                "max_connections" | "pool_size" => {
+                    max_connections = parse_num("max_connections", &v)?
+                }
+                "read_timeout" => read_timeout_ms = parse_num("read_timeout", &v)?,
+                "queue_capacity" => queue_capacity = parse_num("queue_capacity", &v)?,
+                other => return Err(format!("unknown connection parameter: '{}'", other)),
+            }
+        }
+
+        let name = name
+            .filter(|s| !s.is_empty())
+            .ok_or("missing 'name' query parameter in connection url")?;
+
+        Ok(ConnectConfig {
+            params: ConnParams {
+                host,
+                port,
+                user,
+                password,
+                database,
+                application_name: application_name.unwrap_or_else(|| "moon".to_string()),
+            },
+            name,
+            connect_timeout_ms,
+            max_connections: max_connections.max(1),
+            read_timeout_ms,
+            queue_capacity: queue_capacity.max(1),
         })
     }
+}
+
+fn parse_num<T>(key: &str, value: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse::<T>()
+        .map_err(|_| format!("invalid value for '{}': {:?}", key, value))
 }
 
 /// Minimal percent-decoding (the `url` crate keeps userinfo percent-encoded).
@@ -198,8 +255,9 @@ struct QueryResult {
 }
 
 enum PgResponse {
-    Connect,
-    /// Configuration / URL parse failure.
+    /// Successful connect; carries the registered pool name for `find_connection`.
+    Connect(String),
+    /// Configuration / connection-string parse failure.
     Config(String),
     /// Socket / IO failure.
     Socket(String),
@@ -1265,23 +1323,21 @@ const PG_POOL_META: *const std::ffi::c_char = cstr!("pg_pool_metatable");
 
 extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let database_url = unsafe { laux::lua_check_str(state, 1) }.to_string();
-    let name = unsafe { laux::lua_check_str(state, 2) }.to_string();
-    let timeout_ms: u64 = laux::lua_opt(state, 3).unwrap_or(5000);
-    let max_connections: usize =
-        laux::lua_opt(state, 4).unwrap_or(crate::LIMITS.db_pool_size as usize);
-    let max_connections = max_connections.max(1);
-    let read_timeout_ms: u64 = laux::lua_opt(state, 5).unwrap_or(crate::LIMITS.db_read_timeout_ms);
-    let queue_capacity: usize =
-        laux::lua_opt(state, 6).unwrap_or(crate::LIMITS.request_queue_capacity);
-    let queue_capacity = queue_capacity.max(1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
     CONTEXT.io_runtime().spawn(async move {
-        let params = match ConnParams::parse(&database_url) {
-            Ok(p) => p,
+        let ConnectConfig {
+            params,
+            name,
+            connect_timeout_ms: timeout_ms,
+            max_connections,
+            read_timeout_ms,
+            queue_capacity,
+        } = match ConnectConfig::parse(&database_url) {
+            Ok(c) => c,
             Err(e) => {
                 let _ =
                     CONTEXT.send_value(context::PTYPE_PG, owner, session, PgResponse::Config(e));
@@ -1323,7 +1379,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
         // Replacing an existing pool of the same name: shut down the previous
         // pool's workers so their tasks/connections don't leak (the old workers
         // drain their queued requests, then exit on `Shutdown`).
-        if let Some(old) = PG_CONNECTIONS.insert(name, pool) {
+        if let Some(old) = PG_CONNECTIONS.insert(name.clone(), pool) {
             log::warn!(
                 "pg '{}' reconnected with the same name; shutting down the previous pool",
                 old.inner.name()
@@ -1332,7 +1388,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
                 let _ = w.tx().send(PgMessage::Shutdown).await;
             }
         }
-        let _ = CONTEXT.send_value(context::PTYPE_PG, owner, session, PgResponse::Connect);
+        let _ = CONTEXT.send_value(context::PTYPE_PG, owner, session, PgResponse::Connect(name));
     });
 
     laux::lua_push(state, session);
@@ -1903,9 +1959,9 @@ fn push_db_error(state: LuaState, err: &DbError) {
 
 fn push_pg_response(state: LuaState, response: PgResponse) -> c_int {
     match response {
-        PgResponse::Connect => {
-            // Empty table => no `.code`, signalling success to pg.lua.
-            LuaTable::new(state, 0, 0);
+        PgResponse::Connect(name) => {
+            // No `.code` => success; `.name` lets pg.lua look the pool up.
+            push_lua_table!(state, "name" => name);
             1
         }
         PgResponse::Config(msg) => {
@@ -2315,34 +2371,53 @@ mod tests {
 
     #[test]
     fn parse_url_full() {
-        let p = ConnParams::parse("postgres://alice:s3cret@db.host:6543/shop?application_name=svc")
-            .unwrap();
-        assert_eq!(p.host, "db.host");
-        assert_eq!(p.port, 6543);
-        assert_eq!(p.user, "alice");
-        assert_eq!(p.password, "s3cret");
-        assert_eq!(p.database, "shop");
-        assert_eq!(p.application_name, "svc");
+        let cfg = ConnectConfig::parse(
+            "postgres://alice:s3cret@db.host:6543/shop?application_name=svc&name=main\
+             &connect_timeout=3000&max_connections=8&read_timeout=20000&queue_capacity=2048",
+        )
+        .unwrap();
+        assert_eq!(cfg.params.host, "db.host");
+        assert_eq!(cfg.params.port, 6543);
+        assert_eq!(cfg.params.user, "alice");
+        assert_eq!(cfg.params.password, "s3cret");
+        assert_eq!(cfg.params.database, "shop");
+        assert_eq!(cfg.params.application_name, "svc");
+        assert_eq!(cfg.name, "main");
+        assert_eq!(cfg.connect_timeout_ms, 3000);
+        assert_eq!(cfg.max_connections, 8);
+        assert_eq!(cfg.read_timeout_ms, 20000);
+        assert_eq!(cfg.queue_capacity, 2048);
     }
 
     #[test]
     fn parse_url_defaults_and_alias() {
-        let p = ConnParams::parse("postgresql://postgres:123456@127.0.0.1/postgres").unwrap();
-        assert_eq!(p.port, 5432);
-        assert_eq!(p.application_name, "moon");
+        // `postgresql` scheme alias, `pool_size` param alias, defaults elsewhere.
+        let cfg =
+            ConnectConfig::parse("postgresql://postgres:123456@127.0.0.1/postgres?name=c&pool_size=3")
+                .unwrap();
+        assert_eq!(cfg.params.port, 5432);
+        assert_eq!(cfg.params.application_name, "moon");
+        assert_eq!(cfg.name, "c");
+        assert_eq!(cfg.connect_timeout_ms, 5000);
+        assert_eq!(cfg.max_connections, 3);
     }
 
     #[test]
     fn parse_url_percent_encoded_password() {
-        let p = ConnParams::parse("postgres://u:p%40ss%2Fword@h/db").unwrap();
-        assert_eq!(p.password, "p@ss/word");
+        let cfg = ConnectConfig::parse("postgres://u:p%40ss%2Fword@h/db?name=c").unwrap();
+        assert_eq!(cfg.params.password, "p@ss/word");
     }
 
     #[test]
     fn parse_url_errors() {
-        assert!(ConnParams::parse("mysql://u:p@h/db").is_err());
-        assert!(ConnParams::parse("postgres://h/db").is_err()); // no user
-        assert!(ConnParams::parse("postgres://u@h").is_err()); // no database
+        assert!(ConnectConfig::parse("mysql://u:p@h/db?name=c").is_err()); // bad scheme
+        assert!(ConnectConfig::parse("postgres://h/db?name=c").is_err()); // no user
+        assert!(ConnectConfig::parse("postgres://u@h?name=c").is_err()); // no database
+        assert!(ConnectConfig::parse("postgres://u:p@h/db").is_err()); // no name
+        assert!(ConnectConfig::parse("postgres://u:p@h/db?name=c&sslmode=require").is_err()); // unknown param
+        assert!(ConnectConfig::parse("not_a_url").is_err()); // not a url
+        assert!(ConnectConfig::parse("postgres://u:p@h/db?name=c&port=abc").is_err()); // 'port' is not a query param
+        assert!(ConnectConfig::parse("postgres://u:p@h/db?name=c&connect_timeout=abc").is_err()); // bad number
     }
 
     #[test]
@@ -2679,16 +2754,18 @@ mod tests {
 
     #[test]
     fn parse_url_ipv6_host() {
-        let p = ConnParams::parse("postgres://user:pass@[::1]:5433/mydb").unwrap();
-        assert_eq!(p.host, "[::1]");
-        assert_eq!(p.port, 5433);
+        let cfg = ConnectConfig::parse("postgres://user:pass@[::1]:5433/mydb?name=n").unwrap();
+        assert_eq!(cfg.params.host, "[::1]");
+        assert_eq!(cfg.params.port, 5433);
     }
 
     #[test]
-    fn parse_url_default_host() {
-        let p = ConnParams::parse("postgres://user:pass@/mydb");
-        // URL parsing with empty host may vary; should not panic
-        assert!(p.is_ok() || p.is_err());
+    fn parse_url_clamps_pool_and_queue() {
+        let cfg =
+            ConnectConfig::parse("postgres://u:p@h/d?name=n&max_connections=0&queue_capacity=0")
+                .unwrap();
+        assert_eq!(cfg.max_connections, 1);
+        assert_eq!(cfg.queue_capacity, 1);
     }
 
     // -- start_message / end_message ------------------------------------------
@@ -2785,24 +2862,5 @@ mod tests {
     fn read_u16_big_endian() {
         let buf = [0x01, 0x00];
         assert_eq!(read_u16(&buf, 0), 256);
-    }
-
-    // -- percent_decode -------------------------------------------------------
-
-    #[test]
-    fn percent_decode_basic() {
-        assert_eq!(percent_decode("hello%20world"), "hello world");
-        assert_eq!(percent_decode("100%25"), "100%");
-        assert_eq!(percent_decode("no_encoding"), "no_encoding");
-    }
-
-    #[test]
-    fn percent_decode_empty() {
-        assert_eq!(percent_decode(""), "");
-    }
-
-    #[test]
-    fn percent_decode_special_chars() {
-        assert_eq!(percent_decode("%40%2F%3A"), "@/:");
     }
 }

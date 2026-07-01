@@ -34,7 +34,7 @@ lazy_static! {
 }
 
 // ---------------------------------------------------------------------------
-// Connection parameters (from Lua table: host, port, auth, db, timeout)
+// Connection parameters (parsed from a `redis://` URL, incl. pool query params)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -45,6 +45,118 @@ struct ConnParams {
     password: String,
     db: u16,
     read_timeout_ms: u64,
+}
+
+/// Everything `connect` needs, parsed from a single connection URL. The
+/// wire-protocol params come from the URL authority/path; the pool settings
+/// come from the `?key=value` query string.
+struct ConnectConfig {
+    params: ConnParams,
+    /// Pool name used for registry lookup (`find_connection`).
+    name: String,
+    connect_timeout_ms: u64,
+    pool_size: usize,
+    queue_capacity: usize,
+}
+
+impl ConnectConfig {
+    /// Parse `redis://username:password@host:port/db?param=value&...`.
+    ///
+    /// The `/db` segment is optional and defaults to `0` when absent.
+    ///
+    /// Query params (all optional):
+    ///   * `name` — pool name for `find_connection` (default "default")
+    ///   * `connect_timeout` — connect timeout in ms (default 5000)
+    ///   * `pool_size`/`max_connections` — pool size (default 1)
+    ///   * `read_timeout` — read timeout in ms (default 10000)
+    ///   * `queue_capacity` — per-worker request queue capacity (default 1024)
+    fn parse(url_str: &str) -> Result<Self, String> {
+        let url =
+            url::Url::parse(url_str).map_err(|e| format!("invalid connection url: {}", e))?;
+        match url.scheme() {
+            "redis" => {}
+            other => return Err(format!("unsupported scheme '{}', expected redis", other)),
+        }
+
+        let host = url.host_str().unwrap_or("127.0.0.1").to_string();
+        let port = url.port().unwrap_or(6379);
+        let username = percent_decode(url.username());
+        let password = url.password().map(percent_decode).unwrap_or_default();
+
+        let db_path = url.path().trim_start_matches('/');
+        let db: u16 = if db_path.is_empty() {
+            0
+        } else {
+            db_path
+                .parse()
+                .map_err(|_| format!("invalid db number: {:?}", db_path))?
+        };
+
+        let mut name = "default".to_string();
+        let mut connect_timeout_ms: u64 = 5000;
+        let mut pool_size: usize = 1;
+        let mut read_timeout_ms: u64 = crate::LIMITS.db_read_timeout_ms;
+        let mut queue_capacity: usize = crate::LIMITS.request_queue_capacity;
+
+        for (k, v) in url.query_pairs() {
+            match k.as_ref() {
+                "name" => name = v.into_owned(),
+                "connect_timeout" => connect_timeout_ms = parse_num("connect_timeout", &v)?,
+                "pool_size" | "max_connections" => pool_size = parse_num("pool_size", &v)?,
+                "read_timeout" => read_timeout_ms = parse_num("read_timeout", &v)?,
+                "queue_capacity" => queue_capacity = parse_num("queue_capacity", &v)?,
+                other => return Err(format!("unknown connection parameter: '{}'", other)),
+            }
+        }
+        if name.is_empty() {
+            name = "default".to_string();
+        }
+
+        Ok(ConnectConfig {
+            params: ConnParams {
+                host,
+                port,
+                username,
+                password,
+                db,
+                read_timeout_ms,
+            },
+            name,
+            connect_timeout_ms,
+            pool_size: pool_size.max(1),
+            queue_capacity: queue_capacity.max(1),
+        })
+    }
+}
+
+fn parse_num<T>(key: &str, value: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse::<T>()
+        .map_err(|_| format!("invalid value for '{}': {:?}", key, value))
+}
+
+/// Minimal percent-decoding (the `url` crate keeps userinfo percent-encoded).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +223,10 @@ enum RedisReply {
 }
 
 enum RedisResponse {
-    Connect,
+    /// Successful connect; carries the registered pool name for `find_connection`.
+    Connect(String),
+    /// Connection-string parse failure.
+    Config(String),
     Error(String),
     /// Single command: raw RESP bytes (parsed on actor thread).
     Raw(Vec<u8>),
@@ -774,78 +889,6 @@ fn write_bulk_bytes(buf: &mut Vec<u8>, data: &[u8]) {
 const REDIS_POOL_META: *const std::ffi::c_char = cstr!("redis_pool_metatable");
 const REDIS_WATCH_META: *const std::ffi::c_char = cstr!("redis_watch_metatable");
 
-fn parse_conn_params(state: LuaState, idx: i32) -> ConnParams {
-    laux::lua_checktype(state, idx, ffi::LUA_TTABLE);
-
-    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("host")) };
-    let host = if laux::lua_type(state, -1) == laux::LuaType::String {
-        unsafe { laux::lua_check_str(state, -1) }.to_string()
-    } else {
-        "127.0.0.1".to_string()
-    };
-    laux::lua_pop(state, 1);
-
-    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("port")) };
-    let port: u16 = if laux::lua_type(state, -1) == laux::LuaType::Number {
-        laux::lua_opt(state, -1).unwrap_or(6379)
-    } else {
-        6379
-    };
-    laux::lua_pop(state, 1);
-
-    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("username")) };
-    let username = if laux::lua_type(state, -1) == laux::LuaType::String {
-        unsafe { laux::lua_check_str(state, -1) }.to_string()
-    } else {
-        String::new()
-    };
-    laux::lua_pop(state, 1);
-
-    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("auth")) };
-    let password = if laux::lua_type(state, -1) == laux::LuaType::String {
-        unsafe { laux::lua_check_str(state, -1) }.to_string()
-    } else {
-        String::new()
-    };
-    laux::lua_pop(state, 1);
-
-    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("db")) };
-    let db: u16 = if laux::lua_type(state, -1) == laux::LuaType::Number {
-        laux::lua_opt(state, -1).unwrap_or(0)
-    } else {
-        0
-    };
-    laux::lua_pop(state, 1);
-
-    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("read_timeout")) };
-    let read_timeout_ms: u64 = if laux::lua_type(state, -1) == laux::LuaType::Number {
-        laux::lua_opt(state, -1).unwrap_or(crate::LIMITS.db_read_timeout_ms)
-    } else {
-        crate::LIMITS.db_read_timeout_ms
-    };
-    laux::lua_pop(state, 1);
-
-    ConnParams {
-        host,
-        port,
-        username,
-        password,
-        db,
-        read_timeout_ms,
-    }
-}
-
-fn parse_connect_timeout(state: LuaState, idx: i32, default: u64) -> u64 {
-    unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("timeout")) };
-    let v = if laux::lua_type(state, -1) == laux::LuaType::Number {
-        laux::lua_opt(state, -1).unwrap_or(default)
-    } else {
-        default
-    };
-    laux::lua_pop(state, 1);
-    v
-}
-
 fn collect_string_args(state: LuaState, start: i32) -> Vec<String> {
     let top = laux::lua_top(state);
     let mut out = Vec::with_capacity((top - start + 1) as usize);
@@ -855,25 +898,36 @@ fn collect_string_args(state: LuaState, start: i32) -> Vec<String> {
     out
 }
 
-/// `redis.connect(opts_table, name, timeout_ms, pool_size)`
+/// `redis.connect(url)`
 ///
-/// `opts_table`: `{ host = "127.0.0.1", port = 6379, auth = "password", db = 0 }`
+/// `url`: `redis://username:password@host:port/db?name=...&pool_size=...`
 extern "C-unwind" fn connect(state: LuaState) -> c_int {
-    let params = parse_conn_params(state, 1);
-
-    let name: String = laux::lua_opt(state, 2).unwrap_or_else(|| "default".to_string());
-    let timeout_ms: u64 = laux::lua_opt(state, 3).unwrap_or(5000);
-    let pool_size: usize = laux::lua_opt(state, 4).unwrap_or(1);
-    let pool_size = pool_size.max(1);
-    let queue_capacity: usize =
-        laux::lua_opt(state, 5).unwrap_or(crate::LIMITS.request_queue_capacity);
-    let queue_capacity = queue_capacity.max(1);
+    let url = unsafe { laux::lua_check_str(state, 1) }.to_string();
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
     CONTEXT.io_runtime().spawn(async move {
+        let ConnectConfig {
+            params,
+            name,
+            connect_timeout_ms: timeout_ms,
+            pool_size,
+            queue_capacity,
+        } = match ConnectConfig::parse(&url) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = CONTEXT.send_value(
+                    context::PTYPE_REDIS,
+                    owner,
+                    session,
+                    RedisResponse::Config(e),
+                );
+                return;
+            }
+        };
+
         let first_conn = match RedisConn::connect(&params, timeout_ms).await {
             Ok(c) => c,
             Err(e) => {
@@ -909,7 +963,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
         // Replacing an existing pool of the same name: shut down the previous
         // pool's workers so their tasks/connections don't leak (the old workers
         // drain their queued requests, then exit on `Shutdown`).
-        if let Some(old) = REDIS_CONNECTIONS.insert(name, pool) {
+        if let Some(old) = REDIS_CONNECTIONS.insert(name.clone(), pool) {
             log::warn!(
                 "redis '{}' reconnected with the same name; shutting down the previous pool",
                 old.inner.name()
@@ -918,7 +972,8 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
                 let _ = w.tx().send(RedisMessage::Shutdown).await;
             }
         }
-        let _ = CONTEXT.send_value(context::PTYPE_REDIS, owner, session, RedisResponse::Connect);
+        let _ =
+            CONTEXT.send_value(context::PTYPE_REDIS, owner, session, RedisResponse::Connect(name));
     });
 
     laux::lua_push(state, session);
@@ -1120,16 +1175,30 @@ extern "C-unwind" fn stats(state: LuaState) -> c_int {
     1
 }
 
-/// `redis.watch(opts_table)` — dedicated pub/sub connection.
+/// `redis.watch(url)` — dedicated pub/sub connection. Accepts the same
+/// `redis://...` URL as `connect` (the pool-only params like `name`/`pool_size`
+/// are ignored here).
 extern "C-unwind" fn watch_connect(state: LuaState) -> c_int {
-    let params = parse_conn_params(state, 1);
-    let timeout_ms = parse_connect_timeout(state, 1, 5000);
+    let url = unsafe { laux::lua_check_str(state, 1) }.to_string();
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
     CONTEXT.io_runtime().spawn(async move {
+        let (params, timeout_ms) = match ConnectConfig::parse(&url) {
+            Ok(c) => (c.params, c.connect_timeout_ms),
+            Err(e) => {
+                let _ = CONTEXT.send_value(
+                    context::PTYPE_REDIS,
+                    owner,
+                    session,
+                    RedisResponse::Config(e),
+                );
+                return;
+            }
+        };
+
         match RedisConn::connect(&params, timeout_ms).await {
             Ok(conn) => {
                 let (tx, rx) = mpsc::unbounded_channel();
@@ -1349,8 +1418,13 @@ fn parse_raw_push(state: LuaState, raw: &[u8], pos: usize) -> Result<usize, Stri
 
 fn push_redis_response(state: LuaState, response: RedisResponse) -> c_int {
     match response {
-        RedisResponse::Connect => {
-            LuaTable::new(state, 0, 0);
+        RedisResponse::Connect(name) => {
+            // No `.code` => success; `.name` lets redis.lua look the pool up.
+            push_lua_table!(state, "name" => name.as_str());
+            1
+        }
+        RedisResponse::Config(msg) => {
+            push_lua_table!(state, "code" => "CONFIG", "message" => msg.as_str());
             1
         }
         RedisResponse::Error(msg) => {
@@ -1527,6 +1601,74 @@ mod tests {
         assert!(p.password.is_empty());
         assert_eq!(p.db, 0);
         assert_eq!(p.read_timeout_ms, crate::LIMITS.db_read_timeout_ms);
+    }
+
+    // -- ConnectConfig::parse -------------------------------------------------
+
+    #[test]
+    fn parse_url_full() {
+        let cfg = ConnectConfig::parse(
+            "redis://user:pass@redis.host:6380/3?name=main&connect_timeout=3000\
+             &pool_size=4&read_timeout=20000&queue_capacity=2048",
+        )
+        .unwrap();
+        assert_eq!(cfg.params.host, "redis.host");
+        assert_eq!(cfg.params.port, 6380);
+        assert_eq!(cfg.params.username, "user");
+        assert_eq!(cfg.params.password, "pass");
+        assert_eq!(cfg.params.db, 3);
+        assert_eq!(cfg.params.read_timeout_ms, 20000);
+        assert_eq!(cfg.name, "main");
+        assert_eq!(cfg.connect_timeout_ms, 3000);
+        assert_eq!(cfg.pool_size, 4);
+        assert_eq!(cfg.queue_capacity, 2048);
+    }
+
+    #[test]
+    fn parse_url_defaults() {
+        let cfg = ConnectConfig::parse("redis://127.0.0.1:6379").unwrap();
+        assert_eq!(cfg.params.host, "127.0.0.1");
+        assert_eq!(cfg.params.port, 6379);
+        assert!(cfg.params.username.is_empty());
+        assert!(cfg.params.password.is_empty());
+        assert_eq!(cfg.params.db, 0);
+        assert_eq!(cfg.name, "default");
+        assert_eq!(cfg.connect_timeout_ms, 5000);
+        assert_eq!(cfg.pool_size, 1);
+    }
+
+    #[test]
+    fn parse_url_password_only_and_max_connections_alias() {
+        // Redis allows password without a username (`redis://:pass@host`).
+        let cfg =
+            ConnectConfig::parse("redis://:secret@localhost/1?max_connections=8").unwrap();
+        assert!(cfg.params.username.is_empty());
+        assert_eq!(cfg.params.password, "secret");
+        assert_eq!(cfg.params.db, 1);
+        assert_eq!(cfg.pool_size, 8);
+    }
+
+    #[test]
+    fn parse_url_percent_encoded_password() {
+        let cfg = ConnectConfig::parse("redis://:p%40ss%2Fword@h:6379/0").unwrap();
+        assert_eq!(cfg.params.password, "p@ss/word");
+    }
+
+    #[test]
+    fn parse_url_clamps_pool_and_queue() {
+        let cfg =
+            ConnectConfig::parse("redis://h/0?pool_size=0&queue_capacity=0").unwrap();
+        assert_eq!(cfg.pool_size, 1);
+        assert_eq!(cfg.queue_capacity, 1);
+    }
+
+    #[test]
+    fn parse_url_errors() {
+        assert!(ConnectConfig::parse("http://h/0").is_err()); // bad scheme
+        assert!(ConnectConfig::parse("not_a_url").is_err()); // not a url
+        assert!(ConnectConfig::parse("redis://h/abc").is_err()); // db not a number
+        assert!(ConnectConfig::parse("redis://h/0?sslmode=require").is_err()); // unknown param
+        assert!(ConnectConfig::parse("redis://h/0?connect_timeout=abc").is_err()); // bad number
     }
 
     // -- Limits --------------------------------------------------------------
