@@ -13,22 +13,19 @@ jobs:
             os: ubuntu-latest
             rust: nightly
             target: x86_64-unknown-linux-musl
-            archive-name: moon_rs-linux.tar.gz
           - build: macos
             os: macos-latest
             rust: nightly
             target: x86_64-apple-darwin
-            archive-name: moon_rs-macos.tar.gz
           - build: windows
             os: windows-latest
             rust: nightly-x86_64-msvc
             target: x86_64-pc-windows-msvc
-            archive-name: moon_rs-windows.7z
       fail-fast: false
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -53,23 +50,22 @@ jobs:
         if: matrix.build == 'linux' || matrix.build == 'macos'
         run: strip "target/${{ matrix.target }}/release/moon_rs"
 
-      - name: Build archive
+      - name: Collect artifacts
         shell: bash
         run: |
-          mkdir archive
-          cp README.md archive/
-          cp -r lualib archive/
-          cp -r assets archive/
-          cd archive
+          mkdir -p "moon_rs-${{ matrix.build }}"
+          cp README.md "moon_rs-${{ matrix.build }}/"
+          cp -r lualib "moon_rs-${{ matrix.build }}/"
+          cp -r assets "moon_rs-${{ matrix.build }}/"
           if [ "${{ matrix.build }}" = "windows" ]; then
-            cp "../target/${{ matrix.target }}/release/moon_rs.exe" ./
-            7z a "${{ matrix.archive-name }}" README.md moon_rs.exe lualib assets
+            cp "target/${{ matrix.target }}/release/moon_rs.exe" "moon_rs-${{ matrix.build }}/"
           else
-            cp "../target/${{ matrix.target }}/release/moon_rs" ./
-            tar -czf "${{ matrix.archive-name }}" README.md moon_rs lualib assets
+            cp "target/${{ matrix.target }}/release/moon_rs" "moon_rs-${{ matrix.build }}/"
           fi
-      - name: Upload archive
-        uses: actions/upload-artifact@v6
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.archive-name }}
-          path: archive/${{ matrix.archive-name }}
+          name: moon_rs-${{ matrix.build }}
+          path: moon_rs-${{ matrix.build }}/
+
