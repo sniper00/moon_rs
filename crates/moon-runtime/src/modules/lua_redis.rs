@@ -23,7 +23,7 @@ use moon_base::{
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
-use std::{collections::VecDeque, ffi::c_int, sync::Arc, time::Duration};
+use std::{collections::VecDeque, ffi::c_int, pin::Pin, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -437,6 +437,7 @@ struct RedisConn {
     stream: BufReader<TcpStream>,
     read_timeout: Duration,
     line_buf: Vec<u8>,
+    read_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl RedisConn {
@@ -468,6 +469,9 @@ impl RedisConn {
             stream: BufReader::new(tcp),
             read_timeout: Duration::from_millis(params.read_timeout_ms),
             line_buf: Vec::with_capacity(128),
+            read_timer: Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+                params.read_timeout_ms,
+            )))),
         };
 
         // AUTH (Redis 6+ ACL: AUTH username password)
@@ -524,10 +528,16 @@ impl RedisConn {
     }
 
     async fn read_reply(&mut self) -> Result<RedisReply, String> {
-        match timeout(self.read_timeout, self.read_reply_inner()).await {
-            Ok(r) => r,
-            Err(_) => Err("read timeout".to_string()),
-        }
+        let mut timer = self.read_timer.take().expect("redis read timer missing");
+        timer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.read_timeout);
+        let result = tokio::select! {
+            result = self.read_reply_inner() => result,
+            _ = timer.as_mut() => Err("read timeout".to_string()),
+        };
+        self.read_timer = Some(timer);
+        result
     }
 
     fn read_reply_inner(
@@ -680,10 +690,16 @@ impl RedisConn {
     }
 
     async fn read_raw_reply(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
-        match timeout(self.read_timeout, self.read_raw_reply_into(out)).await {
-            Ok(r) => r,
-            Err(_) => Err("read timeout".to_string()),
-        }
+        let mut timer = self.read_timer.take().expect("redis read timer missing");
+        timer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.read_timeout);
+        let result = tokio::select! {
+            result = self.read_raw_reply_into(out) => result,
+            _ = timer.as_mut() => Err("read timeout".to_string()),
+        };
+        self.read_timer = Some(timer);
+        result
     }
 
     #[allow(dead_code)]

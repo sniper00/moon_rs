@@ -14,6 +14,7 @@ use std::{
     ffi::{c_int, c_void},
     io::{Error, ErrorKind, IoSlice},
     net::TcpStream,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -100,6 +101,7 @@ async fn read_until(
     let mut buffer = Box::new(Buffer::with_capacity(std::cmp::min(max_size, 512)));
     let last_byte = *delim_bytes.last().unwrap();
     let delim_len = delim_bytes.len();
+    let mut timer = Box::pin(sleep(Duration::from_millis(read_timeout)));
     loop {
         // Read one buffered chunk at a time (bounded by the BufReader's internal
         // buffer) up to and including the next `last_byte`, enforcing `max_size`
@@ -107,12 +109,13 @@ async fn read_until(
         // prevents a peer that withholds the delimiter from growing `buffer`
         // without bound inside a single read.
         let fill = if read_timeout > 0 {
-            match timeout(Duration::from_millis(read_timeout), reader.fill_buf()).await {
-                Ok(res) => res,
-                Err(_) => {
-                    CONTEXT.response_error(0, owner, -session, "read timeout".to_string());
-                    return false;
-                }
+            timer
+                .as_mut()
+                .as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_millis(read_timeout));
+            tokio::select! {
+                result = reader.fill_buf() => result,
+                _ = timer.as_mut() => Err(Error::new(ErrorKind::TimedOut, "read timeout")),
             }
         } else {
             reader.fill_buf().await
@@ -562,6 +565,15 @@ async fn read_one_frame(
     reader: &mut BufReader<OwnedReadHalf>,
     read_timeout: u64,
 ) -> std::result::Result<Box<Buffer>, String> {
+    let mut timer = Box::pin(sleep(Duration::from_millis(read_timeout)));
+    read_one_frame_with_timer(reader, read_timeout, &mut timer).await
+}
+
+async fn read_one_frame_with_timer(
+    reader: &mut BufReader<OwnedReadHalf>,
+    read_timeout: u64,
+    timer: &mut Pin<Box<tokio::time::Sleep>>,
+) -> std::result::Result<Box<Buffer>, String> {
     let mut data: Option<Box<Buffer>> = None;
     // Cumulative size across all continuation frames of this message. A peer
     // can stream unbounded `MESSAGE_CONTINUED_FLAG` frames, so cap the total
@@ -571,14 +583,13 @@ async fn read_one_frame(
     loop {
         let mut header_buf = [0u8; 2];
         let header_res = if read_timeout > 0 {
-            match timeout(
-                Duration::from_millis(read_timeout),
-                reader.read_exact(&mut header_buf),
-            )
-            .await
-            {
-                Ok(res) => res,
-                Err(_) => return Err("read timeout".to_string()),
+            timer
+                .as_mut()
+                .as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_millis(read_timeout));
+            tokio::select! {
+                result = reader.read_exact(&mut header_buf) => result,
+                _ = timer.as_mut() => Err(Error::new(ErrorKind::TimedOut, "read timeout")),
             }
         } else {
             reader.read_exact(&mut header_buf).await
@@ -627,14 +638,13 @@ async fn read_one_frame(
             // fully writes the slice before any read of it.
             let space = unsafe { std::slice::from_raw_parts_mut(buf.prepare(size), size) };
             let body_res = if read_timeout > 0 {
-                match timeout(
-                    Duration::from_millis(read_timeout),
-                    reader.read_exact(space),
-                )
-                .await
-                {
-                    Ok(res) => res,
-                    Err(_) => return Err("read timeout".to_string()),
+                timer
+                    .as_mut()
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(read_timeout));
+                tokio::select! {
+                    result = reader.read_exact(space) => result,
+                    _ = timer.as_mut() => Err(Error::new(ErrorKind::TimedOut, "read timeout")),
                 }
             } else {
                 reader.read_exact(&mut space[..size]).await
@@ -668,8 +678,9 @@ async fn frame_read_loop(
     fd: i64,
     read_timeout: u64,
 ) -> Option<String> {
+    let mut timer = Box::pin(sleep(Duration::from_millis(read_timeout)));
     loop {
-        match read_one_frame(reader, read_timeout).await {
+        match read_one_frame_with_timer(reader, read_timeout, &mut timer).await {
             Ok(buf) => {
                 if CONTEXT
                     .send_value(

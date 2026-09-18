@@ -14,7 +14,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::{runtime::Builder, sync::mpsc, time::timeout};
+use tokio::{runtime::Builder, sync::mpsc, time::sleep};
 
 use crate::escape_print;
 
@@ -888,28 +888,20 @@ pub fn run_timer() {
         .unwrap_or_else(|_| panic!("run_timer called more than once"));
     tokio::spawn(async move {
         let mut btree_map = BTreeSet::new();
-        let mut wait_time = 1000;
+        let mut wake = Box::pin(sleep(Duration::from_secs(1)));
         loop {
-            // // Terminate cooperatively once shutdown has been requested. The
-            // // global `timer_tx` sender lives in `CONTEXT` and never drops, so
-            // // `rc.recv()` alone would never return `None` and this task would
-            // // otherwise keep the IO runtime alive forever. The ≤1s `wait_time`
-            // // bounds how long after shutdown we take to notice.
-            // if CONTEXT.exit_code() != i32::MAX {
-            //     break;
-            // }
-            match timeout(Duration::from_millis(wait_time), rc.recv()).await {
-                Ok(Some(timer)) => {
-                    //println!("insert timer: {:?} {:?}", timer, CONTEXT.now_clock());
-                    btree_map.insert(timer);
+            tokio::select! {
+                timer = rc.recv() => {
+                    match timer {
+                        Some(timer) => {
+                            //println!("insert timer: {:?} {:?}", timer, CONTEXT.now_clock());
+                            btree_map.insert(timer);
+                        }
+                        None => break,
+                    }
                 }
-                Ok(None) => {
-                    break;
-                }
-                Err(_) => {} //timeout
+                _ = wake.as_mut() => {}
             }
-
-            wait_time = 1000;
 
             while let Some(timer) = btree_map.first() {
                 let diff = timer.expiry_clock - CONTEXT.now_clock().as_millis() as i64;
@@ -924,9 +916,17 @@ pub fn run_timer() {
                     btree_map.pop_first();
                     CONTEXT.pending_timers.fetch_sub(1, Ordering::Release);
                 } else {
-                    wait_time = diff as u64;
+                    wake.as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_millis(diff as u64));
                     break;
                 }
+            }
+
+            // No pending timer means there is no useful deadline. Keep a
+            // bounded wake-up so shutdown is still observed promptly.
+            if btree_map.is_empty() {
+                wake.as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(1));
             }
         }
     });

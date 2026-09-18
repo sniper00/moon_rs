@@ -31,7 +31,7 @@ use moon_base::{
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
-use std::{ffi::c_int, sync::Arc, time::Duration};
+use std::{ffi::c_int, pin::Pin, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -271,6 +271,7 @@ enum PgResponse {
 struct PgConn {
     stream: BufReader<TcpStream>,
     read_timeout: Duration,
+    read_timer: Pin<Box<tokio::time::Sleep>>,
 }
 
 const AUTH_OK: i32 = 0;
@@ -310,6 +311,7 @@ impl PgConn {
         let mut conn = PgConn {
             stream: BufReader::with_capacity(16 * 1024, stream),
             read_timeout,
+            read_timer: Box::pin(tokio::time::sleep(read_timeout)),
         };
         conn.startup(params).await?;
         conn.authenticate(params).await?;
@@ -479,10 +481,16 @@ impl PgConn {
     async fn read_message(&mut self) -> Result<(u8, Vec<u8>), String> {
         let deadline = self.read_timeout;
         let mut header = [0u8; 5];
-        timeout(deadline, self.stream.read_exact(&mut header))
-            .await
-            .map_err(|_| "socket read timed out".to_string())?
-            .map_err(|e| format!("socket read failed: {}", e))?;
+        self.read_timer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + deadline);
+        tokio::select! {
+            result = self.stream.read_exact(&mut header) => result,
+            _ = self.read_timer.as_mut() => {
+                return Err("socket read timed out".to_string());
+            }
+        }
+        .map_err(|e| format!("socket read failed: {}", e))?;
         let t = header[0];
         let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
         if len < 4 {
@@ -497,10 +505,16 @@ impl PgConn {
         }
         let mut body = vec![0u8; body_len];
         if body_len > 0 {
-            timeout(deadline, self.stream.read_exact(&mut body))
-                .await
-                .map_err(|_| "socket read timed out".to_string())?
-                .map_err(|e| format!("socket read failed: {}", e))?;
+            self.read_timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + deadline);
+            tokio::select! {
+                result = self.stream.read_exact(&mut body) => result,
+                _ = self.read_timer.as_mut() => {
+                    return Err("socket read timed out".to_string());
+                }
+            }
+            .map_err(|e| format!("socket read failed: {}", e))?;
         }
         Ok((t, body))
     }
