@@ -10,6 +10,24 @@ local httpc = {}
 ---@return integer session
 function httpc.request(opts) end
 
+--- Issue an async streaming HTTP request. The first response contains headers
+--- and a stream handle; call `handle:next()` to obtain a session for one body
+--- chunk, then await that session. The handle also supports `close()`.
+--- The high-level `moon.http.client.stream` wrapper can be declared `<close>`.
+---@param opts table @ `{ method?, url, body?, headers?, timeout?, read_timeout?, proxy? }`
+---@return integer session
+function httpc.request_stream(opts) end
+
+---@class http_stream_handle
+local http_stream_handle = {}
+
+---@param handle http_stream_handle
+---@return integer session
+function http_stream_handle:next() end
+
+---@param handle http_stream_handle
+function http_stream_handle:close() end
+
 --- URL-encode a table of key/value pairs.
 ---@param params table<string, string>
 ---@return string

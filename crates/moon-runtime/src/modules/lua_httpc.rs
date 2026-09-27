@@ -13,7 +13,8 @@ use moon_runtime::{
 use percent_encoding::percent_decode;
 use reqwest::ClientBuilder;
 use reqwest::{Method, Version, header::HeaderMap};
-use std::{error::Error, ffi::c_int, str::FromStr, time::Duration};
+use std::{error::Error, ffi::c_int, pin::Pin, str::FromStr, time::Duration};
+use tokio::sync::oneshot;
 use url::form_urlencoded::{self};
 
 lazy_static! {
@@ -28,6 +29,7 @@ struct HttpRequest {
     body: Vec<u8>,
     headers: HeaderMap,
     timeout: u64,
+    read_timeout: u64,
     proxy: String,
 }
 
@@ -36,6 +38,63 @@ struct HttpResponse {
     status_code: i32,
     headers: HeaderMap,
     body: bytes::Bytes,
+}
+
+enum HttpcResponse {
+    Complete(HttpResponse),
+    StreamHeaders {
+        version: Version,
+        status_code: i32,
+        headers: HeaderMap,
+        next: oneshot::Sender<HttpStreamCommand>,
+    },
+    StreamChunk {
+        body: bytes::Bytes,
+        next: oneshot::Sender<HttpStreamCommand>,
+    },
+    StreamEnd,
+    StreamError(String),
+}
+
+enum HttpStreamCommand {
+    Next { owner: ActorId, session: i64 },
+    Close,
+}
+
+struct HttpStreamHandle(Option<oneshot::Sender<HttpStreamCommand>>);
+
+struct IdleReadTimer {
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    timeout: Duration,
+}
+
+impl IdleReadTimer {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            sleep: Box::pin(tokio::time::sleep(timeout)),
+            timeout,
+        }
+    }
+
+    async fn next_chunk(
+        &mut self,
+        response: &mut reqwest::Response,
+    ) -> Result<Option<bytes::Bytes>, String> {
+        if self.timeout.is_zero() {
+            return response.chunk().await.map_err(|err| err.to_string());
+        }
+
+        self.sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.timeout);
+        tokio::select! {
+            result = response.chunk() => result.map_err(|err| err.to_string()),
+            _ = self.sleep.as_mut() => Err(format!(
+                "http response stream idle timeout after {}ms",
+                self.timeout.as_millis()
+            )),
+        }
+    }
 }
 
 /// Returns a cached `reqwest::Client` for the given proxy.
@@ -131,15 +190,141 @@ async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
         context::PTYPE_HTTPC,
         req.id,
         req.session,
-        HttpResponse {
+        HttpcResponse::Complete(HttpResponse {
             version,
             status_code,
             headers,
             body,
-        },
+        }),
     );
 
     Ok(())
+}
+
+async fn http_stream_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
+    let http_client = get_http_client(&req.proxy)?;
+
+    if req.timeout > crate::LIMITS.http_client_timeout_ms {
+        log::warn!("http stream timeout {}ms is too long", req.timeout);
+    }
+    if req.read_timeout > crate::LIMITS.http_client_timeout_ms {
+        log::warn!(
+            "http stream read timeout {}ms is too long",
+            req.read_timeout
+        );
+    }
+
+    let mut builder = http_client
+        .request(Method::from_str(req.method.as_str())?, req.url)
+        .headers(req.headers)
+        .body(req.body);
+    // Reqwest's request timeout covers the entire response body. Streaming
+    // callers normally disable it and use read_timeout for the gap between
+    // chunks instead.
+    if req.timeout > 0 {
+        builder = builder.timeout(Duration::from_millis(req.timeout));
+    }
+    let mut response = builder.send().await?;
+
+    let version = response.version();
+    let status_code = response.status().as_u16() as i32;
+    let headers = response.headers().clone();
+    let limit = crate::LIMITS.max_network_read_bytes;
+    if let Some(len) = response.content_length()
+        && len > limit as u64
+    {
+        return Err(format!(
+            "http response body too large: {} bytes (limit {})",
+            len, limit
+        )
+        .into());
+    }
+
+    let (next_tx, mut next_rx) = oneshot::channel();
+    if CONTEXT
+        .send_value(
+            context::PTYPE_HTTPC,
+            req.id,
+            req.session,
+            HttpcResponse::StreamHeaders {
+                version,
+                status_code,
+                headers,
+                next: next_tx,
+            },
+        )
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let mut timer = IdleReadTimer::new(Duration::from_millis(req.read_timeout));
+    let mut total = 0usize;
+    loop {
+        let command = match next_rx.await {
+            Ok(command) => command,
+            Err(_) => return Ok(()),
+        };
+        let (owner, session) = match command {
+            HttpStreamCommand::Next { owner, session } => (owner, session),
+            HttpStreamCommand::Close => return Ok(()),
+        };
+
+        match timer.next_chunk(&mut response).await {
+            Ok(Some(chunk)) => {
+                total = total
+                    .checked_add(chunk.len())
+                    .ok_or_else(|| std::io::Error::other("http response body size overflow"))?;
+                if total > limit {
+                    let _ = CONTEXT.send_value(
+                        context::PTYPE_HTTPC,
+                        owner,
+                        session,
+                        HttpcResponse::StreamError(format!(
+                            "http response body exceeds limit of {} bytes",
+                            limit
+                        )),
+                    );
+                    return Ok(());
+                }
+
+                let (next_tx, new_next_rx) = oneshot::channel();
+                if CONTEXT
+                    .send_value(
+                        context::PTYPE_HTTPC,
+                        owner,
+                        session,
+                        HttpcResponse::StreamChunk {
+                            body: chunk,
+                            next: next_tx,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                next_rx = new_next_rx;
+            }
+            Ok(None) => {
+                let _ = CONTEXT.send_value(
+                    context::PTYPE_HTTPC,
+                    owner,
+                    session,
+                    HttpcResponse::StreamEnd,
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                let _ = CONTEXT.send_value(
+                    context::PTYPE_HTTPC,
+                    owner,
+                    session,
+                    HttpcResponse::StreamError(err),
+                );
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn extract_headers(lua: &mut LuaStack<'_>, index: i32) -> Result<HeaderMap, String> {
@@ -169,49 +354,54 @@ fn extract_headers(lua: &mut LuaStack<'_>, index: i32) -> Result<HeaderMap, Stri
     Ok(headers)
 }
 
-fn lua_http_request(lua: &mut LuaStack<'_>) -> Result<i32, String> {
-    let state = lua.state();
-    if lua.value(1).kind() != laux::LuaType::Table {
-        return Err("bad argument #1 (table expected)".to_string());
-    }
+fn parse_http_request(
+    lua: &mut LuaStack<'_>,
+    id: ActorId,
+    session: i64,
+    default_timeout: u64,
+) -> Result<HttpRequest, String> {
+    let headers = extract_headers(lua, 1)?;
 
-    let headers = match extract_headers(lua, 1) {
-        Ok(headers) => headers,
-        Err(error) => return Ok(crate::lua_push_error_tuple(state, &error)),
-    };
-
-    let actor = LuaActor::from_lua_state(state);
-
-    let id = unsafe { (*actor).id };
-    let session = unsafe { (*actor).next_session() };
-
-    // Read the (optional) request body as raw bytes so binary payloads are
-    // preserved, and cap it so a single request can't buffer an unbounded
-    // amount of memory before it is even sent.
+    // Read the optional request body as raw bytes so binary payloads are
+    // preserved, and cap it before spawning an IO task.
     let body: Vec<u8> = match lua.opt_field::<Vec<u8>>(1, "body") {
         Some(b) if b.len() > crate::LIMITS.max_network_read_bytes => {
-            return Ok(crate::lua_push_error_tuple(
-                state,
-                &format!(
-                    "http request body too large: {} bytes (max {})",
-                    b.len(),
-                    crate::LIMITS.max_network_read_bytes
-                ),
+            return Err(format!(
+                "http request body too large: {} bytes (max {})",
+                b.len(),
+                crate::LIMITS.max_network_read_bytes
             ));
         }
         Some(b) => b,
         None => Vec::new(),
     };
 
-    let req = HttpRequest {
+    Ok(HttpRequest {
         id,
         session,
         method: lua.opt_field(1, "method").unwrap_or("GET".to_string()),
         url: lua.opt_field(1, "url").unwrap_or_default(),
         body,
         headers,
-        timeout: lua.opt_field(1, "timeout").unwrap_or(5000),
+        timeout: lua.opt_field(1, "timeout").unwrap_or(default_timeout),
+        read_timeout: lua.opt_field(1, "read_timeout").unwrap_or(0),
         proxy: lua.opt_field(1, "proxy").unwrap_or_default(),
+    })
+}
+
+fn lua_http_request(lua: &mut LuaStack<'_>) -> Result<i32, String> {
+    let state = lua.state();
+    if lua.value(1).kind() != laux::LuaType::Table {
+        return Err("bad argument #1 (table expected)".to_string());
+    }
+
+    let actor = LuaActor::from_lua_state(state);
+
+    let id = unsafe { (*actor).id };
+    let session = unsafe { (*actor).next_session() };
+    let req = match parse_http_request(lua, id, session, 5000) {
+        Ok(req) => req,
+        Err(error) => return Ok(crate::lua_push_error_tuple(state, &error)),
     };
 
     CONTEXT.io_runtime().spawn(async move {
@@ -220,12 +410,42 @@ fn lua_http_request(lua: &mut LuaStack<'_>) -> Result<i32, String> {
                 context::PTYPE_HTTPC,
                 id,
                 session,
-                HttpResponse {
+                HttpcResponse::Complete(HttpResponse {
                     version: Version::HTTP_11,
                     status_code: -1,
                     headers: HeaderMap::new(),
                     body: err.to_string().into(),
-                },
+                }),
+            );
+        }
+    });
+
+    lua.push(session);
+    Ok(1)
+}
+
+fn lua_http_stream_request(lua: &mut LuaStack<'_>) -> Result<i32, String> {
+    let state = lua.state();
+    if lua.value(1).kind() != laux::LuaType::Table {
+        return Err("bad argument #1 (table expected)".to_string());
+    }
+
+    let actor = LuaActor::from_lua_state(state);
+    let id = unsafe { (*actor).id };
+    let session = unsafe { (*actor).next_session() };
+    let mut req = match parse_http_request(lua, id, session, 0) {
+        Ok(req) => req,
+        Err(error) => return Ok(crate::lua_push_error_tuple(state, &error)),
+    };
+    req.read_timeout = lua.opt_field(1, "read_timeout").unwrap_or(10000);
+
+    CONTEXT.io_runtime().spawn(async move {
+        if let Err(err) = http_stream_request(req).await {
+            let _ = CONTEXT.send_value(
+                context::PTYPE_HTTPC,
+                id,
+                session,
+                HttpcResponse::StreamError(err.to_string()),
             );
         }
     });
@@ -246,6 +466,109 @@ fn push_http_response(state: LuaState, response: HttpResponse) -> i32 {
             }
         });
     1
+}
+
+fn push_http_stream_headers(
+    state: LuaState,
+    version: Version,
+    status_code: i32,
+    headers: HeaderMap,
+) -> i32 {
+    LuaTable::new(state, 0, 6)
+        .insert("version", version_to_string(&version))
+        .insert("status_code", status_code)
+        .insert("stream", true)
+        .rawset_x("headers", || {
+            let table = LuaTable::new(state, 0, headers.len());
+            for (key, value) in &headers {
+                table.insert(key.as_str(), value.to_str().unwrap_or("").trim());
+            }
+        });
+    1
+}
+
+fn http_stream_next(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut handle_ptr = lua
+        .value(1)
+        .as_userdata::<HttpStreamHandle>()
+        .ok_or_else(|| "invalid http stream handle".to_string())?;
+    let handle = unsafe { handle_ptr.as_mut() };
+    let Some(tx) = handle.0.take() else {
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            "http stream: cursor already consumed or closed",
+        ));
+    };
+
+    let actor = LuaActor::from_lua_state(state);
+    let owner = unsafe { (*actor).id };
+    let session = unsafe { (*actor).next_session() };
+    if tx.send(HttpStreamCommand::Next { owner, session }).is_err() {
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            "http stream: worker is gone",
+        ));
+    }
+    laux::lua_push(state, session);
+    Ok(1)
+}
+
+fn http_stream_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let mut handle_ptr = lua
+        .value(1)
+        .as_userdata::<HttpStreamHandle>()
+        .ok_or_else(|| "invalid http stream handle".to_string())?;
+    let handle = unsafe { handle_ptr.as_mut() };
+    if let Some(tx) = handle.0.take() {
+        let _ = tx.send(HttpStreamCommand::Close);
+    }
+    Ok(0)
+}
+
+fn push_http_stream_handle(state: LuaState, next: Option<oneshot::Sender<HttpStreamCommand>>) {
+    let Some(next) = next else {
+        laux::lua_pushnil(state);
+        return;
+    };
+    let methods = [
+        lreg_try!("next", http_stream_next),
+        lreg_try!("close", http_stream_close),
+        lreg_null!(),
+    ];
+    laux::lua_newuserdata(
+        state,
+        HttpStreamHandle(Some(next)),
+        cstr!("http_stream_handle"),
+        &methods,
+    );
+}
+
+fn push_httpc_response(state: LuaState, response: HttpcResponse) -> c_int {
+    match response {
+        HttpcResponse::Complete(response) => push_http_response(state, response),
+        HttpcResponse::StreamHeaders {
+            version,
+            status_code,
+            headers,
+            next,
+        } => {
+            push_http_stream_headers(state, version, status_code, headers);
+            push_http_stream_handle(state, Some(next));
+            2
+        }
+        HttpcResponse::StreamChunk { body, next } => {
+            laux::lua_push(state, body.as_ref());
+            push_http_stream_handle(state, Some(next));
+            2
+        }
+        HttpcResponse::StreamEnd => {
+            laux::lua_pushnil(state);
+            laux::lua_pushnil(state);
+            2
+        }
+        HttpcResponse::StreamError(error) => crate::lua_push_error_tuple(state, &error),
+    }
 }
 
 fn lua_http_form_urlencode(lua: &mut LuaStack<'_>) -> Result<i32, String> {
@@ -415,8 +738,8 @@ pub unsafe extern "C-unwind" fn decode_httpc_message(
     state: LuaState,
     m: *mut moon_runtime::context::Message,
 ) -> c_int {
-    match unsafe { crate::message_decode::take_boxed::<HttpResponse>(m) } {
-        Ok(response) => push_http_response(state, response),
+    match unsafe { crate::message_decode::take_boxed::<HttpcResponse>(m) } {
+        Ok(response) => push_httpc_response(state, response),
         Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
@@ -424,6 +747,7 @@ pub unsafe extern "C-unwind" fn decode_httpc_message(
 pub extern "C-unwind" fn luaopen_httpc(state: LuaState) -> c_int {
     let l = [
         lreg_try!("request", lua_http_request),
+        lreg_try!("request_stream", lua_http_stream_request),
         lreg_try!("form_urlencode", lua_http_form_urlencode),
         lreg_try!("form_urldecode", lua_http_form_urldecode),
         lreg_try!("parse_response", lua_http_parse_response),
