@@ -122,7 +122,7 @@ moon.async(function()
         table.insert(receivers, id)
     end
 
-    moon.send('lua', moon.query('sender'), "RUN", receivers)
+    moon.send('lua', sender, "RUN", receivers)
 end)
 
 

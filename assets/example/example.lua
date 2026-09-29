@@ -49,7 +49,6 @@ moon.async(function()
         name = "example",
         source = "example.lua",
         worker = true, -- see line 5
-        unique = true
     })
 
     -- send to other actor
