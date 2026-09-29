@@ -1,4 +1,4 @@
-use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests};
+use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests, try_send_counted};
 use dashmap::DashMap;
 use futures_util::stream::TryStreamExt;
 use lazy_static::lazy_static;
@@ -1177,9 +1177,8 @@ fn operators(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
             }
         }
     } else {
-        match conn.tx.try_send(request) {
+        match try_send_counted(&conn.tx, &conn.counter, request) {
             Ok(_) => {
-                conn.counter.inc();
                 laux::lua_push(state, session);
                 Ok(1)
             }

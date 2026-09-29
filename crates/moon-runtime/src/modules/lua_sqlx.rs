@@ -1,5 +1,5 @@
 use crate::lua_json::{JsonOptions, encode_table};
-use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests};
+use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests, try_send_counted};
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
 use lazy_static::lazy_static;
@@ -852,13 +852,12 @@ fn query_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
         unsafe { (*actor).next_session() }
     };
 
-    match conn.tx.try_send(DatabaseRequest::Query(
-        owner,
-        session,
-        DatabaseQuery { sql, binds: params },
-    )) {
+    match try_send_counted(
+        &conn.tx,
+        &conn.counter,
+        DatabaseRequest::Query(owner, session, DatabaseQuery { sql, binds: params }),
+    ) {
         Ok(_) => {
-            conn.counter.inc();
             if forget {
                 laux::lua_push(state, true);
             } else {
@@ -919,14 +918,17 @@ fn query_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
-    match conn.tx.try_send(DatabaseRequest::QueryStream(
-        owner,
-        session,
-        DatabaseQuery { sql, binds: params },
-        batch_size,
-    )) {
+    match try_send_counted(
+        &conn.tx,
+        &conn.counter,
+        DatabaseRequest::QueryStream(
+            owner,
+            session,
+            DatabaseQuery { sql, binds: params },
+            batch_size,
+        ),
+    ) {
         Ok(_) => {
-            conn.counter.inc();
             laux::lua_push(state, session);
             Ok(1)
         }
@@ -1008,13 +1010,16 @@ fn transaction_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, Strin
         unsafe { (*actor).next_session() }
     };
 
-    match conn.tx.try_send(DatabaseRequest::Transaction(
-        owner,
-        session,
-        std::mem::take(&mut unsafe { queries_ptr.as_mut() }.queries),
-    )) {
+    match try_send_counted(
+        &conn.tx,
+        &conn.counter,
+        DatabaseRequest::Transaction(
+            owner,
+            session,
+            std::mem::take(&mut unsafe { queries_ptr.as_mut() }.queries),
+        ),
+    ) {
         Ok(_) => {
-            conn.counter.inc();
             if forget {
                 laux::lua_push(state, true);
             } else {

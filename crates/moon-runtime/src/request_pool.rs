@@ -92,6 +92,27 @@ impl PendingCounter {
     }
 }
 
+/// Reserve capacity before counting, then publish only after accounting.
+/// Failed sends leave all counters unchanged.
+pub(crate) fn try_send_counted<M>(
+    tx: &mpsc::Sender<M>,
+    counter: &PendingCounter,
+    msg: M,
+) -> Result<(), mpsc::error::TrySendError<M>> {
+    let permit = match tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            return Err(mpsc::error::TrySendError::Full(msg));
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return Err(mpsc::error::TrySendError::Closed(msg));
+        }
+    };
+    counter.inc();
+    permit.send(msg);
+    Ok(())
+}
+
 /// Build a per-connection stats table and leave it on top of the Lua stack.
 ///
 /// Shared by every DB-backed module's `stats()` so the shape stays consistent:
@@ -183,11 +204,8 @@ impl<M> WorkerSet<M> {
         }
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % n;
         let worker = &self.workers[idx];
-        match worker.tx.try_send(msg) {
-            Ok(()) => {
-                worker.counter.inc();
-                Ok(())
-            }
+        match try_send_counted(&worker.tx, &worker.counter, msg) {
+            Ok(()) => Ok(()),
             Err(err) => Err(format!(
                 "{}: failed to send message to worker: {}",
                 self.name, err
@@ -236,6 +254,42 @@ mod tests {
                 TestMessage::Shutdown => None,
             }
         }
+    }
+
+    #[test]
+    fn counted_send_is_visible_before_worker_completion() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let counter = PendingCounter::new();
+        let worker_counter = counter.clone();
+        let worker = std::thread::spawn(move || {
+            while rx.blocking_recv().is_some() {
+                assert!(worker_counter.load() > 0);
+                worker_counter.dec();
+            }
+        });
+        for _ in 0..10_000 {
+            loop {
+                match try_send_counted(&tx, &counter, ()) {
+                    Ok(()) => break,
+                    Err(mpsc::error::TrySendError::Full(_)) => std::thread::yield_now(),
+                    Err(err) => panic!("{err}"),
+                }
+            }
+        }
+        drop(tx);
+        worker.join().unwrap();
+        assert_eq!(counter.load(), 0);
+        assert_eq!(counter.total(), 10_000);
+        assert!(counter.peak() >= 1);
+    }
+
+    #[test]
+    fn closed_queue_does_not_change_counts() {
+        let (tx, rx) = mpsc::channel(1);
+        let counter = PendingCounter::new();
+        drop(rx);
+        assert!(try_send_counted(&tx, &counter, ()).is_err());
+        assert_eq!((counter.load(), counter.total(), counter.peak()), (0, 0, 0));
     }
 
     #[test]
@@ -292,7 +346,7 @@ mod tests {
             .is_err()
         );
 
-        assert_eq!(counter.load(), 1);
+        assert_eq!((counter.load(), counter.total(), counter.peak()), (1, 1, 1));
     }
 
     #[test]
