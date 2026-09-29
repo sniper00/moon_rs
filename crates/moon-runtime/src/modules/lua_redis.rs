@@ -24,7 +24,7 @@ use moon_base::{
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
 use std::{collections::VecDeque, ffi::c_int, pin::Pin, sync::Arc, time::Duration};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -384,7 +384,7 @@ async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp
                     // connection down so the next operation fails loudly
                     // ("watch closed") instead of the Lua side believing it is
                     // subscribed when it is not.
-                    Ok(RedisReply::Error(e)) => {
+                    Ok(RedisReply::Error(e)) | Err(e) => {
                         if let Some(wait) = pending_wait.take() {
                             let _ = CONTEXT.send_value(
                                 context::PTYPE_REDIS,
@@ -396,17 +396,6 @@ async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp
                         break;
                     }
                     Ok(_) => {}
-                    Err(e) => {
-                        if let Some(wait) = pending_wait.take() {
-                            let _ = CONTEXT.send_value(
-                                context::PTYPE_REDIS,
-                                wait.owner,
-                                wait.session,
-                                RedisResponse::Error(e),
-                            );
-                        }
-                        break;
-                    }
                 }
             }
         }
@@ -432,12 +421,229 @@ async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp
 
 const MAX_MESSAGE_LEN: usize = crate::LIMITS.db_wire_message_bytes;
 const MAX_ARRAY_COUNT: usize = crate::LIMITS.redis_array_items;
+const MAX_RESP_DEPTH: usize = 128;
+const MAX_RAW_REPLY_LEN: usize = crate::LIMITS.max_network_read_bytes;
+// Amortize socket reads across pipeline replies and large Stream responses.
+const READ_BUFFER_CAPACITY: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum RawReadState {
+    Header,
+    Bulk(usize),
+    BulkCrlf(usize),
+}
+
+/// Locate one RESP2 reply without constructing a value tree or allocating an
+/// async future per node. Progress survives buffer refills, including split
+/// headers and bulk terminators. Only fragmented headers need a scratch copy.
+struct RawReplyScanner {
+    state: RawReadState,
+    remaining: usize,
+    parents: Vec<usize>,
+    line: Vec<u8>,
+    bytes: usize,
+}
+
+enum RawHeader {
+    Scalar,
+    Bulk(usize),
+    Array(usize),
+}
+
+impl RawReplyScanner {
+    fn new() -> Self {
+        Self {
+            state: RawReadState::Header,
+            remaining: 1,
+            parents: Vec::new(),
+            line: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.state = RawReadState::Header;
+        self.remaining = 1;
+        self.parents.clear();
+        self.line.clear();
+        self.bytes = 0;
+    }
+
+    fn complete(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn account(&mut self, count: usize) -> Result<(), String> {
+        if count > MAX_RAW_REPLY_LEN - self.bytes {
+            return Err("RESP reply too large".to_string());
+        }
+        self.bytes += count;
+        Ok(())
+    }
+
+    fn finish_value(&mut self) {
+        self.remaining -= 1;
+        while self.remaining == 0 {
+            match self.parents.pop() {
+                Some(remaining) => self.remaining = remaining,
+                None => break,
+            }
+        }
+        self.state = RawReadState::Header;
+    }
+
+    fn header(line: &[u8]) -> Result<RawHeader, String> {
+        if line.len() < 3 || !line.ends_with(b"\r\n") {
+            return Err("invalid RESP line terminator".to_string());
+        }
+        match line[0] {
+            b'+' | b'-' | b':' => Ok(RawHeader::Scalar),
+            b'$' | b'*' => {
+                let num = lexical_core::parse::<i64>(&line[1..line.len() - 2])
+                    .map_err(|e| format!("invalid RESP length: {}", e))?;
+                if num == -1 {
+                    return Ok(RawHeader::Scalar);
+                }
+                let count =
+                    usize::try_from(num).map_err(|_| format!("invalid RESP length: {}", num))?;
+                if line[0] == b'$' {
+                    if count > MAX_MESSAGE_LEN {
+                        return Err(format!("bulk string too large: {} bytes", count));
+                    }
+                    Ok(RawHeader::Bulk(count))
+                } else {
+                    if count > MAX_ARRAY_COUNT {
+                        return Err(format!(
+                            "array too large: {} elements (max {})",
+                            count, MAX_ARRAY_COUNT
+                        ));
+                    }
+                    Ok(RawHeader::Array(count))
+                }
+            }
+            c => Err(format!("unknown RESP type: {}", c as char)),
+        }
+    }
+
+    /// SET/GET/INCR/XADD normally return a complete scalar in one socket buffer.
+    /// Avoid walking the incremental state machine (especially the bulk body
+    /// and its two terminator bytes) for that common case.
+    fn buffered_scalar_len(input: &[u8]) -> Result<Option<usize>, String> {
+        if !matches!(input.first(), Some(b'+' | b'-' | b':' | b'$')) {
+            return Ok(None);
+        }
+        let Some(end) = memchr::memchr(b'\n', input) else {
+            return Ok(None);
+        };
+        let header_len = end + 1;
+        if header_len > MAX_MESSAGE_LEN {
+            return Err("RESP header too large".to_string());
+        }
+        match Self::header(&input[..header_len])? {
+            RawHeader::Scalar => Ok(Some(header_len)),
+            RawHeader::Bulk(len) => {
+                let data_end = header_len + len;
+                let reply_end = data_end + 2;
+                if input.len() < reply_end {
+                    return Ok(None);
+                }
+                if &input[data_end..reply_end] != b"\r\n" {
+                    return Err("invalid RESP bulk terminator".to_string());
+                }
+                Ok(Some(reply_end))
+            }
+            RawHeader::Array(_) => unreachable!(),
+        }
+    }
+
+    /// Return bytes consumed from this slice, stopping exactly at the end of
+    /// the reply so a following pipeline response stays in the socket buffer.
+    fn consume(&mut self, input: &[u8]) -> Result<usize, String> {
+        if self.bytes == 0
+            && let Some(len) = Self::buffered_scalar_len(input)?
+        {
+            self.account(len)?;
+            self.remaining = 0;
+            return Ok(len);
+        }
+        let mut pos = 0;
+        while pos < input.len() && !self.complete() {
+            match self.state {
+                RawReadState::Header => {
+                    let rest = &input[pos..];
+                    let newline = memchr::memchr(b'\n', rest);
+                    let len = newline.map_or(rest.len(), |end| end + 1);
+                    self.account(len)?;
+                    if self.line.len() + len > MAX_MESSAGE_LEN {
+                        return Err("RESP header too large".to_string());
+                    }
+                    pos += len;
+                    if newline.is_none() {
+                        self.line.extend_from_slice(&rest[..len]);
+                        break;
+                    }
+                    let header = if self.line.is_empty() {
+                        Self::header(&rest[..len])?
+                    } else {
+                        self.line.extend_from_slice(&rest[..len]);
+                        let header = Self::header(&self.line)?;
+                        self.line.clear();
+                        header
+                    };
+                    match header {
+                        RawHeader::Scalar => self.finish_value(),
+                        RawHeader::Bulk(0) => self.state = RawReadState::BulkCrlf(0),
+                        RawHeader::Bulk(len) => self.state = RawReadState::Bulk(len),
+                        RawHeader::Array(count) => {
+                            if self.parents.len() == MAX_RESP_DEPTH {
+                                return Err("RESP arrays nested too deeply".to_string());
+                            }
+                            if count == 0 {
+                                self.finish_value();
+                            } else {
+                                self.parents.push(self.remaining - 1);
+                                self.remaining = count;
+                            }
+                        }
+                    }
+                }
+                RawReadState::Bulk(remaining) => {
+                    let len = remaining.min(input.len() - pos);
+                    self.account(len)?;
+                    pos += len;
+                    self.state = if len == remaining {
+                        RawReadState::BulkCrlf(0)
+                    } else {
+                        RawReadState::Bulk(remaining - len)
+                    };
+                }
+                RawReadState::BulkCrlf(seen) => {
+                    if input[pos] != b"\r\n"[seen] {
+                        return Err("invalid RESP bulk terminator".to_string());
+                    }
+                    self.account(1)?;
+                    pos += 1;
+                    if seen == 1 {
+                        self.finish_value();
+                    } else {
+                        self.state = RawReadState::BulkCrlf(1);
+                    }
+                }
+            }
+        }
+        Ok(pos)
+    }
+}
 
 struct RedisConn {
     stream: BufReader<TcpStream>,
     read_timeout: Duration,
-    line_buf: Vec<u8>,
-    read_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    read_timer: Pin<Box<tokio::time::Sleep>>,
+    raw_scanner: RawReplyScanner,
+    // Pub/sub selects between reading and control messages. Keep both the
+    // partial frame and its deadline on the connection when a read is canceled.
+    pending_reply: Vec<u8>,
+    typed_read_active: bool,
 }
 
 impl RedisConn {
@@ -466,12 +672,14 @@ impl RedisConn {
         tcp.set_nodelay(true).ok();
 
         let mut conn = RedisConn {
-            stream: BufReader::new(tcp),
+            stream: BufReader::with_capacity(READ_BUFFER_CAPACITY, tcp),
             read_timeout: Duration::from_millis(params.read_timeout_ms),
-            line_buf: Vec::with_capacity(128),
-            read_timer: Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+            read_timer: Box::pin(tokio::time::sleep(Duration::from_millis(
                 params.read_timeout_ms,
-            )))),
+            ))),
+            raw_scanner: RawReplyScanner::new(),
+            pending_reply: Vec::new(),
+            typed_read_active: false,
         };
 
         // AUTH (Redis 6+ ACL: AUTH username password)
@@ -512,11 +720,7 @@ impl RedisConn {
     async fn send_command(&mut self, args: &[&str]) -> Result<(), String> {
         let mut buf = Vec::with_capacity(64);
         encode_resp_strings(&mut buf, args);
-        self.stream
-            .get_mut()
-            .write_all(&buf)
-            .await
-            .map_err(|e| format!("write: {}", e))
+        self.send_raw(&buf).await
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> Result<(), String> {
@@ -528,84 +732,27 @@ impl RedisConn {
     }
 
     async fn read_reply(&mut self) -> Result<RedisReply, String> {
-        let mut timer = self.read_timer.take().expect("redis read timer missing");
-        timer
-            .as_mut()
-            .reset(tokio::time::Instant::now() + self.read_timeout);
-        let result = tokio::select! {
-            result = self.read_reply_inner() => result,
-            _ = timer.as_mut() => Err("read timeout".to_string()),
-        };
-        self.read_timer = Some(timer);
-        result
-    }
-
-    fn read_reply_inner(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RedisReply, String>> + Send + '_>>
-    {
-        Box::pin(async move {
-            self.line_buf.clear();
-            self.stream
-                .read_until(b'\n', &mut self.line_buf)
-                .await
-                .map_err(|e| format!("read: {}", e))?;
-            if self.line_buf.len() < 3 {
-                return Err(format!("invalid RESP line (len={})", self.line_buf.len()));
+        if !self.typed_read_active {
+            self.raw_scanner.reset();
+            self.pending_reply.clear();
+            self.read_timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + self.read_timeout);
+            self.typed_read_active = true;
+        }
+        loop {
+            if Self::read_raw_buffer(
+                &mut self.stream,
+                &mut self.raw_scanner,
+                &mut self.pending_reply,
+            )? {
+                let reply = parse_owned_reply(&self.pending_reply, &mut 0);
+                self.typed_read_active = false;
+                self.pending_reply.clear();
+                return reply;
             }
-            let data = &self.line_buf[1..self.line_buf.len() - 2];
-            match self.line_buf[0] {
-                b'+' => Ok(RedisReply::Status(
-                    String::from_utf8_lossy(data).into_owned(),
-                )),
-                b'-' => Ok(RedisReply::Error(
-                    String::from_utf8_lossy(data).into_owned(),
-                )),
-                b':' => {
-                    let v = lexical_core::parse::<i64>(data)
-                        .map_err(|e| format!("invalid integer: {}", e))?;
-                    Ok(RedisReply::Integer(v))
-                }
-                b'$' => {
-                    let len = lexical_core::parse::<i64>(data)
-                        .map_err(|e| format!("invalid bulk length: {}", e))?;
-                    if len < 0 {
-                        return Ok(RedisReply::Bulk(None));
-                    }
-                    let len = len as usize;
-                    if len > MAX_MESSAGE_LEN {
-                        return Err(format!("bulk string too large: {} bytes", len));
-                    }
-                    let mut buf = vec![0u8; len + 2];
-                    self.stream
-                        .read_exact(&mut buf)
-                        .await
-                        .map_err(|e| format!("read bulk: {}", e))?;
-                    buf.truncate(len);
-                    Ok(RedisReply::Bulk(Some(buf)))
-                }
-                b'*' => {
-                    let count = lexical_core::parse::<i64>(data)
-                        .map_err(|e| format!("invalid array count: {}", e))?;
-                    if count < 0 {
-                        return Ok(RedisReply::Array(None));
-                    }
-                    let count = count as usize;
-                    if count > MAX_ARRAY_COUNT {
-                        return Err(format!(
-                            "array too large: {} elements (max {})",
-                            count, MAX_ARRAY_COUNT
-                        ));
-                    }
-                    let mut items = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        items.push(self.read_reply_inner().await?);
-                    }
-                    Ok(RedisReply::Array(Some(items)))
-                }
-                c => Err(format!("unknown RESP type: {}", c as char)),
-            }
-        })
+            self.refill_raw_buffer().await?;
+        }
     }
 
     async fn execute(&mut self, data: &[u8]) -> Result<RedisReply, String> {
@@ -628,96 +775,89 @@ impl RedisConn {
 
     // ---- Raw-bytes path (hot path for await mode) ----
 
-    fn read_raw_reply_into<'a>(
-        &'a mut self,
-        out: &'a mut Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            self.line_buf.clear();
-            self.stream
-                .read_until(b'\n', &mut self.line_buf)
-                .await
-                .map_err(|e| format!("read: {}", e))?;
-            if self.line_buf.len() < 3 {
-                return Err(format!("invalid RESP line (len={})", self.line_buf.len()));
-            }
-            let type_byte = self.line_buf[0];
-            let num = if matches!(type_byte, b'$' | b'*') {
-                lexical_core::parse::<i64>(&self.line_buf[1..self.line_buf.len() - 2])
-                    .map_err(|e| format!("invalid RESP length: {}", e))?
-            } else {
-                0
-            };
-            out.extend_from_slice(&self.line_buf);
+    /// Scan and copy only the bytes belonging to this reply. The BufReader
+    /// retains any subsequent replies, and the scanner retains partial-frame
+    /// progress instead of reparsing the response on every socket read.
+    fn read_raw_buffer(
+        stream: &mut BufReader<TcpStream>,
+        scanner: &mut RawReplyScanner,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, String> {
+        let buffered = stream.buffer();
+        let used = scanner.consume(buffered)?;
+        out.extend_from_slice(&buffered[..used]);
+        stream.consume(used);
+        Ok(scanner.complete())
+    }
 
-            match type_byte {
-                b'+' | b'-' | b':' => Ok(()),
-                b'$' => {
-                    if num < 0 {
-                        return Ok(());
-                    }
-                    let len = num as usize;
-                    if len > MAX_MESSAGE_LEN {
-                        return Err(format!("bulk string too large: {} bytes", len));
-                    }
-                    let start = out.len();
-                    out.resize(start + len + 2, 0);
-                    self.stream
-                        .read_exact(&mut out[start..])
-                        .await
-                        .map_err(|e| format!("read bulk: {}", e))?;
+    async fn refill_raw_buffer(&mut self) -> Result<(), String> {
+        tokio::select! {
+            biased;
+            _ = self.read_timer.as_mut() => Err("read timeout".to_string()),
+            result = self.stream.fill_buf() => {
+                if result.map_err(|e| format!("read: {}", e))?.is_empty() {
+                    Err("unexpected EOF in RESP reply".to_string())
+                } else {
                     Ok(())
                 }
-                b'*' => {
-                    if num < 0 {
-                        return Ok(());
-                    }
-                    let count = num as usize;
-                    if count > MAX_ARRAY_COUNT {
-                        return Err(format!(
-                            "array too large: {} elements (max {})",
-                            count, MAX_ARRAY_COUNT
-                        ));
-                    }
-                    for _ in 0..count {
-                        self.read_raw_reply_into(out).await?;
-                    }
-                    Ok(())
-                }
-                c => Err(format!("unknown RESP type: {}", c as char)),
             }
-        })
+        }
     }
 
     async fn read_raw_reply(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
-        let mut timer = self.read_timer.take().expect("redis read timer missing");
-        timer
+        self.raw_scanner.reset();
+        // Pipeline replies already buffered need neither an async read nor a
+        // timer reset. This is also the fast path for small nested RESP arrays.
+        if Self::read_raw_buffer(&mut self.stream, &mut self.raw_scanner, out)? {
+            return Ok(());
+        }
+
+        self.read_timer
             .as_mut()
             .reset(tokio::time::Instant::now() + self.read_timeout);
-        let result = tokio::select! {
-            result = self.read_raw_reply_into(out) => result,
-            _ = timer.as_mut() => Err("read timeout".to_string()),
-        };
-        self.read_timer = Some(timer);
-        result
+        loop {
+            // One deadline for the entire reply, not a new timeout for each
+            // fragment. Each subsequent pipeline reply gets its own deadline.
+            self.refill_raw_buffer().await?;
+            if Self::read_raw_buffer(&mut self.stream, &mut self.raw_scanner, out)? {
+                return Ok(());
+            }
+        }
     }
 
-    #[allow(dead_code)]
-    async fn execute_raw(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        self.send_raw(data).await?;
-        self.read_raw_reply(out).await
-    }
-
-    #[allow(dead_code)]
-    async fn execute_pipeline_raw(
-        &mut self,
-        data: &[u8],
-        count: usize,
-        out: &mut Vec<u8>,
-    ) -> Result<(), String> {
-        self.send_raw(data).await?;
-        for _ in 0..count {
-            self.read_raw_reply(out).await?;
+    async fn read_raw_replies(&mut self, out: &mut Vec<u8>, count: usize) -> Result<(), String> {
+        if count == 1 {
+            return self.read_raw_reply(out).await;
+        }
+        self.raw_scanner.reset();
+        let mut remaining = count;
+        let mut deadline_active = false;
+        while remaining != 0 {
+            let buffered = self.stream.buffer();
+            let mut used = 0;
+            while used < buffered.len() && remaining != 0 {
+                used += self.raw_scanner.consume(&buffered[used..])?;
+                if !self.raw_scanner.complete() {
+                    break;
+                }
+                remaining -= 1;
+                self.raw_scanner.reset();
+                deadline_active = false;
+            }
+            // Copy an entire run of replies once, rather than extending the
+            // output and advancing BufReader separately for every small reply.
+            out.extend_from_slice(&buffered[..used]);
+            self.stream.consume(used);
+            if remaining == 0 {
+                break;
+            }
+            if !deadline_active {
+                self.read_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + self.read_timeout);
+                deadline_active = true;
+            }
+            self.refill_raw_buffer().await?;
         }
         Ok(())
     }
@@ -801,51 +941,27 @@ async fn worker_loop(
             let count = req.reply_count as usize;
 
             if req.session != 0 {
-                let write_result = c.send_raw(&req.data).await;
-
-                let result: Result<RedisResponse, String> = match write_result {
-                    Err(e) => Err(format!("write: {}", e)),
-                    Ok(()) => {
-                        let mut raw = Vec::with_capacity(if count == 1 { 64 } else { count * 32 });
-                        let mut read_err = None;
-                        for _ in 0..count {
-                            if let Err(e) = c.read_raw_reply(&mut raw).await {
-                                read_err = Some(e);
-                                break;
-                            }
-                        }
-
-                        match read_err {
-                            Some(e) => Err(e),
-                            None => {
-                                let response = if count == 1 {
-                                    RedisResponse::Raw(raw)
-                                } else {
-                                    RedisResponse::RawPipeline(raw, req.reply_count)
-                                };
-                                let _ = CONTEXT.send_value(
-                                    context::PTYPE_REDIS,
-                                    req.owner,
-                                    req.session,
-                                    response,
-                                );
-                                counter.dec();
-                                break;
-                            }
-                        }
+                let result: Result<RedisResponse, String> = async {
+                    c.send_raw(&req.data).await?;
+                    let mut raw = Vec::with_capacity(if count == 1 { 64 } else { count * 32 });
+                    c.read_raw_replies(&mut raw, count).await?;
+                    Ok(if count == 1 {
+                        RedisResponse::Raw(raw)
+                    } else {
+                        RedisResponse::RawPipeline(raw, req.reply_count)
+                    })
+                }
+                .await;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(e) => {
+                        conn = None;
+                        RedisResponse::Error(e)
                     }
                 };
-                if let Err(e) = result {
-                    conn = None;
-                    let _ = CONTEXT.send_value(
-                        context::PTYPE_REDIS,
-                        req.owner,
-                        req.session,
-                        RedisResponse::Error(e),
-                    );
-                    counter.dec();
-                    break;
-                }
+                let _ = CONTEXT.send_value(context::PTYPE_REDIS, req.owner, req.session, response);
+                counter.dec();
+                break;
             } else {
                 let result: Result<(), String> = if count == 1 {
                     match c.execute(&req.data).await {
@@ -1324,64 +1440,38 @@ fn watch_connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     Ok(1)
 }
 
-fn watch_subscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+fn watch_subscription(
+    lua: &mut LuaStack<'_>,
+    make_op: fn(Vec<String>) -> WatchOp,
+) -> Result<c_int, String> {
     let state = lua.state();
     let watch_ptr = lua
         .value(1)
         .as_userdata::<RedisWatch>()
         .expect("invalid redis watch pointer");
     let watch = unsafe { watch_ptr.as_ref() };
-    let channels = collect_string_args(lua, 2)?;
-    match watch.send_op(WatchOp::Subscribe(channels)) {
+    let args = collect_string_args(lua, 2)?;
+    match watch.send_op(make_op(args)) {
         Ok(()) => laux::lua_push(state, true),
         Err(err) => push_lua_table!(state, "code" => "SOCKET", "message" => err.as_str()),
     }
     Ok(1)
+}
+
+fn watch_subscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    watch_subscription(lua, WatchOp::Subscribe)
 }
 
 fn watch_psubscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
-    let state = lua.state();
-    let watch_ptr = lua
-        .value(1)
-        .as_userdata::<RedisWatch>()
-        .expect("invalid redis watch pointer");
-    let watch = unsafe { watch_ptr.as_ref() };
-    let patterns = collect_string_args(lua, 2)?;
-    match watch.send_op(WatchOp::PSubscribe(patterns)) {
-        Ok(()) => laux::lua_push(state, true),
-        Err(err) => push_lua_table!(state, "code" => "SOCKET", "message" => err.as_str()),
-    }
-    Ok(1)
+    watch_subscription(lua, WatchOp::PSubscribe)
 }
 
 fn watch_unsubscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
-    let state = lua.state();
-    let watch_ptr = lua
-        .value(1)
-        .as_userdata::<RedisWatch>()
-        .expect("invalid redis watch pointer");
-    let watch = unsafe { watch_ptr.as_ref() };
-    let channels = collect_string_args(lua, 2)?;
-    match watch.send_op(WatchOp::Unsubscribe(channels)) {
-        Ok(()) => laux::lua_push(state, true),
-        Err(err) => push_lua_table!(state, "code" => "SOCKET", "message" => err.as_str()),
-    }
-    Ok(1)
+    watch_subscription(lua, WatchOp::Unsubscribe)
 }
 
 fn watch_punsubscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
-    let state = lua.state();
-    let watch_ptr = lua
-        .value(1)
-        .as_userdata::<RedisWatch>()
-        .expect("invalid redis watch pointer");
-    let watch = unsafe { watch_ptr.as_ref() };
-    let patterns = collect_string_args(lua, 2)?;
-    match watch.send_op(WatchOp::PUnsubscribe(patterns)) {
-        Ok(()) => laux::lua_push(state, true),
-        Err(err) => push_lua_table!(state, "code" => "SOCKET", "message" => err.as_str()),
-    }
-    Ok(1)
+    watch_subscription(lua, WatchOp::PUnsubscribe)
 }
 
 fn watch_message(lua: &mut LuaStack<'_>) -> c_int {
@@ -1460,8 +1550,53 @@ fn push_reply_to_lua(state: LuaState, reply: &RedisReply) -> Result<(), String> 
 }
 
 // ---------------------------------------------------------------------------
-// Response decoding (runs on the actor thread)
+// Response decoding (owned values for workers, Lua values on the actor thread)
 // ---------------------------------------------------------------------------
+
+// Only called on a complete frame validated by RawReplyScanner, including its
+// length and nesting bounds. Pub/sub and fire-and-forget need owned values;
+// awaited commands instead decode the same wire representation directly to Lua.
+fn parse_owned_reply(raw: &[u8], pos: &mut usize) -> Result<RedisReply, String> {
+    let tag = *raw.get(*pos).ok_or("unexpected end of RESP data")?;
+    let end = find_crlf(raw, *pos + 1)?;
+    let data = &raw[*pos + 1..end];
+    *pos = end + 2;
+    match tag {
+        b'+' => Ok(RedisReply::Status(
+            String::from_utf8_lossy(data).into_owned(),
+        )),
+        b'-' => Ok(RedisReply::Error(
+            String::from_utf8_lossy(data).into_owned(),
+        )),
+        b':' => Ok(RedisReply::Integer(
+            lexical_core::parse::<i64>(data).map_err(|e| format!("invalid integer: {}", e))?,
+        )),
+        b'$' => {
+            let len = lexical_core::parse::<i64>(data)
+                .map_err(|e| format!("invalid bulk length: {}", e))?;
+            if len < 0 {
+                return Ok(RedisReply::Bulk(None));
+            }
+            let end = *pos + len as usize;
+            let value = raw.get(*pos..end).ok_or("truncated bulk string")?.to_vec();
+            *pos = end + 2;
+            Ok(RedisReply::Bulk(Some(value)))
+        }
+        b'*' => {
+            let count = lexical_core::parse::<i64>(data)
+                .map_err(|e| format!("invalid array count: {}", e))?;
+            if count < 0 {
+                return Ok(RedisReply::Array(None));
+            }
+            let mut items = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                items.push(parse_owned_reply(raw, pos)?);
+            }
+            Ok(RedisReply::Array(Some(items)))
+        }
+        c => Err(format!("unknown RESP type: {}", c as char)),
+    }
+}
 
 /// Find the position of `\r\n` starting from `start`.
 #[inline]
@@ -1622,6 +1757,232 @@ pub extern "C-unwind" fn luaopen_redis(state: LuaState) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise every split point: RESP boundaries need not align with socket
+    // reads, and bulk payloads can themselves contain RESP-looking bytes.
+    #[test]
+    fn raw_scanner_fragmented_replies_and_pipeline_boundaries() {
+        let replies: &[&[u8]] = &[
+            b"+OK\r\n",
+            b"-ERR wrong type\r\n",
+            b":-9223372036854775808\r\n",
+            b"$-1\r\n",
+            b"*-1\r\n",
+            b"*0\r\n",
+            b"$0\r\n\r\n",
+            b"$8\r\n\0\xff\r\n*1\r\n\r\n",
+            b"*3\r\n*2\r\n+OK\r\n:42\r\n*0\r\n$3\r\nfoo\r\n",
+        ];
+        let mut scanner = RawReplyScanner::new();
+        for reply in replies {
+            for split in 0..=reply.len() {
+                scanner.reset();
+                assert_eq!(scanner.consume(&reply[..split]).unwrap(), split);
+                assert_eq!(scanner.complete(), split == reply.len());
+                let mut tail = reply[split..].to_vec();
+                tail.extend_from_slice(b"+NEXT\r\n");
+                assert_eq!(scanner.consume(&tail).unwrap(), reply.len() - split);
+                assert!(scanner.complete());
+            }
+            scanner.reset();
+            for (i, byte) in reply.iter().enumerate() {
+                assert_eq!(scanner.consume(&[*byte]).unwrap(), 1);
+                assert_eq!(scanner.complete(), i + 1 == reply.len());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_scanner_rejects_invalid_frames_and_limits() {
+        let frames = [
+            b"+bad\n".to_vec(),
+            b"$1\r\nx!!".to_vec(),
+            b"$-2\r\n".to_vec(),
+            b"*-2\r\n".to_vec(),
+            b"$oops\r\n".to_vec(),
+            b"?OK\r\n".to_vec(),
+            format!("${}\r\n", MAX_MESSAGE_LEN + 1).into_bytes(),
+            format!("*{}\r\n", MAX_ARRAY_COUNT + 1).into_bytes(),
+            b"$9223372036854775808\r\n".to_vec(),
+        ];
+        for frame in frames {
+            let mut scanner = RawReplyScanner::new();
+            assert!(scanner.consume(&frame).is_err(), "accepted {frame:?}");
+        }
+
+        let mut nested = b"*1\r\n".repeat(MAX_RESP_DEPTH);
+        nested.extend_from_slice(b"+OK\r\n");
+        let mut scanner = RawReplyScanner::new();
+        assert_eq!(scanner.consume(&nested).unwrap(), nested.len());
+        assert!(scanner.complete());
+        scanner.reset();
+        nested.splice(0..0, b"*1\r\n".iter().copied());
+        assert!(scanner.consume(&nested).is_err());
+        scanner.reset();
+        let mut nested_empty = b"*1\r\n".repeat(MAX_RESP_DEPTH);
+        nested_empty.extend_from_slice(b"*0\r\n");
+        assert!(scanner.consume(&nested_empty).is_err());
+    }
+
+    #[test]
+    fn raw_scanner_bounds_aggregate_reply_size() {
+        // Reuse the same chunk to simulate a large reply without allocating
+        // hundreds of MiB in the test. Individually legal bulk strings must not
+        // bypass the aggregate bound when wrapped in an array.
+        let mut scanner = RawReplyScanner::new();
+        let count = MAX_RAW_REPLY_LEN / MAX_MESSAGE_LEN + 1;
+        scanner.consume(format!("*{count}\r\n").as_bytes()).unwrap();
+        let header = format!("${MAX_MESSAGE_LEN}\r\n");
+        let chunk = [0; 16 * 1024];
+        for _ in 0..count {
+            scanner.consume(header.as_bytes()).unwrap();
+            for _ in 0..MAX_MESSAGE_LEN / chunk.len() {
+                match scanner.consume(&chunk) {
+                    Ok(n) => assert_eq!(n, chunk.len()),
+                    Err(e) => {
+                        assert_eq!(e, "RESP reply too large");
+                        return;
+                    }
+                }
+            }
+            scanner.consume(b"\r\n").unwrap();
+        }
+        panic!("oversized aggregate reply was accepted");
+    }
+
+    async fn raw_test_connection(read_timeout_ms: u64) -> (RedisConn, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let params = ConnParams {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            username: String::new(),
+            password: String::new(),
+            db: 0,
+            read_timeout_ms,
+        };
+        let (client, server) = tokio::join!(RedisConn::connect(&params, 1000), listener.accept());
+        (client.unwrap(), server.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn raw_reader_retains_pipeline_tail_for_typed_reader() {
+        let (mut conn, mut server) = raw_test_connection(1000).await;
+        // Exceed BufReader's capacity and include binary payload/CRLF bytes.
+        let payload = b"\0\xff\r\n".repeat(READ_BUFFER_CAPACITY / 2);
+        let mut expected = format!("*2\r\n+OK\r\n${}\r\n", payload.len()).into_bytes();
+        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(b"\r\n");
+        let mut wire = expected.clone();
+        wire.extend_from_slice(b"$-1\r\n:42\r\n");
+        let writer = tokio::spawn(async move { server.write_all(&wire).await.unwrap() });
+        let mut raw = b"prefix".to_vec();
+        conn.read_raw_reply(&mut raw).await.unwrap();
+        assert_eq!(&raw[6..], &expected);
+        conn.read_raw_reply(&mut raw).await.unwrap();
+        assert_eq!(&raw[6 + expected.len()..], b"$-1\r\n");
+        assert!(matches!(
+            conn.read_reply().await.unwrap(),
+            RedisReply::Integer(42)
+        ));
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_reader_batches_mixed_frames_without_consuming_extra_reply() {
+        let (mut conn, mut server) = raw_test_connection(1000).await;
+        let frame = b"*3\r\n+OK\r\n$3\r\nfoo\r\n:7\r\n$-1\r\n-ERR test\r\n";
+        let expected = frame.repeat(4000);
+        let mut wire = expected.clone();
+        wire.extend_from_slice(b"+TAIL\r\n");
+        let writer = tokio::spawn(async move { server.write_all(&wire).await.unwrap() });
+        let mut raw = b"prefix".to_vec();
+        conn.read_raw_replies(&mut raw, 12000).await.unwrap();
+        assert_eq!(&raw[6..], &expected);
+        let mut tail = Vec::new();
+        conn.read_raw_reply(&mut tail).await.unwrap();
+        assert_eq!(tail, b"+TAIL\r\n");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_reader_reports_truncated_reply() {
+        let (mut conn, mut server) = raw_test_connection(1000).await;
+        server.write_all(b"$5\r\nabc").await.unwrap();
+        drop(server);
+        let err = conn.read_raw_reply(&mut Vec::new()).await.unwrap_err();
+        assert!(err.contains("EOF"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn typed_reader_resumes_partial_frame_after_cancellation() {
+        let (mut conn, mut server) = raw_test_connection(1000).await;
+        server.write_all(b"*2\r\n$5\r\nhe").await.unwrap();
+        // This is what watch_loop's select does when a control message wins
+        // while part of a pub/sub delivery has already been received.
+        assert!(
+            timeout(Duration::from_millis(20), conn.read_reply())
+                .await
+                .is_err()
+        );
+        server.write_all(b"llo\r\n:42\r\n+NEXT\r\n").await.unwrap();
+        let RedisReply::Array(Some(items)) = conn.read_reply().await.unwrap() else {
+            panic!("expected array");
+        };
+        assert!(matches!(&items[0], RedisReply::Bulk(Some(value)) if value == b"hello"));
+        assert!(matches!(&items[1], RedisReply::Integer(42)));
+        assert!(matches!(conn.read_reply().await.unwrap(), RedisReply::Status(s) if s == "NEXT"));
+    }
+
+    #[tokio::test]
+    async fn typed_reader_cancellation_preserves_deadline() {
+        let (mut conn, mut server) = raw_test_connection(100).await;
+        server.write_all(b"+PARTIAL").await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(20), conn.read_reply())
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        // The old deadline must be observed immediately, not replaced with a
+        // fresh 100 ms budget when a canceled read future is created again.
+        let result = timeout(Duration::from_millis(40), conn.read_reply())
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(e) if e == "read timeout"));
+    }
+
+    #[tokio::test]
+    async fn raw_reader_deadline_is_per_reply_not_per_pipeline() {
+        let (mut conn, mut server) = raw_test_connection(400).await;
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            server.write_all(b"+ONE\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            server.write_all(b"+TWO\r\n").await.unwrap();
+        });
+        let mut raw = Vec::new();
+        conn.read_raw_replies(&mut raw, 2).await.unwrap();
+        assert_eq!(raw, b"+ONE\r\n+TWO\r\n");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_reader_fragments_do_not_restart_deadline() {
+        let (mut conn, mut server) = raw_test_connection(200).await;
+        server.write_all(b"$3\r\n").await.unwrap();
+        let writer = tokio::spawn(async move {
+            for part in [b"a".as_slice(), b"b", b"c\r\n"] {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                if server.write_all(part).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let err = conn.read_raw_replies(&mut Vec::new(), 2).await.unwrap_err();
+        assert_eq!(err, "read timeout");
+        writer.abort();
+        let _ = writer.await;
+    }
 
     // -- RESP encoding -------------------------------------------------------
 

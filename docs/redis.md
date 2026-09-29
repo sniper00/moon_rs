@@ -39,6 +39,24 @@ High-performance native Redis driver with RESP protocol implementation in Rust.
 4. **Auto-reconnect** — workers reconnect transparently on socket errors with AUTH/SELECT replay.
 5. **Dynamic command dispatch** — any Redis command usable as a method via Lua `__index` metamethod.
 
+Replies use an incremental RESP2 scanner over a 64 KiB socket read buffer
+per connection, with a fast path for complete buffered scalar replies.
+Complete buffered replies are scanned synchronously; the awaited-command path
+only enters async I/O and timeout handling on a buffer refill.
+The scanner retains partial header, bulk-string and array progress across reads,
+and reuses its scratch buffers.
+Pipeline replies already present in the buffer are scanned together and copied
+to the response buffer in one run, rather than appending each reply separately.
+`read_timeout` applies separately to each reply (including each pipeline
+reply); receiving another fragment does not restart that reply's deadline.
+Pub/sub also retains the partial reply and deadline when a control message
+cancels a pending read, so the next read resumes at the correct position.
+
+The read path bounds individual bulk strings and headers at 64 MiB,
+arrays at 1,048,576 elements each, nesting at 128 array levels, and a complete
+reply at 512 MiB. These bounds also protect the subsequent Lua value decoder.
+They apply per reply, not to the sum of all replies in a pipeline.
+
 ## Lua API
 
 ```lua

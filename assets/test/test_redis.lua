@@ -90,6 +90,37 @@ moon.async(function()
     assert_eq("pipeline[3]", "1", pipe[3])
     assert_eq("pipeline[4]", "2", pipe[4])
 
+    -- Replies spanning multiple socket buffers, including RESP-looking binary
+    -- payloads and nil/error replies between successful pipeline responses.
+    local binary = string.rep("\0\255\r\n*2\r\n", 16384)
+    local binary_key = test_prefix .. ":binary"
+    assert_eq("SET binary", "OK", db:set(binary_key, binary))
+    local replies = db:pipeline({
+        { "GET", binary_key },
+        { "GET", test_prefix .. ":missing" },
+        { "LPUSH", binary_key, "wrongtype" },
+        { "GET", binary_key },
+        { "PING" },
+    })
+    assert_eq("pipeline binary first", binary, replies[1])
+    assert_eq("pipeline nil", nil, replies[2])
+    assert_eq("pipeline Redis error", "REDIS", replies[3] and replies[3].code)
+    assert_eq("pipeline binary after error", binary, replies[4])
+    assert_eq("pipeline tail", "PONG", replies[5])
+    db:del(binary_key)
+
+    -- A read timeout must discard the partially read connection; the next
+    -- request reconnects instead of consuming the timed-out command's reply.
+    local timed, timed_err = redis.connect(redis_conf()
+        .. "?name=test_redis_timeout&pool_size=1&read_timeout=100")
+    assert(timed, timed_err)
+    local timeout_result = timed:blpop(test_prefix .. ":missing", 1)
+    assert_eq("read timeout code", "SOCKET", timeout_result and timeout_result.code)
+    assert_true("read timeout message", timeout_result and timeout_result.message
+        and timeout_result.message:find("timeout", 1, true))
+    assert_eq("reconnect after read timeout", "PONG", timed:ping())
+    timed:close()
+
     local no_sub_channel = test_prefix .. ":nobody"
     assert_eq("publish no subscribers", 0, db:publish(no_sub_channel, "ignored"))
 
