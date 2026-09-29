@@ -31,8 +31,8 @@ use moon_base::{
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
-use std::{ffi::c_int, pin::Pin, sync::Arc, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use std::{borrow::Cow, ffi::c_int, ops::Range, pin::Pin, sync::Arc, time::Duration};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -238,10 +238,43 @@ struct DbError {
 }
 
 /// One statement's raw result, accumulated until its CommandComplete.
+#[derive(Default)]
 struct Statement {
     row_desc: Option<Vec<u8>>,
-    data_rows: Vec<Vec<u8>>,
+    data_rows: DataRows,
     command_tag: Option<Vec<u8>>,
+}
+
+/// Length-prefixed row bodies in one allocation, moved to the actor with the
+/// result. Fragmented rows are appended directly, without a temporary body.
+#[derive(Default)]
+struct DataRows {
+    bytes: Vec<u8>,
+    count: usize,
+}
+
+impl DataRows {
+    fn begin(&mut self, len: usize) -> &mut Vec<u8> {
+        self.bytes.reserve(4 + len);
+        self.bytes.extend_from_slice(&(len as u32).to_be_bytes());
+        self.count += 1;
+        &mut self.bytes
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        let mut rest = self.bytes.as_slice();
+        std::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
+            }
+            // These lengths are written by begin(), after validating the wire
+            // header. A failed/incomplete read never publishes this result.
+            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+            let row = &rest[4..4 + len];
+            rest = &rest[4 + len..];
+            Some(row)
+        })
+    }
 }
 
 struct QueryResult {
@@ -252,6 +285,105 @@ struct QueryResult {
     error: Option<Box<DbError>>,
     /// ReadyForQuery transaction status: b'I' idle, b'T' in-txn, b'E' failed-txn.
     txn_status: u8,
+}
+
+struct QueryCollector {
+    result: QueryResult,
+    current: Statement,
+    capture: bool,
+    total_rows: usize,
+    row_cap: usize,
+    rows_exceeded: bool,
+}
+
+impl QueryCollector {
+    fn new(capture: bool, row_cap: usize) -> Self {
+        Self {
+            result: QueryResult {
+                statements: Vec::new(),
+                notifications: Vec::new(),
+                error: None,
+                txn_status: b'I',
+            },
+            current: Statement::default(),
+            capture,
+            total_rows: 0,
+            row_cap,
+            rows_exceeded: false,
+        }
+    }
+
+    fn row_destination(&mut self, len: usize) -> Option<&mut Vec<u8>> {
+        if self.rows_exceeded {
+            return None;
+        }
+        self.total_rows += 1;
+        if self.total_rows > self.row_cap {
+            self.rows_exceeded = true;
+            self.current.data_rows = DataRows::default();
+            return None;
+        }
+        self.capture.then(|| self.current.data_rows.begin(len))
+    }
+
+    /// Whether a non-row body needs to be retained long enough to inspect it.
+    fn needs_body(&self, kind: u8) -> bool {
+        matches!(kind, b'E' | b'Z') || (self.capture && matches!(kind, b'T' | b'C' | b'A'))
+    }
+
+    /// Returns true only at the query cycle boundary, including error replies.
+    fn accept(&mut self, kind: u8, body: &[u8]) -> Result<bool, String> {
+        match kind {
+            b'D' => {
+                if let Some(out) = self.row_destination(body.len()) {
+                    out.extend_from_slice(body);
+                }
+            }
+            b'T' if self.capture => self.current.row_desc = Some(body.to_vec()),
+            b'C' if self.capture => {
+                self.current.command_tag = Some(body.to_vec());
+                self.result
+                    .statements
+                    .push(std::mem::take(&mut self.current));
+            }
+            b'A' if self.capture => {
+                if let Some(n) = parse_notification(body) {
+                    self.result.notifications.push(n);
+                }
+            }
+            b'E' => self.result.error = Some(Box::new(parse_error(body))),
+            b'Z' => {
+                if !matches!(body, [b'I' | b'T' | b'E']) {
+                    return Err("invalid ReadyForQuery message".to_string());
+                }
+                self.result.txn_status = body[0];
+                return Ok(true);
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn finish(mut self) -> QueryResult {
+        if self.rows_exceeded && self.result.error.is_none() {
+            // Keep this a query error: session-zero transport failures are
+            // retried by the worker. Always drain to ReadyForQuery first.
+            self.result.error = Some(Box::new(DbError {
+                severity: None,
+                code: Some("54000".to_string()),
+                message: Some(format!(
+                    "query returned more than {} rows; use a streaming/paginated query for large result sets",
+                    self.row_cap
+                )),
+                position: None,
+                detail: None,
+                schema: None,
+                table: None,
+                constraint: None,
+            }));
+        }
+        self.result
+    }
 }
 
 enum PgResponse {
@@ -477,22 +609,8 @@ impl PgConn {
         self.write_all(&msg).await
     }
 
-    /// Reads one backend message: 1-byte type + i32 length (incl. itself) + body.
-    async fn read_message(&mut self) -> Result<(u8, Vec<u8>), String> {
-        let deadline = self.read_timeout;
-        let mut header = [0u8; 5];
-        self.read_timer
-            .as_mut()
-            .reset(tokio::time::Instant::now() + deadline);
-        tokio::select! {
-            result = self.stream.read_exact(&mut header) => result,
-            _ = self.read_timer.as_mut() => {
-                return Err("socket read timed out".to_string());
-            }
-        }
-        .map_err(|e| format!("socket read failed: {}", e))?;
-        let t = header[0];
-        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+    fn message_header(header: &[u8]) -> Result<(u8, usize), String> {
+        let len = read_i32(header, 1);
         if len < 4 {
             return Err(format!("invalid message length: {}", len));
         }
@@ -503,127 +621,135 @@ impl PgConn {
                 body_len, MAX_MESSAGE_LEN
             ));
         }
-        let mut body = vec![0u8; body_len];
-        if body_len > 0 {
-            self.read_timer
-                .as_mut()
-                .reset(tokio::time::Instant::now() + deadline);
+        Ok((header[0], body_len))
+    }
+
+    async fn read_header(&mut self) -> Result<(u8, usize), String> {
+        if self.stream.buffer().len() >= 5 {
+            let header = Self::message_header(self.stream.buffer())?;
+            self.stream.consume(5);
+            return Ok(header);
+        }
+        let mut header = [0u8; 5];
+        self.read_timer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.read_timeout);
+        tokio::select! {
+            result = self.stream.read_exact(&mut header) => result,
+            _ = self.read_timer.as_mut() => {
+                return Err("socket read timed out".to_string());
+            }
+        }
+        .map_err(|e| format!("socket read failed: {}", e))?;
+        Self::message_header(&header)
+    }
+
+    /// Append directly into the final row storage, or drain without allocating.
+    /// Preserve the existing separate header/body timeout budgets; fragments
+    /// of one body share a deadline. Buffered bytes need no timer or async read.
+    async fn read_body(
+        &mut self,
+        mut remaining: usize,
+        mut out: Option<&mut Vec<u8>>,
+    ) -> Result<(), String> {
+        let mut deadline_active = false;
+        while remaining != 0 {
+            let buffered = self.stream.buffer();
+            if !buffered.is_empty() {
+                let used = remaining.min(buffered.len());
+                if let Some(out) = out.as_mut() {
+                    out.extend_from_slice(&buffered[..used]);
+                }
+                self.stream.consume(used);
+                remaining -= used;
+                continue;
+            }
+            if !deadline_active {
+                self.read_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + self.read_timeout);
+                deadline_active = true;
+            }
             tokio::select! {
-                result = self.stream.read_exact(&mut body) => result,
+                biased;
                 _ = self.read_timer.as_mut() => {
                     return Err("socket read timed out".to_string());
                 }
-            }
-            .map_err(|e| format!("socket read failed: {}", e))?;
-        }
-        Ok((t, body))
-    }
-
-    /// Send a simple-query ROLLBACK to clear an aborted transaction.
-    async fn rollback(&mut self) -> Result<(), String> {
-        let sql = b"ROLLBACK\0";
-        let len = (sql.len() as u32) + 4;
-        let mut buf = Vec::with_capacity(1 + 4 + sql.len());
-        buf.push(b'Q');
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(sql);
-        self.write_all(&buf).await?;
-        loop {
-            let (t, _) = self.read_message().await?;
-            if t == b'Z' {
-                break;
+                result = self.stream.fill_buf() => {
+                    if result.map_err(|e| format!("socket read failed: {}", e))?.is_empty() {
+                        return Err("socket read failed: unexpected EOF".to_string());
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    /// Write a prebuilt request buffer, then read the reply until ReadyForQuery.
-    async fn execute(&mut self, data: &[u8]) -> Result<QueryResult, String> {
+    /// Owned-message path for authentication. Queries use the buffered path.
+    async fn read_message(&mut self) -> Result<(u8, Vec<u8>), String> {
+        let (kind, len) = self.read_header().await?;
+        let mut body = Vec::new();
+        self.read_body(len, Some(&mut body)).await?;
+        Ok((kind, body))
+    }
+
+    /// A pooled request must leave the connection idle: transactions cannot
+    /// span requests because the next request may run on another worker.
+    async fn finish_request(&mut self, result: &mut QueryResult) -> Result<(), String> {
+        if result.txn_status == b'I' {
+            return Ok(());
+        }
+        if result.error.is_none() {
+            result.error = Some(Box::new(parse_error(
+                b"SERROR\0C25000\0Mopen transactions cannot span pooled requests\0\0",
+            )));
+        }
+        self.rollback().await
+    }
+
+    async fn rollback(&mut self) -> Result<(), String> {
+        let result = self.execute(b"Q\0\0\0\x0dROLLBACK\0", false).await?;
+        if result.error.is_some() || result.txn_status != b'I' {
+            return Err("ROLLBACK failed to restore an idle connection".to_string());
+        }
+        Ok(())
+    }
+
+    /// Write once, then scan buffered frames synchronously until ReadyForQuery.
+    /// Only split frames need asynchronous reads. No result rows are retained
+    /// for fire-and-forget requests, but errors and transaction status survive.
+    async fn execute(&mut self, data: &[u8], capture: bool) -> Result<QueryResult, String> {
         self.write_all(data).await?;
-
-        let mut statements: Vec<Statement> = Vec::new();
-        let mut notifications: Vec<Notification> = Vec::new();
-        let mut error: Option<Box<DbError>> = None;
-        let mut cur_row_desc: Option<Vec<u8>> = None;
-        let mut cur_rows: Vec<Vec<u8>> = Vec::new();
-        let mut txn_status = b'I';
-        // Total DataRow messages accumulated across all statements in this reply.
-        let mut total_rows: usize = 0;
-        // Set once the cumulative row count exceeds `db_query_rows`. The reply
-        // keeps being drained to ReadyForQuery so the connection stays
-        // synchronized and reusable; the overflow is then reported below as a
-        // query-level error instead of an `Err`, which the worker treats as a
-        // socket failure and would answer by reconnecting and re-executing the
-        // same request forever (see the retry loop in `worker_loop`).
-        let row_cap = crate::LIMITS.db_query_rows;
-        let mut rows_exceeded = false;
-
+        let mut collector = QueryCollector::new(capture, crate::LIMITS.db_query_rows);
+        let mut scratch = Vec::new();
         loop {
-            let (t, body) = self.read_message().await?;
-            match t {
-                b'D' => {
-                    if rows_exceeded {
-                        // Over the cap already: drain and drop further rows.
-                        continue;
+            let buffered = self.stream.buffer();
+            if buffered.len() >= 5 {
+                let (kind, len) = Self::message_header(buffered)?;
+                if buffered.len() >= 5 + len {
+                    let done = collector.accept(kind, &buffered[5..5 + len])?;
+                    self.stream.consume(5 + len);
+                    if done {
+                        break;
                     }
-                    total_rows += 1;
-                    if total_rows > row_cap {
-                        rows_exceeded = true;
-                        // Discard rows buffered so far for the current statement
-                        // so a truncated statement is never reported complete.
-                        cur_rows.clear();
-                        continue;
-                    }
-                    cur_rows.push(body);
+                    continue;
                 }
-                b'T' => cur_row_desc = Some(body),
-                b'E' => error = Some(Box::new(parse_error(&body))),
-                b'C' => {
-                    statements.push(Statement {
-                        row_desc: cur_row_desc.take(),
-                        data_rows: std::mem::take(&mut cur_rows),
-                        command_tag: Some(body),
-                    });
-                }
-                b'A' => {
-                    if let Some(n) = parse_notification(&body) {
-                        notifications.push(n);
-                    }
-                }
-                b'Z' => {
-                    if !body.is_empty() {
-                        txn_status = body[0];
-                    }
+            }
+
+            let (kind, len) = self.read_header().await?;
+            if kind == b'D' {
+                self.read_body(len, collector.row_destination(len)).await?;
+            } else if collector.needs_body(kind) {
+                scratch.clear();
+                self.read_body(len, Some(&mut scratch)).await?;
+                if collector.accept(kind, &scratch)? {
                     break;
                 }
-                _ => {}
+            } else {
+                self.read_body(len, None).await?;
             }
         }
-
-        if rows_exceeded && error.is_none() {
-            // SQLSTATE 54000 (program_limit_exceeded): the server ran the query,
-            // but the reply exceeded the client-side buffer cap. The connection
-            // is healthy, so this must not look like a transport failure.
-            error = Some(Box::new(DbError {
-                severity: None,
-                code: Some("54000".to_string()),
-                message: Some(format!(
-                    "query returned more than {row_cap} rows; use a streaming/paginated query for large result sets"
-                )),
-                position: None,
-                detail: None,
-                schema: None,
-                table: None,
-                constraint: None,
-            }));
-        }
-
-        Ok(QueryResult {
-            statements,
-            notifications,
-            error,
-            txn_status,
-        })
+        Ok(collector.finish())
     }
 }
 
@@ -705,22 +831,16 @@ fn parse_error_string(body: &[u8]) -> String {
 }
 
 fn parse_notification(body: &[u8]) -> Option<Notification> {
-    if body.len() < 5 {
+    if body.len() < 6 {
         return None;
     }
     let pid = read_i32(body, 0);
-    let mut i = 4;
-    let start = i;
-    while i < body.len() && body[i] != 0 {
-        i += 1;
-    }
-    let channel = String::from_utf8_lossy(&body[start..i]).into_owned();
-    i += 1;
-    let pstart = i;
-    while i < body.len() && body[i] != 0 {
-        i += 1;
-    }
-    let payload = String::from_utf8_lossy(&body[pstart..i]).into_owned();
+    let rest = &body[4..];
+    let channel_end = memchr::memchr(0, rest)?;
+    let payload = &rest[channel_end + 1..];
+    let payload_end = memchr::memchr(0, payload)?;
+    let channel = String::from_utf8_lossy(&rest[..channel_end]).into_owned();
+    let payload = String::from_utf8_lossy(&payload[..payload_end]).into_owned();
     Some(Notification {
         pid,
         channel,
@@ -786,12 +906,10 @@ async fn worker_loop(
             }
 
             let c = conn.as_mut().unwrap();
-            match c.execute(&req.data).await {
-                Ok(result) => {
-                    if result.txn_status == b'E' {
-                        if c.rollback().await.is_err() {
-                            conn = None;
-                        }
+            match c.execute(&req.data, req.session != 0).await {
+                Ok(mut result) => {
+                    if c.finish_request(&mut result).await.is_err() {
+                        conn = None;
                     }
                     if req.session != 0 {
                         let _ = CONTEXT.send_value(
@@ -878,15 +996,21 @@ fn write_param(
     let stub = buf.len();
     buf.extend_from_slice(&[0u8; 4]); // length placeholder
     match kind {
-        LuaType::Integer => buf.extend_from_slice(
-            value
-                .as_integer()
-                .unwrap_or_default()
-                .to_string()
-                .as_bytes(),
-        ),
+        LuaType::Integer => {
+            let mut tmp = [0u8; lexical_core::BUFFER_SIZE];
+            buf.extend_from_slice(lexical_core::write(
+                value.as_integer().unwrap_or_default(),
+                &mut tmp,
+            ));
+        }
         LuaType::Number => {
-            buf.extend_from_slice(value.as_number().unwrap_or_default().to_string().as_bytes())
+            // Keep Rust's existing float spelling (including -0, NaN and inf)
+            // while formatting directly into the wire buffer, without String.
+            std::io::Write::write_fmt(
+                buf,
+                format_args!("{}", value.as_number().unwrap_or_default()),
+            )
+            .expect("writing to Vec cannot fail");
         }
         LuaType::Boolean => buf.extend_from_slice(if value.as_bool().unwrap_or(false) {
             b"true"
@@ -914,15 +1038,10 @@ fn append_statement(
     buf: &mut Vec<u8>,
     lua: &mut LuaStack<'_>,
     sql: &[u8],
-    param_indices: &[i32],
+    param_indices: Range<i32>,
     options: &JsonOptions,
 ) -> Result<(), String> {
-    // Parse
-    let stub = start_message(buf, PQ_PARSE);
-    write_cstr(buf, b""); // unnamed statement
-    write_cstr(buf, sql);
-    buf.extend_from_slice(&0u16.to_be_bytes()); // no parameter type OIDs
-    end_message(buf, stub);
+    append_parse_unnamed(buf, sql);
 
     // Bind
     // The PG v3 Bind message encodes the parameter count as an i16, so a
@@ -940,13 +1059,21 @@ fn append_statement(
     write_cstr(buf, b""); // statement
     buf.extend_from_slice(&0u16.to_be_bytes()); // parameter format codes (0 => text)
     buf.extend_from_slice(&(param_indices.len() as u16).to_be_bytes());
-    for &i in param_indices {
+    for i in param_indices {
         write_param(buf, lua, i, options)?;
     }
     buf.extend_from_slice(&1u16.to_be_bytes()); // one result format code
     buf.extend_from_slice(&0u16.to_be_bytes()); // text
     end_message(buf, stub);
 
+    append_describe_execute(buf);
+
+    Ok(())
+}
+
+/// Request metadata and all rows from the unnamed portal. Bulk writes need
+/// Describe too, because their conflict clause can include RETURNING.
+fn append_describe_execute(buf: &mut Vec<u8>) {
     // Describe (portal)
     let stub = start_message(buf, PQ_DESCRIBE);
     buf.push(b'P');
@@ -958,8 +1085,6 @@ fn append_statement(
     write_cstr(buf, b""); // portal
     buf.extend_from_slice(&0u32.to_be_bytes()); // unlimited rows
     end_message(buf, stub);
-
-    Ok(())
 }
 
 fn append_sync(buf: &mut Vec<u8>) {
@@ -968,7 +1093,7 @@ fn append_sync(buf: &mut Vec<u8>) {
 }
 
 /// Parse `sql` into the unnamed statement (no parameter type OIDs). Used by
-/// `batch`, which parses once and then binds it many times within one Sync.
+/// parameterized queries and bulk writes, which can bind it repeatedly.
 fn append_parse_unnamed(buf: &mut Vec<u8>, sql: &[u8]) {
     let stub = start_message(buf, PQ_PARSE);
     write_cstr(buf, b""); // unnamed statement
@@ -1008,7 +1133,7 @@ fn encode_many(
     let multi = total_chunks > 1;
 
     if multi {
-        append_statement(buf, lua, b"BEGIN", &[], options)?;
+        append_statement(buf, lua, b"BEGIN", 0..0, options)?;
     }
 
     let mut parsed_len = 0usize; // tuple count currently held by the unnamed stmt
@@ -1060,24 +1185,13 @@ fn encode_many(
         buf.extend_from_slice(&0u16.to_be_bytes()); // 0 result format codes => all text
         end_message(buf, stub);
 
-        // Describe (portal) — required so the server sends RowDescription
-        // before DataRow when the statement has a RETURNING clause.
-        let stub = start_message(buf, PQ_DESCRIBE);
-        buf.push(b'P');
-        write_cstr(buf, b"");
-        end_message(buf, stub);
-
-        // Execute
-        let stub = start_message(buf, PQ_EXECUTE);
-        write_cstr(buf, b""); // portal
-        buf.extend_from_slice(&0u32.to_be_bytes()); // unlimited rows
-        end_message(buf, stub);
+        append_describe_execute(buf);
 
         start += len;
     }
 
     if multi {
-        append_statement(buf, lua, b"COMMIT", &[], options)?;
+        append_statement(buf, lua, b"COMMIT", 0..0, options)?;
     }
     append_sync(buf);
     Ok(())
@@ -1599,11 +1713,11 @@ fn query_params_impl(lua: &mut LuaStack<'_>, forget: bool) -> c_int {
     let sql = unsafe { std::slice::from_raw_parts(sql_ptr, sql_len) };
 
     let top = laux::lua_top(state);
-    let param_indices: Vec<i32> = ((sql_idx + 1)..=top).collect();
+    let param_indices = (sql_idx + 1)..(top + 1);
 
     let options = JsonOptions::default();
     let mut data = Vec::with_capacity(64 + sql.len());
-    if let Err(err) = append_statement(&mut data, lua, sql, &param_indices, &options) {
+    if let Err(err) = append_statement(&mut data, lua, sql, param_indices, &options) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
         return 1;
     }
@@ -1638,7 +1752,7 @@ fn pipe_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
     let options = JsonOptions::default();
     let mut data = Vec::with_capacity(256);
 
-    if let Err(err) = append_statement(&mut data, lua, b"BEGIN", &[], &options) {
+    if let Err(err) = append_statement(&mut data, lua, b"BEGIN", 0..0, &options) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
         return Ok(1);
     }
@@ -1665,21 +1779,34 @@ fn pipe_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
         let sql = unsafe { std::slice::from_raw_parts(sql_ptr, sql_len) };
 
         let stmt_len = unsafe { ffi::lua_rawlen(state.as_ptr(), stmt_idx) };
-        let mut param_tops = Vec::new();
+        let param_count = stmt_len.saturating_sub(1);
+        if param_count > MAX_BIND_PARAMS {
+            laux::lua_pop(state, 2);
+            push_lua_table!(state, "code" => "ENCODE", "message" => format!(
+                "too many bind parameters: {} (max {})", param_count, MAX_BIND_PARAMS
+            ));
+            return Ok(1);
+        }
+        laux::lua_checkstack(state, param_count as i32 + 4, std::ptr::null())?;
         for p in 2..=stmt_len {
             unsafe { ffi::lua_rawgeti(state.as_ptr(), stmt_idx, p as ffi::lua_Integer) };
-            param_tops.push(laux::lua_top(state));
         }
 
-        let res = append_statement(&mut data, lua, sql, &param_tops, &options);
-        laux::lua_pop(state, (param_tops.len() as i32) + 2);
+        let res = append_statement(
+            &mut data,
+            lua,
+            sql,
+            (sql_top + 1)..(sql_top + 1 + param_count as i32),
+            &options,
+        );
+        laux::lua_pop(state, param_count as i32 + 2);
         if let Err(err) = res {
             push_lua_table!(state, "code" => "ENCODE", "message" => err);
             return Ok(1);
         }
     }
 
-    if let Err(err) = append_statement(&mut data, lua, b"COMMIT", &[], &options) {
+    if let Err(err) = append_statement(&mut data, lua, b"COMMIT", 0..0, &options) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
         return Ok(1);
     }
@@ -1939,30 +2066,51 @@ fn convert_value(state: LuaState, oid: i32, value: &[u8]) {
 }
 
 /// Parse a RowDescription body into `(name, type_oid)` fields.
-fn parse_row_desc(body: &[u8]) -> Vec<(String, i32)> {
-    let mut fields = Vec::new();
+fn parse_row_desc(body: &[u8]) -> Result<Vec<(Cow<'_, str>, i32)>, String> {
     if body.len() < 2 {
-        return fields;
+        return Err("truncated RowDescription".to_string());
     }
     let num = read_u16(body, 0) as usize;
-    let mut offset = 2;
+    let mut fields = Vec::with_capacity(num.min(body.len() / 19));
+    let mut rest = &body[2..];
     for _ in 0..num {
-        let start = offset;
-        while offset < body.len() && body[offset] != 0 {
-            offset += 1;
-        }
-        let name = String::from_utf8_lossy(&body[start..offset]).into_owned();
-        offset += 1; // skip NUL
+        let end = memchr::memchr(0, rest).ok_or("unterminated RowDescription field name")?;
+        let name = String::from_utf8_lossy(&rest[..end]);
+        rest = &rest[end + 1..];
         // table_oid(4) col_attr(2) type_oid(4) type_size(2) type_mod(4) format(2)
-        let type_oid = if offset + 10 <= body.len() {
-            read_i32(body, offset + 6)
-        } else {
-            0
-        };
-        offset += 18;
-        fields.push((name, type_oid));
+        if rest.len() < 18 {
+            return Err("truncated RowDescription field metadata".to_string());
+        }
+        if read_u16(rest, 16) != 0 {
+            return Err("unsupported binary RowDescription field".to_string());
+        }
+        fields.push((name, read_i32(rest, 6)));
+        rest = &rest[18..];
     }
-    fields
+    if !rest.is_empty() {
+        return Err("trailing bytes in RowDescription".to_string());
+    }
+    Ok(fields)
+}
+
+/// Consume one text column, rejecting malformed lengths rather than returning
+/// silently truncated values. NULL is the only valid negative length.
+fn take_column<'a>(rest: &mut &'a [u8]) -> Result<Option<&'a [u8]>, String> {
+    if rest.len() < 4 {
+        return Err("truncated DataRow column length".to_string());
+    }
+    let len = read_i32(rest, 0);
+    *rest = &rest[4..];
+    if len == -1 {
+        return Ok(None);
+    }
+    let len = usize::try_from(len).map_err(|_| "invalid DataRow column length")?;
+    if len > rest.len() {
+        return Err("truncated DataRow column value".to_string());
+    }
+    let value = &rest[..len];
+    *rest = &rest[len..];
+    Ok(Some(value))
 }
 
 /// Parse `command_tag` -> (command, affected_rows).
@@ -1976,7 +2124,7 @@ fn parse_command_tag(tag: &[u8]) -> (String, Option<i64>) {
 }
 
 /// Push one statement's result as a Lua value (rows table, {affected_rows}, or true).
-fn push_statement_result(state: LuaState, stmt: &Statement) {
+fn push_statement_result(state: LuaState, stmt: &Statement) -> Result<(), String> {
     let (command, affected_rows) = stmt
         .command_tag
         .as_ref()
@@ -1984,42 +2132,45 @@ fn push_statement_result(state: LuaState, stmt: &Statement) {
         .unwrap_or((String::new(), None));
 
     if let Some(row_desc) = &stmt.row_desc {
-        let fields = parse_row_desc(row_desc);
-        let table = LuaTable::new(state, stmt.data_rows.len(), 0);
+        let fields = parse_row_desc(row_desc)?;
+        // Root each Lua key once per result set. Repeated rows can push the
+        // existing key with rawgeti instead of rehashing its bytes each time.
+        let keys = if stmt.data_rows.count > 1 {
+            let keys = LuaTable::new(state, fields.len(), 0);
+            for (i, (name, _)) in fields.iter().enumerate() {
+                laux::lua_push(state, name.as_ref());
+                keys.rawseti(i + 1);
+            }
+            Some(keys)
+        } else {
+            None
+        };
+        let table = LuaTable::new(state, stmt.data_rows.count, 0);
         for (ri, row) in stmt.data_rows.iter().enumerate() {
+            if row.len() < 2 || read_u16(row, 0) as usize != fields.len() {
+                return Err("DataRow column count does not match RowDescription".to_string());
+            }
             let row_table = LuaTable::new(state, 0, fields.len());
-            if row.len() >= 2 {
-                let ncols = read_u16(row, 0) as usize;
-                let mut offset = 2;
-                for ci in 0..ncols {
-                    if offset + 4 > row.len() {
-                        // Truncated DataRow: the server response is shorter than
-                        // its own column count claims. Don't silently drop the
-                        // rest — log it so the malformed reply is diagnosable.
-                        log::warn!(
-                            "pg: truncated DataRow (row {}, got {}/{} columns, len {})",
-                            ri,
-                            ci,
-                            ncols,
-                            row.len()
-                        );
-                        break;
+            let mut rest = &row[2..];
+            for (ci, (name, oid)) in fields.iter().enumerate() {
+                if let Some(value) = take_column(&mut rest)? {
+                    if let Some(keys) = &keys {
+                        unsafe {
+                            ffi::lua_rawgeti(
+                                state.as_ptr(),
+                                keys.index(),
+                                (ci + 1) as ffi::lua_Integer,
+                            )
+                        };
+                    } else {
+                        laux::lua_push(state, name.as_ref());
                     }
-                    let len = read_i32(row, offset);
-                    offset += 4;
-                    if len < 0 {
-                        // SQL NULL -> leave the field absent (nil).
-                        continue;
-                    }
-                    let len = len as usize;
-                    let value = &row[offset..(offset + len).min(row.len())];
-                    offset += len;
-                    if let Some((name, oid)) = fields.get(ci) {
-                        laux::lua_push(state, name.as_str());
-                        convert_value(state, *oid, value);
-                        unsafe { ffi::lua_rawset(state.as_ptr(), row_table.index()) };
-                    }
+                    convert_value(state, *oid, value);
+                    unsafe { ffi::lua_rawset(state.as_ptr(), row_table.index()) };
                 }
+            }
+            if !rest.is_empty() {
+                return Err("trailing bytes in DataRow".to_string());
             }
             table.rawseti(ri + 1);
         }
@@ -2028,7 +2179,10 @@ fn push_statement_result(state: LuaState, stmt: &Statement) {
                 table.insert("affected_rows", n);
             }
         }
-        return;
+        if let Some(keys) = keys {
+            unsafe { ffi::lua_remove(state.as_ptr(), keys.index()) };
+        }
+        return Ok(());
     }
 
     if let Some(n) = affected_rows {
@@ -2036,27 +2190,26 @@ fn push_statement_result(state: LuaState, stmt: &Statement) {
     } else {
         laux::lua_push(state, true);
     }
+    Ok(())
 }
 
 /// Push the aggregated `data` field across statements (mirrors pg.lua).
-fn push_data(state: LuaState, statements: &[Statement]) {
+fn push_data(state: LuaState, statements: &[Statement]) -> Result<(), String> {
     match statements.len() {
         0 => laux::lua_pushnil(state),
-        1 => push_statement_result(state, &statements[0]),
+        1 => push_statement_result(state, &statements[0])?,
         n => {
             let table = LuaTable::new(state, n, 0);
             for (i, stmt) in statements.iter().enumerate() {
-                push_statement_result(state, stmt);
+                push_statement_result(state, stmt)?;
                 table.rawseti(i + 1);
             }
         }
     }
+    Ok(())
 }
 
-fn push_notifications(state: LuaState, notifications: &[Notification]) -> bool {
-    if notifications.is_empty() {
-        return false;
-    }
+fn push_notifications(state: LuaState, notifications: &[Notification]) {
     let table = LuaTable::new(state, notifications.len(), 0);
     for (i, n) in notifications.iter().enumerate() {
         let one = LuaTable::new(state, 0, 4);
@@ -2066,7 +2219,6 @@ fn push_notifications(state: LuaState, notifications: &[Notification]) -> bool {
         one.insert("payload", n.payload.as_str());
         table.rawseti(i + 1);
     }
-    true
 }
 
 fn push_db_error(state: LuaState, err: &DbError) {
@@ -2100,50 +2252,49 @@ fn push_db_error(state: LuaState, err: &DbError) {
 }
 
 fn push_pg_response(state: LuaState, response: PgResponse) -> c_int {
+    let top = laux::lua_top(state);
+    match try_push_pg_response(state, response) {
+        Ok(count) => count,
+        Err(message) => {
+            // Remove partially built tables and rooted keys before returning
+            // a decoding error. The worker has already drained the response.
+            laux::lua_settop(state, top);
+            push_lua_table!(state, "code" => "PROTOCOL", "message" => message);
+            1
+        }
+    }
+}
+
+fn try_push_pg_response(state: LuaState, response: PgResponse) -> Result<c_int, String> {
     match response {
         PgResponse::Connect(name) => {
             // No `.code` => success; `.name` lets pg.lua look the pool up.
             push_lua_table!(state, "name" => name);
-            1
+            Ok(1)
         }
         PgResponse::Config(msg) => {
             push_lua_table!(state, "code" => "CONFIG", "message" => msg);
-            1
+            Ok(1)
         }
         PgResponse::Socket(msg) => {
             push_lua_table!(state, "code" => "SOCKET", "message" => msg);
-            1
+            Ok(1)
         }
         PgResponse::Result(result) => {
             let num_queries = result.statements.len() as i64;
             if let Some(err) = &result.error {
-                // Error table carries data/num_queries/notifications too.
                 push_db_error(state, err);
-                let idx = laux::lua_top(state);
-                laux::lua_push(state, "num_queries");
-                laux::lua_push(state, num_queries);
-                unsafe { ffi::lua_rawset(state.as_ptr(), idx) };
-
-                laux::lua_push(state, "data");
-                push_data(state, &result.statements);
-                unsafe { ffi::lua_rawset(state.as_ptr(), idx) };
-
-                if !result.notifications.is_empty() {
-                    laux::lua_push(state, "notifications");
-                    push_notifications(state, &result.notifications);
-                    unsafe { ffi::lua_rawset(state.as_ptr(), idx) };
-                }
-                return 1;
+            } else {
+                LuaTable::new(state, 0, 3);
             }
-
-            let table = LuaTable::new(state, 0, 3);
-            let idx = table.index();
+            // Successful and failed queries carry the same result metadata.
+            let idx = laux::lua_top(state);
             laux::lua_push(state, "num_queries");
             laux::lua_push(state, num_queries);
             unsafe { ffi::lua_rawset(state.as_ptr(), idx) };
 
             laux::lua_push(state, "data");
-            push_data(state, &result.statements);
+            push_data(state, &result.statements)?;
             unsafe { ffi::lua_rawset(state.as_ptr(), idx) };
 
             if !result.notifications.is_empty() {
@@ -2151,7 +2302,7 @@ fn push_pg_response(state: LuaState, response: PgResponse) -> c_int {
                 push_notifications(state, &result.notifications);
                 unsafe { ffi::lua_rawset(state.as_ptr(), idx) };
             }
-            1
+            Ok(1)
         }
     }
 }
@@ -2511,6 +2662,473 @@ mod scram {
 mod tests {
     use super::*;
 
+    fn wire_frame(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut wire = vec![kind];
+        wire.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    fn description(fields: &[(&str, i32)]) -> Vec<u8> {
+        let mut body = (fields.len() as u16).to_be_bytes().to_vec();
+        for (name, oid) in fields {
+            write_cstr(&mut body, name.as_bytes());
+            body.extend_from_slice(&[0; 6]);
+            body.extend_from_slice(&oid.to_be_bytes());
+            body.extend_from_slice(&[0; 8]);
+        }
+        body
+    }
+
+    fn data_row(values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut row = (values.len() as u16).to_be_bytes().to_vec();
+        for value in values {
+            match value {
+                Some(value) => {
+                    row.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                    row.extend_from_slice(value);
+                }
+                None => row.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        row
+    }
+
+    async fn test_connection(capacity: usize, millis: u64) -> (PgConn, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let read_timeout = Duration::from_millis(millis);
+        (
+            PgConn {
+                stream: BufReader::with_capacity(capacity, client.unwrap()),
+                read_timeout,
+                read_timer: Box::pin(tokio::time::sleep(read_timeout)),
+            },
+            server.unwrap().0,
+        )
+    }
+
+    #[tokio::test]
+    async fn buffered_and_fragmented_queries_keep_statement_and_cycle_boundaries() {
+        let desc = description(&[("value", 25)]);
+        let small = data_row(&[Some(b"small")]);
+        let payload = b"\0\xff\r\n".repeat(10_000);
+        let large = data_row(&[Some(&payload)]);
+        let notify = [42i32.to_be_bytes().as_slice(), b"chan\0payload\0"].concat();
+        let mut wire = Vec::new();
+        for (kind, body) in [
+            (b'1', b"".as_slice()),
+            (b'2', b""),
+            (b'T', desc.as_slice()),
+            (b'D', small.as_slice()),
+            (b'D', large.as_slice()),
+            (b'N', b"SNOTICE\0Mtest\0\0"),
+            (b'A', notify.as_slice()),
+            (b'C', b"SELECT 2\0"),
+            (b'C', b"UPDATE 3\0"),
+            (b'Z', b"I"),
+            (b'C', b"DELETE 4\0"),
+            (b'Z', b"T"),
+        ] {
+            wire.extend(wire_frame(kind, body));
+        }
+        for capacity in [1, 4, 5, 17, 16 * 1024, wire.len()] {
+            let (mut conn, mut server) = test_connection(capacity, 5000).await;
+            let bytes = wire.clone();
+            let writer = tokio::spawn(async move { server.write_all(&bytes).await.unwrap() });
+            let result = conn.execute(b"", true).await.unwrap();
+            assert!(result.error.is_none());
+            assert_eq!(result.txn_status, b'I');
+            assert_eq!(result.statements.len(), 2);
+            assert_eq!(
+                result.statements[0].row_desc.as_deref(),
+                Some(desc.as_slice())
+            );
+            assert_eq!(result.statements[0].data_rows.count, 2);
+            assert_eq!(
+                result.statements[0].data_rows.iter().collect::<Vec<_>>(),
+                [&small[..], &large[..]]
+            );
+            assert_eq!(
+                result.statements[1].command_tag.as_deref(),
+                Some(b"UPDATE 3\0".as_slice())
+            );
+            assert_eq!(result.notifications.len(), 1);
+            assert_eq!(result.notifications[0].payload, "payload");
+            let next = conn.execute(b"", true).await.unwrap();
+            assert_eq!(next.txn_status, b'T');
+            assert_eq!(
+                next.statements[0].command_tag.as_deref(),
+                Some(b"DELETE 4\0".as_slice())
+            );
+            writer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_result_drains_large_rows_and_preserves_error_and_txn_status() {
+        let row = data_row(&[Some(&vec![b'x'; 64 * 1024])]);
+        let mut wire = wire_frame(b'T', &description(&[("value", 25)]));
+        wire.extend(wire_frame(b'D', &row));
+        wire.extend(wire_frame(b'C', b"SELECT 1\0"));
+        wire.extend(wire_frame(b'E', b"SERROR\0C23505\0Mduplicate\0\0"));
+        wire.extend(wire_frame(b'Z', b"E"));
+        wire.extend(wire_frame(b'C', b"ROLLBACK\0"));
+        wire.extend(wire_frame(b'Z', b"I"));
+        for capacity in [7, wire.len()] {
+            let (mut conn, mut server) = test_connection(capacity, 5000).await;
+            let bytes = wire.clone();
+            let writer = tokio::spawn(async move {
+                server.write_all(&bytes).await.unwrap();
+                // Keep the peer alive until the explicit rollback arrives.
+                let mut rollback = [0u8; 14];
+                server.read_exact(&mut rollback).await.unwrap();
+                assert_eq!(&rollback, b"Q\0\0\0\x0dROLLBACK\0");
+            });
+            let result = conn.execute(b"", false).await.unwrap();
+            assert!(result.statements.is_empty());
+            assert!(result.notifications.is_empty());
+            assert_eq!(result.error.unwrap().code.as_deref(), Some("23505"));
+            assert_eq!(result.txn_status, b'E');
+            conn.rollback().await.unwrap();
+            writer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_requests_rollback_open_transactions_and_validate_cleanup() {
+        for (status, rollback_status, rollback_error) in [
+            (b'T', b'I', false),
+            (b'E', b'I', false),
+            (b'T', b'T', false),
+            (b'T', b'I', true),
+        ] {
+            let (mut conn, mut server) = test_connection(128, 5000).await;
+            let peer = tokio::spawn(async move {
+                let mut query = [0; 14];
+                server.read_exact(&mut query).await.unwrap();
+                assert_eq!(&query, b"Q\0\0\0\x0dROLLBACK\0");
+                if rollback_error {
+                    server
+                        .write_all(&wire_frame(b'E', b"SERROR\0CXX000\0Mfailed\0\0"))
+                        .await
+                        .unwrap();
+                }
+                server
+                    .write_all(&wire_frame(b'Z', &[rollback_status]))
+                    .await
+                    .unwrap();
+            });
+            let mut result = QueryCollector::new(true, 10).finish();
+            result.txn_status = status;
+            if status == b'E' {
+                result.error = Some(Box::new(parse_error(b"SERROR\0C23505\0Mduplicate\0\0")));
+            }
+            let cleanup = conn.finish_request(&mut result).await;
+            assert_eq!(cleanup.is_ok(), rollback_status == b'I' && !rollback_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code.as_deref(),
+                Some(if status == b'E' { "23505" } else { "25000" })
+            );
+            peer.await.unwrap();
+        }
+        let (mut conn, _server) = test_connection(128, 20).await;
+        let mut result = QueryCollector::new(true, 10).finish();
+        conn.finish_request(&mut result).await.unwrap();
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn row_cap_preserves_completed_statements_and_discards_current_rows() {
+        for capture in [true, false] {
+            let mut collector = QueryCollector::new(capture, 2);
+            collector.accept(b'D', &data_row(&[Some(b"1")])).unwrap();
+            collector.accept(b'C', b"SELECT 1\0").unwrap();
+            collector.accept(b'D', &data_row(&[Some(b"2")])).unwrap();
+            collector.accept(b'D', &data_row(&[Some(b"3")])).unwrap();
+            assert!(collector.row_destination(64 * 1024).is_none());
+            assert!(collector.current.data_rows.bytes.is_empty());
+            collector.accept(b'C', b"SELECT 2\0").unwrap();
+            assert!(collector.accept(b'Z', b"I").unwrap());
+            let result = collector.finish();
+            assert_eq!(result.error.unwrap().code.as_deref(), Some("54000"));
+            if capture {
+                assert_eq!(result.statements.len(), 2);
+                assert_eq!(result.statements[0].data_rows.count, 1);
+                assert_eq!(result.statements[1].data_rows.count, 0);
+            } else {
+                assert!(result.statements.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_invalid_headers_and_truncated_bodies() {
+        let mut oversized = vec![b'D'];
+        oversized.extend_from_slice(&((MAX_MESSAGE_LEN + 5) as i32).to_be_bytes());
+        for (bytes, expected) in [
+            (vec![b'D', 0, 0, 0, 3], "invalid message length"),
+            (oversized, "message too large"),
+            (vec![b'D', 0, 0], "socket read failed"),
+            (vec![b'D', 0, 0, 0, 9, b'x'], "EOF"),
+            (wire_frame(b'Z', b""), "invalid ReadyForQuery"),
+            (wire_frame(b'Z', b"X"), "invalid ReadyForQuery"),
+        ] {
+            for capture in [true, false] {
+                let (mut conn, mut server) = test_connection(16, 1000).await;
+                server.write_all(&bytes).await.unwrap();
+                server.shutdown().await.unwrap();
+                let error = conn.execute(b"", capture).await.err().unwrap();
+                assert!(error.contains(expected), "{error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_auth_and_query_share_buffered_messages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let params = ConnParams {
+            host: "127.0.0.1".to_string(),
+            port: listener.local_addr().unwrap().port(),
+            user: "tester".to_string(),
+            password: String::new(),
+            database: "test".to_string(),
+            application_name: "pg-test".to_string(),
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let len = stream.read_u32().await.unwrap() as usize;
+            let mut startup = vec![0; len - 4];
+            stream.read_exact(&mut startup).await.unwrap();
+            assert_eq!(read_i32(&startup, 0), 196608);
+            let mut reply = wire_frame(b'R', &0i32.to_be_bytes());
+            reply.extend(wire_frame(b'S', b"client_encoding\0UTF8\0"));
+            reply.extend(wire_frame(b'K', &[0; 8]));
+            reply.extend(wire_frame(b'Z', b"I"));
+            stream.write_all(&reply).await.unwrap();
+            let mut query = [0u8; 14];
+            stream.read_exact(&mut query).await.unwrap();
+            assert_eq!(&query, b"Q\0\0\0\x0dSELECT 1\0");
+            let mut reply = wire_frame(b'T', &description(&[("one", 23)]));
+            reply.extend(wire_frame(b'D', &data_row(&[Some(b"1")])));
+            reply.extend(wire_frame(b'C', b"SELECT 1\0"));
+            reply.extend(wire_frame(b'Z', b"I"));
+            stream.write_all(&reply).await.unwrap();
+        });
+        let mut conn = PgConn::connect(&params, 1000, 1000).await.unwrap();
+        let result = conn
+            .execute(&wire_frame(b'Q', b"SELECT 1\0"), true)
+            .await
+            .unwrap();
+        assert_eq!(result.statements[0].data_rows.count, 1);
+        assert_eq!(
+            result.statements[0].data_rows.iter().next().unwrap(),
+            data_row(&[Some(b"1")])
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fully_buffered_response_does_not_rearm_timer() {
+        let (mut conn, mut server) = test_connection(1024, 1000).await;
+        let mut wire = wire_frame(b'C', b"UPDATE 2\0");
+        wire.extend(wire_frame(b'Z', b"I"));
+        server.write_all(&wire).await.unwrap();
+        assert_eq!(conn.stream.fill_buf().await.unwrap(), wire);
+        let deadline = conn.read_timer.deadline();
+        assert_eq!(conn.execute(b"", true).await.unwrap().statements.len(), 1);
+        assert_eq!(conn.read_timer.deadline(), deadline);
+    }
+
+    #[tokio::test]
+    async fn body_fragments_do_not_restart_timeout() {
+        let (mut conn, mut server) = test_connection(8, 150).await;
+        // Header declares a body of 100 bytes; each fragment arrives in less
+        // than 150ms, but the body as a whole never completes within its budget.
+        server.write_all(&[b'D', 0, 0, 0, 104]).await.unwrap();
+        let writer = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                if server.write_all(b"x").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let result = timeout(Duration::from_secs(2), conn.execute(b"", true))
+            .await
+            .unwrap();
+        writer.abort();
+        let _ = writer.await;
+        assert_eq!(result.err().unwrap(), "socket read timed out");
+    }
+
+    fn test_lua() -> (LuaState, laux::LuaGlobalState) {
+        let state = LuaState::new(unsafe { ffi::luaL_newstate() }).unwrap();
+        let owner = laux::LuaGlobalState::new(state);
+        unsafe { ffi::luaL_openlibs(state.as_ptr()) };
+        (state, owner)
+    }
+
+    fn check_lua(state: LuaState, code: &str) {
+        let code = std::ffi::CString::new(code).unwrap();
+        let result = unsafe { ffi::luaL_dostring(state.as_ptr(), code.as_ptr()) };
+        assert_eq!(
+            result,
+            ffi::LUA_OK,
+            "{}",
+            unsafe { LuaStack::from_raw(state) }.value(-1)
+        );
+    }
+
+    #[test]
+    fn compact_rows_decode_with_cached_keys_nulls_and_returning_counts() {
+        let (state, _owner) = test_lua();
+        let mut collector = QueryCollector::new(true, 10);
+        collector
+            .accept(
+                b'T',
+                &description(&[("id", 20), ("text", 25), ("flag", 16)]),
+            )
+            .unwrap();
+        for values in [
+            [
+                Some(b"9223372036854775807".as_slice()),
+                Some(b"a\0b"),
+                Some(b"t"),
+            ],
+            [Some(b"-42".as_slice()), None, Some(b"f")],
+        ] {
+            collector.accept(b'D', &data_row(&values)).unwrap();
+        }
+        collector.accept(b'C', b"INSERT 0 2\0").unwrap();
+        collector.accept(b'C', b"BEGIN\0").unwrap();
+        collector.accept(b'Z', b"I").unwrap();
+        laux::lua_push(state, "sentinel");
+        assert_eq!(
+            push_pg_response(state, PgResponse::Result(collector.finish())),
+            1
+        );
+        assert_eq!(laux::lua_top(state), 2);
+        unsafe { ffi::lua_setglobal(state.as_ptr(), cstr!("result")) };
+        check_lua(
+            state,
+            r#"
+            assert(result.num_queries == 2)
+            assert(result.data[1].affected_rows == 2)
+            assert(result.data[1][1].id == math.maxinteger)
+            assert(result.data[1][1].text == "a\0b")
+            assert(result.data[1][1].flag == true)
+            assert(result.data[1][2].id == -42)
+            assert(result.data[1][2].text == nil)
+            assert(result.data[1][2].flag == false)
+            assert(result.data[2] == true)
+        "#,
+        );
+        assert_eq!(laux::lua_top(state), 1);
+    }
+
+    #[test]
+    fn malformed_rows_return_protocol_error_and_restore_lua_stack() {
+        let good = data_row(&[Some(b"ok")]);
+        let mut trailing = good.clone();
+        trailing.push(0);
+        for row in [
+            vec![],
+            data_row(&[]),
+            vec![0, 1, 0, 0, 0],
+            vec![0, 1, 0, 0, 0, 9, b'x'],
+            vec![0, 1, 255, 255, 255, 254],
+            trailing,
+        ] {
+            let (state, _owner) = test_lua();
+            let mut collector = QueryCollector::new(true, 10);
+            collector
+                .accept(b'T', &description(&[("value", 25)]))
+                .unwrap();
+            // Two rows force the cached-key path, including its error cleanup.
+            collector.accept(b'D', &good).unwrap();
+            collector.accept(b'D', &row).unwrap();
+            collector.accept(b'C', b"SELECT 2\0").unwrap();
+            laux::lua_push(state, "sentinel");
+            assert_eq!(
+                push_pg_response(state, PgResponse::Result(collector.finish())),
+                1
+            );
+            assert_eq!(laux::lua_top(state), 2);
+            unsafe { ffi::lua_setglobal(state.as_ptr(), cstr!("result")) };
+            check_lua(
+                state,
+                "assert(result.code == 'PROTOCOL'); assert(result.data == nil)",
+            );
+            assert_eq!(laux::lua_top(state), 1);
+        }
+    }
+
+    #[test]
+    fn row_description_checks_every_truncation_and_borrows_valid_names() {
+        let body = description(&[("first", 23), ("second", 25)]);
+        for len in 0..body.len() {
+            assert!(parse_row_desc(&body[..len]).is_err(), "length {len}");
+        }
+        let fields = parse_row_desc(&body).unwrap();
+        assert!(matches!(fields[0].0, Cow::Borrowed("first")));
+        let mut invalid_utf8 = description(&[("x", 25)]);
+        invalid_utf8[2] = 255;
+        assert_eq!(parse_row_desc(&invalid_utf8).unwrap()[0].0, "\u{fffd}");
+        assert!(parse_notification(b"\0\0\0\0channel").is_none());
+        assert!(parse_notification(b"\0\0\0\0channel\0payload").is_none());
+    }
+
+    #[test]
+    fn numeric_parameters_preserve_existing_text_format() {
+        let (state, _owner) = test_lua();
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let options = JsonOptions::default();
+        let mut encoded = Vec::new();
+        for number in [i64::MIN, -1, 0, 1, i64::MAX] {
+            laux::lua_push(state, number);
+            encoded.clear();
+            write_param(&mut encoded, &mut lua, -1, &options).unwrap();
+            let expected = number.to_string();
+            assert_eq!(read_i32(&encoded, 0) as usize, expected.len());
+            assert_eq!(&encoded[4..], expected.as_bytes());
+            laux::lua_pop(state, 1);
+        }
+        for number in [
+            0.0,
+            -0.0,
+            1.25,
+            1e-300,
+            1e300,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            laux::lua_push(state, number);
+            encoded.clear();
+            write_param(&mut encoded, &mut lua, -1, &options).unwrap();
+            let expected = number.to_string();
+            assert_eq!(read_i32(&encoded, 0) as usize, expected.len());
+            assert_eq!(&encoded[4..], expected.as_bytes());
+            laux::lua_pop(state, 1);
+        }
+        laux::lua_push(state, 42i64);
+        laux::lua_push(state, "value");
+        encoded.clear();
+        append_statement(&mut encoded, &mut lua, b"SELECT $1, $2", 1..3, &options).unwrap();
+        let parse_len = read_i32(&encoded, 1) as usize + 1;
+        let bind = &encoded[parse_len..];
+        assert_eq!(bind[0], b'B');
+        assert_eq!(read_u16(bind, 9), 2);
+        assert_eq!(&bind[11..26], b"\0\0\0\x0242\0\0\0\x05value");
+    }
+
     #[test]
     fn parse_url_full() {
         let cfg = ConnectConfig::parse(
@@ -2603,8 +3221,8 @@ mod tests {
         body.extend_from_slice(&4i16.to_be_bytes()); // type size
         body.extend_from_slice(&(-1i32).to_be_bytes()); // type mod
         body.extend_from_slice(&0i16.to_be_bytes()); // format
-        let fields = parse_row_desc(&body);
-        assert_eq!(fields, vec![("id".to_string(), 23)]);
+        let fields = parse_row_desc(&body).unwrap();
+        assert_eq!(fields, vec![(Cow::Borrowed("id"), 23)]);
     }
 
     #[test]
@@ -2874,22 +3492,22 @@ mod tests {
         body.extend_from_slice(&(-1i32).to_be_bytes());
         body.extend_from_slice(&0i16.to_be_bytes());
 
-        let fields = parse_row_desc(&body);
+        let fields = parse_row_desc(&body).unwrap();
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0], ("name".to_string(), 25));
-        assert_eq!(fields[1], ("age".to_string(), 23));
+        assert_eq!(fields[0], (Cow::Borrowed("name"), 25));
+        assert_eq!(fields[1], (Cow::Borrowed("age"), 23));
     }
 
     #[test]
     fn row_description_empty() {
-        assert!(parse_row_desc(b"").is_empty());
-        assert!(parse_row_desc(b"\x00").is_empty()); // < 2 bytes
+        assert!(parse_row_desc(b"").is_err());
+        assert!(parse_row_desc(b"\x00").is_err()); // < 2 bytes
     }
 
     #[test]
     fn row_description_zero_fields() {
         let body = 0u16.to_be_bytes();
-        let fields = parse_row_desc(&body);
+        let fields = parse_row_desc(&body).unwrap();
         assert!(fields.is_empty());
     }
 

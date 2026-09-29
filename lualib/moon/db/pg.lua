@@ -18,7 +18,7 @@ moon.register_protocol {
 }
 
 ---@class pg_result
----@field public code? string @ error kind: "SOCKET" | "CONFIG" | "ENCODE" | db SQLSTATE
+---@field public code? string @ error kind: "SOCKET" | "CONFIG" | "ENCODE" | "PROTOCOL" | db SQLSTATE
 ---@field public message? string @ error message
 ---@field public data? table @ rows / aggregated results
 ---@field public num_queries? integer

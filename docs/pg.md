@@ -40,6 +40,25 @@ High-performance native PostgreSQL driver implementing the v3 wire protocol in R
 4. **Auto-reconnect** — workers reconnect transparently on socket errors.
 5. **SCRAM-SHA-256 authentication** — full implementation including channel binding.
 
+The receive path scans complete messages already in the socket buffer before
+performing asynchronous reads. Row bodies are stored together in a
+length-prefixed buffer per statement, avoiding one allocation per row; fragmented
+rows are appended directly to that buffer. Header and body reads retain separate
+timeout budgets, and body fragments do not restart the body deadline.
+
+Fire-and-forget `execute_*` calls consume responses without retaining result rows,
+column descriptions, or command tags. They still process database errors and
+transaction status and drain through `ReadyForQuery`. Every pooled request must
+finish with an idle connection. Open or failed transactions are rolled back;
+an otherwise successful request that leaves a transaction open returns `25000`.
+Use a single request or the transactional pipeline API for a whole transaction.
+Existing message-size and row-count limits still apply.
+
+Numeric parameters are formatted directly into request buffers. Result decoding
+borrows valid UTF-8 column names and reuses Lua column keys across rows. Malformed
+row descriptions or row values return a `PROTOCOL` error rather than partial
+values; the response has already been drained before actor-side decoding.
+
 ## Lua API
 
 ```lua
