@@ -196,7 +196,7 @@ end
 ---@field israw? boolean Whether this is a raw protocol (receives message_ptr directly)
 
 ---@class service_params
----@field name string The name of the service.
+---@field name string The service name. Nonempty names must be globally distinct, regardless of `unique`.
 ---@field source string The path to the startup script file for the service.
 ---@field unique? boolean Whether the service is unique. Default is `false`. If `true`, use `moon.query(name)` to query the service ID.
 

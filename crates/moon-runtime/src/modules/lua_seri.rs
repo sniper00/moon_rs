@@ -635,10 +635,6 @@ fn unpack_table(
 fn pack(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let state = lua.state();
     let n = laux::lua_top(state);
-    if n == 0 {
-        return Ok(0);
-    }
-
     let mut buf = Box::new(Buffer::new());
     for i in 1..=n {
         pack_one(lua, i, buf.as_mut_vec(), 0)?;
@@ -652,10 +648,6 @@ fn pack(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
 fn pack_string(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let state = lua.state();
     let n = laux::lua_top(state);
-    if n == 0 {
-        return Ok(0);
-    }
-
     let mut buf = Box::new(Buffer::new());
     for i in 1..=n {
         pack_one(lua, i, buf.as_mut_vec(), 0)?;
@@ -831,6 +823,33 @@ mod tests {
     use super::*;
     use moon_base::laux::LuaGlobalState;
     use std::{hint::black_box, ptr::NonNull, time::Instant};
+
+    #[test]
+    fn empty_pack_returns_a_buffer_and_preserves_zero_values() {
+        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).unwrap();
+        let _owner = LuaGlobalState::new(state);
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        assert_eq!(pack(&mut lua).unwrap(), 1);
+        let ptr = unsafe { ffi::lua_touserdata(state.as_ptr(), -1) } as *mut Buffer;
+        let buf = unsafe { Box::from_raw(ptr) };
+        assert!(buf.as_slice().is_empty());
+        assert!(matches!(
+            unsafe { decode_bytes(state, buf.as_slice()) },
+            Ok(0)
+        ));
+        unsafe {
+            ffi::lua_settop(state.as_ptr(), 0);
+        }
+        assert_eq!(pack_string(&mut lua).unwrap(), 1);
+        assert_eq!(laux::lua_type(state, -1), LuaType::String);
+        assert_eq!(unsafe { ffi::lua_rawlen(state.as_ptr(), -1) }, 0);
+        unsafe {
+            ffi::lua_settop(state.as_ptr(), 0);
+            ffi::lua_pushnil(state.as_ptr());
+        }
+        assert_eq!(pack_string(&mut lua).unwrap(), 1);
+        assert!(unsafe { ffi::lua_rawlen(state.as_ptr(), -1) } > 0);
+    }
 
     fn push_benchmark_table(state: LuaState, array_size: usize, hash_size: usize) {
         unsafe {

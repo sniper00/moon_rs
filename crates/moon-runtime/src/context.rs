@@ -72,6 +72,7 @@ lazy_static! {
             pending_timers: AtomicUsize::new(0),
             actors: DashMap::new(),
             unique_actors: DashMap::new(),
+            actor_names: DashMap::new(),
             clock: Instant::now(),
             env: DashMap::new(),
             timer_tx: OnceLock::new(),
@@ -330,6 +331,7 @@ pub struct LuaActorServer {
     pending_timers: AtomicUsize,
     actors: DashMap<ActorId, ActorEntry>,
     unique_actors: DashMap<String, ActorId>,
+    actor_names: DashMap<String, ActorId>,
     clock: Instant,
     env: DashMap<String, Arc<Vec<u8>>>,
     /// The timer channel is created in `run_timer`, which keeps the receiver in
@@ -357,8 +359,17 @@ impl LuaActorServer {
         actor: &mut LuaActor,
         tx: mpsc::UnboundedSender<Message>,
     ) -> Result<Arc<Watchdog>, String> {
-        if actor.unique && self.unique_actors.contains_key(&actor.name) {
-            return Err(format!("unique actor named {} already exists", actor.name));
+        // Empty names denote anonymous services. Reserve every explicit name,
+        // regardless of whether the service has a dedicated (unique) thread.
+        if !actor.name.is_empty() {
+            match self.actor_names.entry(actor.name.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    return Err(format!("actor named {} already exists", actor.name));
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(actor.id);
+                }
+            }
         }
 
         self.actor_counter.fetch_add(1, Ordering::AcqRel);
@@ -392,7 +403,7 @@ impl LuaActorServer {
     pub fn remove_actor(&self, id: ActorId, name: &str) {
         // Only run registry-dependent cleanup when this actor was actually
         // registered. `add_actor` can fail *before* registering (e.g. a duplicate
-        // unique name) yet the spawned task still calls `remove_actor` on exit. In
+        // name) yet the spawned task still calls `remove_actor` on exit. In
         // that case nothing was inserted and `actor_counter` was never bumped, so
         // we must NOT decrement the counter (it would underflow `AtomicU32` and
         // make `stopped()` never true, hanging shutdown) nor evict the *existing*
@@ -405,9 +416,8 @@ impl LuaActorServer {
             return;
         }
 
-        if !name.is_empty() {
-            self.unique_actors.remove(name);
-        }
+        self.unique_actors.remove_if(name, |_, owner| *owner == id);
+        self.actor_names.remove_if(name, |_, owner| *owner == id);
         self.actor_counter.fetch_sub(1, Ordering::AcqRel);
 
         if id == BOOTSTRAP_ACTOR_ADDR {
@@ -971,6 +981,59 @@ mod tests {
             source: String::new(),
             params: String::new(),
         }
+    }
+
+    #[test]
+    fn service_names_are_exclusive_regardless_of_unique() {
+        for (i, (first_unique, second_unique)) in
+            [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let name = format!("exclusive-name-{i}");
+            let first_id = 0x7200_0010 + i as ActorId * 2;
+            let second_id = first_id + 1;
+            let mut first = LuaActor::new(&actor_param(first_id, &name, first_unique));
+            let mut second = LuaActor::new(&actor_param(second_id, &name, second_unique));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            CONTEXT.add_actor(&mut first, tx).unwrap();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            assert!(CONTEXT.add_actor(&mut second, tx).is_err());
+            CONTEXT.remove_actor(second_id, &name);
+            assert_eq!(CONTEXT.actor_names.get(&name).map(|v| *v), Some(first_id));
+            assert_eq!(
+                CONTEXT.query(&name).map(|v| *v),
+                first_unique.then_some(first_id)
+            );
+            CONTEXT.remove_actor(first_id, &name);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            CONTEXT.add_actor(&mut second, tx).unwrap();
+            CONTEXT.remove_actor(second_id, &name);
+            assert!(!CONTEXT.actor_names.contains_key(&name));
+        }
+    }
+
+    #[test]
+    fn concurrent_service_name_registration_has_one_winner() {
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let id = 0x7200_0020 + i;
+                    let mut actor = LuaActor::new(&actor_param(id, "concurrent-name", i % 2 == 0));
+                    let (tx, _rx) = mpsc::unbounded_channel();
+                    barrier.wait();
+                    CONTEXT.add_actor(&mut actor, tx).ok().map(|_| id)
+                })
+            })
+            .collect();
+        let winners: Vec<_> = threads
+            .into_iter()
+            .filter_map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        CONTEXT.remove_actor(winners[0], "concurrent-name");
     }
 
     #[test]

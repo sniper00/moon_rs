@@ -1154,12 +1154,19 @@ mod tests {
     }
 
     #[test]
-    fn seri_pack_empty_returns_nothing() {
+    fn seri_pack_empty_roundtrip() {
         let (state, _guard) = new_lua_vm();
         let code = r#"
             local seri = require("seri")
-            local n = select('#', seri.pack())
-            assert(n == 0, "empty pack should return nothing")
+            local buffer = require("buffer")
+            local ptr = seri.pack()
+            assert(type(ptr) == "userdata", "empty pack must return a buffer")
+            local data = buffer.read(ptr, buffer.size(ptr))
+            buffer.drop(ptr)
+            assert(data == "")
+            assert(select('#', seri.unpack(data)) == 0)
+            assert(seri.packstring() == "")
+            assert(select('#', seri.unpack(seri.packstring(nil))) == 1)
         "#;
         run_lua(state, code).expect("seri empty pack failed");
     }
