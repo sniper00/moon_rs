@@ -64,44 +64,22 @@ fn next_ws_fd() -> i64 {
 // ---------- Generic connection handler ----------
 
 async fn handle_read<S>(
-    owner: ActorId,
-    session: i64,
     read_timeout: u64,
     reader: &mut futures_util::stream::SplitStream<WebSocketStream<S>>,
-) -> Result<(), String>
+) -> Result<Message, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    if read_timeout > 0 {
-        match timeout(Duration::from_millis(read_timeout), reader.try_next()).await {
-            Ok(Ok(Some(message))) => {
-                let _ = CONTEXT.send_value(
-                    context::PTYPE_WEBSOCKET,
-                    owner,
-                    session,
-                    WsResponse::Read(message),
-                );
-                Ok(())
-            }
-            Ok(Ok(None)) => Err("eof".to_string()),
-            Ok(Err(err)) => Err(err.to_string()),
-            Err(err) => Err(format!("read timeout: {}", err)),
-        }
+    let result = if read_timeout > 0 {
+        timeout(Duration::from_millis(read_timeout), reader.try_next())
+            .await
+            .map_err(|err| format!("read timeout: {}", err))?
     } else {
-        match reader.try_next().await {
-            Ok(Some(message)) => {
-                let _ = CONTEXT.send_value(
-                    context::PTYPE_WEBSOCKET,
-                    owner,
-                    session,
-                    WsResponse::Read(message),
-                );
-                Ok(())
-            }
-            Ok(None) => Err("eof".to_string()),
-            Err(err) => Err(err.to_string()),
-        }
-    }
+        reader.try_next().await
+    };
+    result
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "eof".to_string())
 }
 
 async fn handle_write<S>(
@@ -153,40 +131,50 @@ async fn run_connection<S>(
 {
     let (writer, mut reader) = stream.split();
 
-    let mut read_task = CONTEXT.io_runtime().spawn(async move {
-        let mut closed = false;
-        while let Some(op) = rx_reader.recv().await {
-            if let WsRequest::Read(owner, session, read_timeout) = op {
-                if !closed {
-                    if let Err(err) = handle_read(owner, session, read_timeout, &mut reader).await {
-                        let _ = CONTEXT.send_value(
-                            context::PTYPE_WEBSOCKET,
-                            owner,
-                            session,
-                            WsResponse::Error(err),
-                        );
-                        closed = true;
-                    }
-                } else {
-                    let _ = CONTEXT.send_value(
-                        context::PTYPE_WEBSOCKET,
-                        owner,
-                        session,
-                        WsResponse::Error("closed".to_string()),
-                    );
-                }
+    let write = handle_write(writer, rx_writer);
+    tokio::pin!(write);
+    loop {
+        let op = tokio::select! {
+            _ = &mut write => break,
+            op = rx_reader.recv() => match op {
+                Some(op) => op,
+                None => break,
+            },
+        };
+        if let WsRequest::Read(owner, session, read_timeout) = op {
+            let result = tokio::select! {
+                result = &mut write => Err(result.err().unwrap_or_else(|| "closed".to_string())),
+                result = handle_read(read_timeout, &mut reader) => result,
+            };
+            let closed = match &result {
+                Ok(message) => message.is_close(),
+                Err(_) => true,
+            };
+            let response = match result {
+                Ok(message) => WsResponse::Read(message),
+                Err(err) => WsResponse::Error(err),
+            };
+            let _ = CONTEXT.send_value(context::PTYPE_WEBSOCKET, owner, session, response);
+            if closed {
+                break;
             }
         }
-    });
-
-    let mut write_task = CONTEXT.io_runtime().spawn(handle_write(writer, rx_writer));
-
-    if tokio::try_join!(&mut read_task, &mut write_task).is_err() {
-        read_task.abort();
-        write_task.abort();
     }
 
     WS_NET.remove(&fd);
+    // Stop accepting reads, then release callers already queued behind the
+    // active read. The writer future is dropped together with the connection.
+    rx_reader.close();
+    while let Some(op) = rx_reader.recv().await {
+        if let WsRequest::Read(owner, session, _) = op {
+            let _ = CONTEXT.send_value(
+                context::PTYPE_WEBSOCKET,
+                owner,
+                session,
+                WsResponse::Error("closed".to_string()),
+            );
+        }
+    }
 }
 
 // ---------- Client ----------
@@ -779,4 +767,109 @@ pub extern "C-unwind" fn luaopen_websocket(state: LuaState) -> c_int {
 
     luaL_newlib!(state, l);
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    #[tokio::test]
+    async fn local_close_removes_idle_connection() {
+        let (socket, _peer) = tokio::io::duplex(4096);
+        let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+        let (fd, reads, writes) = setup_ws_connection();
+        let channels = WS_NET.get(&fd).unwrap().clone();
+        channels
+            .tx_writer
+            .try_send(WsRequest::Close(Message::Close(None)))
+            .unwrap();
+        timeout(
+            Duration::from_secs(2),
+            run_connection(stream, fd, reads, writes),
+        )
+        .await
+        .unwrap();
+        assert!(!WS_NET.contains_key(&fd));
+        assert!(channels.tx_reader.is_closed());
+        assert!(channels.tx_writer.is_closed());
+    }
+
+    #[tokio::test]
+    async fn connection_shutdown_releases_active_and_queued_readers() {
+        for mode in 0..4 {
+            let owner = 0x7200_0030 + mode;
+            let (tx, mut responses) = mpsc::unbounded_channel();
+            let mut actor = LuaActor::new(&context::LuaActorParam {
+                id: owner,
+                unique: false,
+                creator: 0,
+                session: 0,
+                memlimit: 0,
+                name: String::new(),
+                source: String::new(),
+                params: String::new(),
+            });
+            CONTEXT.add_actor(&mut actor, tx).unwrap();
+            let (socket, peer) = tokio::io::duplex(4096);
+            let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+            let mut peer = WebSocketStream::from_raw_socket(peer, Role::Client, None).await;
+            let (fd, reads, writes) = setup_ws_connection();
+            let channels = WS_NET.get(&fd).unwrap().clone();
+            channels
+                .tx_reader
+                .try_send(WsRequest::Read(owner, 1, if mode == 2 { 100 } else { 0 }))
+                .unwrap();
+            let task = tokio::spawn(run_connection(stream, fd, reads, writes));
+            timeout(Duration::from_secs(2), async {
+                while channels.tx_reader.capacity() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            channels
+                .tx_reader
+                .try_send(WsRequest::Read(owner, 2, 0))
+                .unwrap();
+            match mode {
+                0 => channels
+                    .tx_writer
+                    .try_send(WsRequest::Close(Message::Close(None)))
+                    .unwrap(),
+                1 => {
+                    drop(peer);
+                    channels
+                        .tx_writer
+                        .try_send(WsRequest::Write(Message::Text("test".into()), false))
+                        .unwrap();
+                }
+                2 => {} // Let the active read time out.
+                3 => peer.send(Message::Close(None)).await.unwrap(),
+                _ => unreachable!(),
+            }
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!WS_NET.contains_key(&fd));
+            for session in [1, 2] {
+                let message = responses
+                    .try_recv()
+                    .expect("waiting reader must be released");
+                assert_eq!(message.session, session);
+                let context::MessageBody::Boxed(_, mut value) = message.data else {
+                    panic!("expected websocket response")
+                };
+                let response = unsafe { Box::from_raw(value.into_raw() as *mut WsResponse) };
+                if mode == 3 && session == 1 {
+                    assert!(matches!(*response, WsResponse::Read(Message::Close(_))));
+                } else {
+                    assert!(matches!(*response, WsResponse::Error(_)));
+                }
+            }
+            assert!(responses.try_recv().is_err());
+            CONTEXT.remove_actor(owner, "");
+        }
+    }
 }
