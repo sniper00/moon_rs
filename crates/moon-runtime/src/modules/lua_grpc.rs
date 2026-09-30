@@ -46,7 +46,6 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use lazy_static::lazy_static;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
-use tokio::task::AbortHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{
@@ -78,7 +77,7 @@ lazy_static! {
     /// worker pool.
     static ref GRPC_CONNECTIONS: DashMap<String, Channel> = DashMap::new();
     /// Active (client-side) streaming RPCs keyed by a process-unique fd.
-    static ref GRPC_STREAMS: DashMap<i64, StreamEntry> = DashMap::new();
+    static ref GRPC_STREAMS: DashMap<i64, StreamHandle> = DashMap::new();
     /// Running gRPC server listeners keyed by fd; the token cancels the accept
     /// loop on `stop(fd)`.
     static ref GRPC_SERVERS: DashMap<i64, CancellationToken> = DashMap::new();
@@ -204,13 +203,7 @@ struct StreamHandle {
     /// is a message; `None` half-closes the request stream. `None` for
     /// server-streaming RPCs (no client messages).
     tx_send: Option<mpsc::UnboundedSender<Option<Vec<u8>>>>,
-}
-
-/// Registry entry: the handle plus an abort handle so `close()` can tear the
-/// background task down deterministically (not just when Lua GCs the handle).
-struct StreamEntry {
-    handle: StreamHandle,
-    abort: AbortHandle,
+    cancel: CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,19 +507,24 @@ async fn run_recv_loop(
     fd: i64,
     mut streaming: Streaming<Bytes>,
     mut rx_recv: mpsc::Receiver<(ActorId, i64)>,
+    cancel: CancellationToken,
 ) {
     let mut ended = false;
-    while let Some((owner, session)) = rx_recv.recv().await {
-        if ended {
-            let _ = CONTEXT.send_value(
-                context::PTYPE_GRPC,
-                owner,
-                session,
-                GrpcResponse::Error("grpc stream already ended".to_string()),
-            );
-            continue;
-        }
-        let response = match streaming.message().await {
+    loop {
+        let request = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            request = rx_recv.recv() => request,
+        };
+        let Some((owner, session)) = request else {
+            break;
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Status::cancelled("grpc stream: closed")),
+            result = streaming.message() => result,
+        };
+        let response = match result {
             Ok(Some(bytes)) => GrpcResponse::StreamMessage(Some(bytes)),
             Ok(None) => {
                 ended = true;
@@ -541,25 +539,48 @@ async fn run_recv_loop(
                 ))
             }
         };
-        if ended {
-            // Drop the registry entry (and its `tx_recv` sender) as soon as the
-            // response stream is done, so the slot is freed even if the caller
-            // never calls `close()`. Outstanding userdata handles keep this loop
-            // alive to answer any further `recv` (with an "already ended" error)
-            // until they are GC'd, at which point `rx_recv` closes and the task
-            // exits.
-            GRPC_STREAMS.remove(&fd);
-        }
         let _ = CONTEXT.send_value(context::PTYPE_GRPC, owner, session, response);
+        if ended {
+            break;
+        }
     }
-    // All senders (registry entry + userdata handles) dropped: tear down.
-    GRPC_STREAMS.remove(&fd);
+    let error = if cancel.is_cancelled() {
+        "grpc stream: closed"
+    } else {
+        "grpc stream already ended"
+    };
+    drain_recv_requests(fd, rx_recv, error.to_string()).await;
 }
 
-/// Answer every pending `recv` with a fixed error. Used when a streaming RPC
-/// was opened (handle handed to Lua) but the underlying call then failed to
-/// establish — the failure surfaces on the first `recv`.
-async fn run_recv_failed(fd: i64, mut rx_recv: mpsc::Receiver<(ActorId, i64)>, err: String) {
+/// Preserve an opening failure until Lua takes the handle and requests a reply.
+/// Removing the entry immediately would race with find_stream after StreamOpen.
+async fn run_recv_failed(
+    fd: i64,
+    mut rx_recv: mpsc::Receiver<(ActorId, i64)>,
+    err: String,
+    cancel: CancellationToken,
+) {
+    let request = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        request = rx_recv.recv() => request,
+    };
+    if let Some((owner, session)) = request {
+        let _ = CONTEXT.send_value(
+            context::PTYPE_GRPC,
+            owner,
+            session,
+            GrpcResponse::Error(err.clone()),
+        );
+    }
+    drain_recv_requests(fd, rx_recv, err).await;
+}
+
+/// Close admission before draining: every accepted recv gets exactly one reply,
+/// while retained Lua handles immediately reject further requests.
+async fn drain_recv_requests(fd: i64, mut rx_recv: mpsc::Receiver<(ActorId, i64)>, err: String) {
+    rx_recv.close();
+    GRPC_STREAMS.remove(&fd);
     while let Some((owner, session)) = rx_recv.recv().await {
         let _ = CONTEXT.send_value(
             context::PTYPE_GRPC,
@@ -568,20 +589,6 @@ async fn run_recv_failed(fd: i64, mut rx_recv: mpsc::Receiver<(ActorId, i64)>, e
             GrpcResponse::Error(err.clone()),
         );
     }
-    GRPC_STREAMS.remove(&fd);
-}
-
-/// Spawn `run_recv_loop` on the IO runtime, returning its abort handle so
-/// `close()` can tear it down deterministically.
-fn spawn_recv_loop(
-    fd: i64,
-    streaming: Streaming<Bytes>,
-    rx_recv: mpsc::Receiver<(ActorId, i64)>,
-) -> AbortHandle {
-    CONTEXT
-        .io_runtime()
-        .spawn(run_recv_loop(fd, streaming, rx_recv))
-        .abort_handle()
 }
 
 /// `handle:server_stream(path, request_bytes, timeout?, metadata?)` -> session.
@@ -639,17 +646,18 @@ fn conn_server_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
             Ok(resp) => {
                 let fd = next_grpc_fd();
                 let (tx_recv, rx_recv) = mpsc::channel::<(ActorId, i64)>(1);
-                let abort = spawn_recv_loop(fd, resp.into_inner(), rx_recv);
+                let cancel = CancellationToken::new();
                 GRPC_STREAMS.insert(
                     fd,
-                    StreamEntry {
-                        handle: StreamHandle {
-                            tx_recv,
-                            tx_send: None,
-                        },
-                        abort,
+                    StreamHandle {
+                        tx_recv,
+                        tx_send: None,
+                        cancel: cancel.clone(),
                     },
                 );
+                CONTEXT
+                    .io_runtime()
+                    .spawn(run_recv_loop(fd, resp.into_inner(), rx_recv, cancel));
                 let _ = CONTEXT.send_value(
                     context::PTYPE_GRPC,
                     owner,
@@ -753,37 +761,39 @@ fn conn_bidi_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
             }
         };
 
-        let abort = CONTEXT
-            .io_runtime()
-            .spawn(async move {
-                match call_future.await {
-                    Ok(resp) => run_recv_loop(fd, resp.into_inner(), rx_recv).await,
-                    Err(status) => {
-                        run_recv_failed(
-                            fd,
-                            rx_recv,
-                            format!(
-                                "grpc bidi_stream status {}: {}",
-                                status.code() as i32,
-                                status.message()
-                            ),
-                        )
-                        .await
-                    }
-                }
-            })
-            .abort_handle();
-
+        let cancel = CancellationToken::new();
         GRPC_STREAMS.insert(
             fd,
-            StreamEntry {
-                handle: StreamHandle {
-                    tx_recv,
-                    tx_send: Some(tx_send),
-                },
-                abort,
+            StreamHandle {
+                tx_recv,
+                tx_send: Some(tx_send),
+                cancel: cancel.clone(),
             },
         );
+        CONTEXT.io_runtime().spawn(async move {
+            // Closing must also cancel a bidi call still waiting for headers.
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(Status::cancelled("grpc stream: closed")),
+                result = call_future => result,
+            };
+            match result {
+                Ok(resp) => run_recv_loop(fd, resp.into_inner(), rx_recv, cancel).await,
+                Err(status) => {
+                    run_recv_failed(
+                        fd,
+                        rx_recv,
+                        format!(
+                            "grpc bidi_stream status {}: {}",
+                            status.code() as i32,
+                            status.message()
+                        ),
+                        cancel,
+                    )
+                    .await;
+                }
+            }
+        });
         let _ = CONTEXT.send_value(
             context::PTYPE_GRPC,
             owner,
@@ -813,7 +823,7 @@ fn grpc_find_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
                 lreg_null!(),
             ];
             // Store the fd alongside the handle so `close()` can find the entry.
-            let handle = (fd, entry.value().handle.clone());
+            let handle = (fd, entry.value().clone());
             if laux::lua_newuserdata(state, handle, cstr!("grpc_stream_metatable"), l.as_ref())
                 .is_none()
             {
@@ -834,6 +844,9 @@ fn stream_recv(lua: &mut LuaStack<'_>) -> c_int {
         .as_userdata::<StreamUserdata>()
         .expect("invalid grpc stream pointer");
     let ud = unsafe { ud_ptr.as_ref() };
+    if ud.1.cancel.is_cancelled() {
+        return crate::lua_push_error_tuple(state, "grpc stream: closed");
+    }
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -858,6 +871,9 @@ fn stream_send(lua: &mut LuaStack<'_>) -> c_int {
         .as_userdata::<StreamUserdata>()
         .expect("invalid grpc stream pointer");
     let ud = unsafe { ud_ptr.as_ref() };
+    if ud.1.cancel.is_cancelled() {
+        return crate::lua_push_error_tuple(state, "grpc stream: closed");
+    }
 
     let tx = match &ud.1.tx_send {
         Some(tx) => tx,
@@ -890,6 +906,9 @@ fn stream_close_send(lua: &mut LuaStack<'_>) -> c_int {
         .as_userdata::<StreamUserdata>()
         .expect("invalid grpc stream pointer");
     let ud = unsafe { ud_ptr.as_ref() };
+    if ud.1.cancel.is_cancelled() {
+        return crate::lua_push_error_tuple(state, "grpc stream: closed");
+    }
 
     match &ud.1.tx_send {
         Some(tx) => {
@@ -910,9 +929,8 @@ fn stream_close(lua: &mut LuaStack<'_>) -> c_int {
     let ud = unsafe { ud_ptr.as_ref() };
     let fd = ud.0;
 
-    if let Some((_, entry)) = GRPC_STREAMS.remove(&fd) {
-        entry.abort.abort();
-    }
+    ud.1.cancel.cancel();
+    GRPC_STREAMS.remove(&fd);
     laux::lua_push(state, true);
     1
 }

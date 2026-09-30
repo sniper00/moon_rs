@@ -174,9 +174,9 @@ end
 ---@return string? err     Set when the stream errored (not on clean end)
 function Stream:recv()
     local data, err = moon.wait(self.obj:recv())
-    if data == nil then
+    if not data then
         -- nil + no err  => clean end of stream
-        -- nil + err     => stream error
+        -- false + err   => stream error
         return nil, err
     end
     return protobuf.decode(self.resp_type, data)
