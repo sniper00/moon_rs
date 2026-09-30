@@ -1140,10 +1140,13 @@ mod tests {
         let target_id = 0x7100_0001;
         let unique_watcher_id = 0x7100_0002;
         let normal_watcher_id = 0x7100_0003;
+        let pseudo_id = 0x7100_0004;
 
         let (target_tx, _target_rx) = mpsc::unbounded_channel();
         let (unique_watcher_tx, mut unique_watcher_rx) = mpsc::unbounded_channel();
         let (normal_watcher_tx, mut normal_watcher_rx) = mpsc::unbounded_channel();
+        let (pseudo_tx, mut pseudo_rx) = mpsc::unbounded_channel();
+        CONTEXT.register_pseudo_actor(pseudo_id, pseudo_tx);
 
         let mut target = LuaActor::new(&actor_param(target_id, "exit-target", false));
         let mut unique_watcher =
@@ -1191,16 +1194,15 @@ mod tests {
             other => panic!("unexpected service-exit payload: {}", other),
         }
 
-        // A non-unique actor must never receive the service-exit broadcast (this
-        // matches Moon). It may still see unrelated foreign traffic, so assert
-        // specifically that nothing came from `target_id`.
         while let Ok(msg) = normal_watcher_rx.try_recv() {
             assert_ne!(
                 msg.from, target_id,
-                "non-unique watcher should match Moon and skip PTYPE_SYSTEM broadcast"
+                "ordinary services must not receive service-exit notices"
             );
         }
 
+        assert!(pseudo_rx.try_recv().is_err());
+        CONTEXT.actors.remove(&pseudo_id);
         CONTEXT.remove_actor(unique_watcher_id, &unique_watcher.name);
         CONTEXT.remove_actor(normal_watcher_id, &normal_watcher.name);
     }

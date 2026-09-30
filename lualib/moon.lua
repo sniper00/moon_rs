@@ -540,15 +540,23 @@ reg_protocol {
 local system_command = {}
 
 system_command._service_exit = function(sender, what)
+    local waiting = {}
     for k, v in pairs(session_watcher) do
         if v == sender then
+            session_watcher[k] = nil
             local co = session_id_coroutine[k]
             if co then
                 session_id_coroutine[k] = nil
-                ---@diagnostic disable-next-line: param-type-not-match
-                coresume(co, false, what)
-                return
+                waiting[#waiting + 1] = co
             end
+        end
+    end
+    -- Resumed code can create new calls or raise; neither should prevent the
+    -- remaining waiters from receiving the exit notification.
+    for _, co in ipairs(waiting) do
+        local ok, err = pcall(coresume, co, false, what)
+        if not ok then
+            moon.error(err)
         end
     end
 end

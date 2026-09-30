@@ -1,6 +1,25 @@
 local moon = require "moon"
 local conf = ...
 
+if conf.exit_target then
+    moon.dispatch("lua", function()
+        moon.send("lua", conf.main, "accepted")
+        moon.sleep(60000) -- Deliberately leave the accepted call unanswered.
+    end)
+    return
+elseif conf.exit_watcher then
+    moon.dispatch("lua", function()
+        for _ = 1, 2 do
+            moon.async(function()
+                local result, err = moon.call("lua", conf.target, "hold")
+                assert(result == false and type(err) == "string")
+                moon.send("lua", conf.main, "released", conf.unique)
+            end)
+        end
+    end)
+    return
+end
+
 if conf.worker then
     local empty_sends = 0
     moon.dispatch("lua", function(sender, session, ...)
@@ -50,11 +69,39 @@ moon.async(function()
             assert(replacement and replacement ~= 0, "exit did not release name")
             assert(moon.call("lua", replacement, "stop"))
         end
+
+        local accepted, ordinary_released, unique_released = 0, 0, 0
+        moon.dispatch("lua", function(_, _, command, unique)
+            if command == "accepted" then
+                accepted = accepted + 1
+            elseif unique then
+                unique_released = unique_released + 1
+            else
+                ordinary_released = ordinary_released + 1
+            end
+        end)
+        local target = moon.new_service({source = source, exit_target = true, main = moon.id})
+        assert(target and target ~= 0)
+        local watchers = {}
+        for _, unique in ipairs({false, true}) do
+            local watcher = moon.new_service({
+                name = "exit_watcher_" .. tostring(unique), source = source, unique = unique,
+                exit_watcher = true, main = moon.id, target = target,
+            })
+            assert(watcher and watcher ~= 0)
+            watchers[#watchers + 1] = watcher
+            moon.send("lua", watcher, "start")
+        end
+        while accepted < 4 do moon.sleep(1) end
+        moon.kill(target)
+        while unique_released < 2 do moon.sleep(1) end
+        assert(ordinary_released == 0 and unique_released == 2)
+        for _, watcher in ipairs(watchers) do moon.kill(watcher) end
     end, debug.traceback)
     if not ok then
         moon.error(err)
     else
-        print("service regression passed: name ownership and empty messages")
+        print("service regression passed: name ownership, empty messages and unique service-exit waiters")
     end
     moon.exit(ok and 0 or 1)
 end)
