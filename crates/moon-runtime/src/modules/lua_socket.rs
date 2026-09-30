@@ -1207,15 +1207,8 @@ pub unsafe extern "C-unwind" fn decode_socket_event_message(
     unsafe {
         let body = (*m).take_body();
         match body {
-            MessageBody::Boxed(_, mut boxed) => {
-                let ptr = boxed.into_raw();
-                if ptr.is_null() {
-                    return crate::lua_push_error_tuple(
-                        state,
-                        "boxed message payload already consumed",
-                    );
-                }
-                push_socket_event(state, *Box::from_raw(ptr as *mut SocketEvent))
+            MessageBody::Boxed(_, boxed) => {
+                push_socket_event(state, boxed.into_inner::<SocketEvent>())
             }
             MessageBody::Buffer(_, buf) => {
                 laux::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);

@@ -23,18 +23,16 @@ pub(crate) unsafe extern "C-unwind" fn default_decode(_state: LuaState, m: *mut 
 ///
 /// Only the feature-gated DB/HTTP modules (httpc, httpd, pg, redis, sqlx,
 /// mongodb, websocket) call this, so it is unused when none are enabled.
+///
+/// # Safety
+/// m must point to an exclusively accessible, live Message, and T must match
+/// the type originally stored in its Boxed payload.
 #[allow(dead_code)]
-pub unsafe fn take_boxed<T: Send>(m: *mut Message) -> Result<T, String> {
+pub unsafe fn take_boxed<T: Send + 'static>(m: *mut Message) -> Result<T, String> {
     unsafe {
         let body = (*m).take_body();
         match body {
-            MessageBody::Boxed(_, mut boxed) => {
-                let ptr = boxed.into_raw();
-                if ptr.is_null() {
-                    return Err("boxed message payload already consumed".to_string());
-                }
-                Ok(*Box::from_raw(ptr as *mut T))
-            }
+            MessageBody::Boxed(_, boxed) => Ok(boxed.into_inner::<T>()),
             other => {
                 let ptype = (*m).ptype();
                 (*m).data = other;

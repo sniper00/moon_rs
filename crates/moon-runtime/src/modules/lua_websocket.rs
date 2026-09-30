@@ -858,14 +858,14 @@ mod tests {
                     .try_recv()
                     .expect("waiting reader must be released");
                 assert_eq!(message.session, session);
-                let context::MessageBody::Boxed(_, mut value) = message.data else {
+                let context::MessageBody::Boxed(_, value) = message.data else {
                     panic!("expected websocket response")
                 };
-                let response = unsafe { Box::from_raw(value.into_raw() as *mut WsResponse) };
+                let response = unsafe { value.into_inner::<WsResponse>() };
                 if mode == 3 && session == 1 {
-                    assert!(matches!(*response, WsResponse::Read(Message::Close(_))));
+                    assert!(matches!(response, WsResponse::Read(Message::Close(_))));
                 } else {
-                    assert!(matches!(*response, WsResponse::Error(_)));
+                    assert!(matches!(response, WsResponse::Error(_)));
                 }
             }
             assert!(responses.try_recv().is_err());

@@ -4,6 +4,8 @@ use lazy_static::lazy_static;
 use std::{
     collections::BTreeSet,
     ffi::c_void,
+    mem::ManuallyDrop,
+    ptr::NonNull,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{
@@ -86,54 +88,73 @@ lazy_static! {
     pub static ref LOGGER: Logger = Logger::new();
 }
 
-/// Type-erased heap value with automatic cleanup on drop.
-///
-/// When a `Message` carrying a `BoxedValue` is dropped without being decoded
-/// (e.g. send failure to a dead actor), the destructor runs automatically,
-/// preventing memory leaks.
-pub struct BoxedValue {
-    ptr: *mut (),
-    drop_fn: unsafe fn(*mut ()),
+// Both repr(C) structs keep the destructor at the allocation's start while
+// allowing Rust to insert the padding required by T's alignment.
+#[repr(C)]
+struct BoxedHeader {
+    drop_fn: unsafe fn(NonNull<BoxedHeader>),
 }
 
+#[repr(C)]
+struct BoxedPayload<T> {
+    header: BoxedHeader,
+    value: T,
+}
+
+/// Type-erased owner of one allocation containing a destructor and its value.
+/// Undecoded messages free their payload automatically, including failed sends.
+pub struct BoxedValue {
+    ptr: NonNull<BoxedHeader>,
+}
+
+// SAFETY: new() accepts only Send + 'static values. This owner is neither cloneable nor
+// Sync, and moving it transfers exclusive ownership of the allocation.
 unsafe impl Send for BoxedValue {}
 
-unsafe fn typed_drop<T>(ptr: *mut ()) {
-    unsafe {
-        let _ = Box::from_raw(ptr as *mut T);
-    }
+unsafe fn typed_drop<T>(ptr: NonNull<BoxedHeader>) {
+    // SAFETY: this function is stored only in allocations of BoxedPayload<T>.
+    unsafe { drop(Box::from_raw(ptr.cast::<BoxedPayload<T>>().as_ptr())) }
 }
 
 impl BoxedValue {
-    pub fn new<T: Send>(value: T) -> Self {
-        let ptr = Box::into_raw(Box::new(value)) as *mut ();
+    pub fn new<T: Send + 'static>(value: T) -> Self {
+        let payload = Box::new(BoxedPayload {
+            header: BoxedHeader {
+                drop_fn: typed_drop::<T>,
+            },
+            value,
+        });
         Self {
-            ptr,
-            drop_fn: typed_drop::<T>,
+            ptr: NonNull::from(Box::leak(payload)).cast(),
         }
     }
 
-    /// Transfer ownership to the caller. After this call the destructor
-    /// becomes a no-op — the caller must eventually `Box::from_raw` the pointer.
-    pub fn into_raw(&mut self) -> *mut () {
-        let ptr = self.ptr;
-        self.ptr = std::ptr::null_mut();
-        ptr
+    /// Move out the value and free its allocation without dropping the value.
+    ///
+    /// # Safety
+    /// T must be exactly the type passed to new(). Protocol decoders are
+    /// responsible for selecting the matching payload type.
+    pub unsafe fn into_inner<T: Send + 'static>(self) -> T {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: the caller guarantees the original allocation type. Taking
+        // ownership consumes self, so its erased destructor cannot run again.
+        let payload = unsafe { Box::from_raw(this.ptr.cast::<BoxedPayload<T>>().as_ptr()) };
+        let BoxedPayload { value, .. } = *payload;
+        value
     }
 }
 
 impl Drop for BoxedValue {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe { (self.drop_fn)(self.ptr) }
-        }
+        // SAFETY: ptr owns a live allocation whose header holds its destructor.
+        unsafe { (self.ptr.as_ref().drop_fn)(self.ptr) }
     }
 }
 
 pub enum MessageBody {
     ISize(u8, isize),
     Buffer(u8, Box<Buffer>),
-    Boxed(u8, Box<BoxedValue>),
+    Boxed(u8, BoxedValue),
     None(u8),
 }
 
@@ -444,8 +465,8 @@ impl LuaActorServer {
         });
     }
 
-    /// Broadcast a PTYPE_SYSTEM message to all unique actors (same scope as
-    /// `_service_exit`). Used by subsystems like cluster to deliver events.
+    /// Broadcast a PTYPE_SYSTEM message to all unique actors.
+    /// Used by subsystems like cluster to deliver events.
     pub fn broadcast_system(&self, sender: ActorId, payload: &str) {
         self.unique_actors.iter().for_each(|v| {
             let _ = self.send(Message {
@@ -554,7 +575,7 @@ impl LuaActorServer {
     }
 
     #[must_use]
-    pub fn send_value<T: Send>(
+    pub fn send_value<T: Send + 'static>(
         &self,
         protocol_type: u8,
         owner: ActorId,
@@ -565,7 +586,7 @@ impl LuaActorServer {
             from: 0,
             to: owner,
             session,
-            data: MessageBody::Boxed(protocol_type, Box::new(BoxedValue::new(res))),
+            data: MessageBody::Boxed(protocol_type, BoxedValue::new(res)),
         })
     }
 
@@ -969,6 +990,84 @@ pub struct LuaActorParam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn message_layout_stays_compact() {
+        assert_eq!(std::mem::size_of::<BoxedValue>(), 8);
+        assert_eq!(std::mem::size_of::<MessageBody>(), 16);
+        assert_eq!(std::mem::size_of::<Message>(), 32);
+    }
+
+    #[repr(align(64))]
+    struct TrackedPayload {
+        drops: Arc<AtomicUsize>,
+        text: String,
+    }
+
+    impl Drop for TrackedPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn boxed_payload_drop_and_decode_preserve_ownership() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload = || TrackedPayload {
+            drops: drops.clone(),
+            text: "aligned payload".to_string(),
+        };
+
+        // Dropping a failed delivery must destroy its otherwise undecoded value.
+        let failed = CONTEXT.send_value(PTYPE_PG, 0, 1, payload());
+        assert!(failed.is_some());
+        drop(failed);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+        // The erased owner can cross threads, even for an over-aligned T.
+        let boxed = BoxedValue::new(payload());
+        assert_eq!(boxed.ptr.as_ptr() as usize % 64, 0);
+        std::thread::spawn(move || drop(boxed)).join().unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+
+        let mut message = Message {
+            from: 0,
+            to: 0,
+            session: 1,
+            data: MessageBody::Boxed(PTYPE_PG, BoxedValue::new(payload())),
+        };
+        let value =
+            unsafe { crate::message_decode::take_boxed::<TrackedPayload>(&mut message).unwrap() };
+        assert_eq!(value.text, "aligned payload");
+        assert!(matches!(message.data, MessageBody::None(0)));
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert!(
+            unsafe { crate::message_decode::take_boxed::<TrackedPayload>(&mut message) }.is_err()
+        );
+        drop(message);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        drop(value);
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn boxed_zero_sized_payload_is_dropped_once() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct ZeroSized;
+        impl Drop for ZeroSized {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        assert_eq!(std::mem::size_of::<ZeroSized>(), 0);
+        drop(BoxedValue::new(ZeroSized));
+        assert_eq!(DROPS.load(Ordering::Relaxed), 1);
+        let value = unsafe { BoxedValue::new(ZeroSized).into_inner::<ZeroSized>() };
+        assert_eq!(DROPS.load(Ordering::Relaxed), 1);
+        drop(value);
+        assert_eq!(DROPS.load(Ordering::Relaxed), 2);
+    }
 
     fn actor_param(id: ActorId, name: &str, unique: bool) -> LuaActorParam {
         LuaActorParam {
