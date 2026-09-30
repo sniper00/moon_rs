@@ -137,77 +137,88 @@ where
         for &(index, col_name, db_type) in &col_info {
             match row.try_get_raw(index) {
                 Ok(value) if value.is_null() => {}
-                Ok(value) => match db_type {
-                    DbType::Null => {}
-                    DbType::Bool => {
-                        row_table.insert(
-                            col_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(false),
-                        );
-                    }
-                    DbType::Integer => {
-                        row_table.insert(
-                            col_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(0i64),
-                        );
-                    }
-                    DbType::Float32 => {
-                        let v: f32 = sqlx::decode::Decode::decode(value).unwrap_or(0.0);
-                        row_table.insert(col_name, v as f64);
-                    }
-                    DbType::Float64 => {
-                        row_table.insert(
-                            col_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(0.0f64),
-                        );
-                    }
-                    DbType::Text => {
-                        let v: &str = sqlx::decode::Decode::decode(value).unwrap_or("");
-                        row_table.insert(col_name, v);
-                    }
-                    DbType::Json => {
-                        if let Ok(v) = <serde_json::Value as sqlx::Decode<DB>>::decode(value) {
-                            let s = v.to_string();
-                            row_table.insert(col_name, s.as_str());
+                Ok(value) => {
+                    // SQLite expression columns can have NULL metadata even
+                    // when a row contains a value. Resolve those types per row.
+                    let db_type = if matches!(db_type, DbType::Null | DbType::Unknown) {
+                        DbType::from_name(value.type_info().name())
+                    } else {
+                        db_type
+                    };
+                    match db_type {
+                        DbType::Null => {}
+                        DbType::Bool => {
+                            row_table.insert(
+                                col_name,
+                                sqlx::decode::Decode::decode(value).unwrap_or(false),
+                            );
+                        }
+                        DbType::Integer => {
+                            row_table.insert(
+                                col_name,
+                                sqlx::decode::Decode::decode(value).unwrap_or(0i64),
+                            );
+                        }
+                        DbType::Float32 => {
+                            let v: f32 = sqlx::decode::Decode::decode(value).unwrap_or(0.0);
+                            row_table.insert(col_name, v as f64);
+                        }
+                        DbType::Float64 => {
+                            row_table.insert(
+                                col_name,
+                                sqlx::decode::Decode::decode(value).unwrap_or(0.0f64),
+                            );
+                        }
+                        DbType::Text => {
+                            let v: &str = sqlx::decode::Decode::decode(value).unwrap_or("");
+                            row_table.insert(col_name, v);
+                        }
+                        DbType::Json => {
+                            if let Ok(v) = <serde_json::Value as sqlx::Decode<DB>>::decode(value) {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Date => {
+                            if let Ok(v) = <chrono::NaiveDate as sqlx::Decode<DB>>::decode(value) {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Time => {
+                            if let Ok(v) = <chrono::NaiveTime as sqlx::Decode<DB>>::decode(value) {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Timestamp => {
+                            if let Ok(v) =
+                                <chrono::NaiveDateTime as sqlx::Decode<DB>>::decode(value)
+                            {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::TimestampTz => {
+                            if let Ok(v) =
+                                <chrono::DateTime<chrono::Utc> as sqlx::Decode<DB>>::decode(value)
+                            {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Uuid => {
+                            if let Ok(v) = <uuid::Uuid as sqlx::Decode<DB>>::decode(value) {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Unknown => {
+                            let v: &[u8] = sqlx::decode::Decode::decode(value).unwrap_or(b"");
+                            row_table.insert(col_name, v);
                         }
                     }
-                    DbType::Date => {
-                        if let Ok(v) = <chrono::NaiveDate as sqlx::Decode<DB>>::decode(value) {
-                            let s = v.to_string();
-                            row_table.insert(col_name, s.as_str());
-                        }
-                    }
-                    DbType::Time => {
-                        if let Ok(v) = <chrono::NaiveTime as sqlx::Decode<DB>>::decode(value) {
-                            let s = v.to_string();
-                            row_table.insert(col_name, s.as_str());
-                        }
-                    }
-                    DbType::Timestamp => {
-                        if let Ok(v) = <chrono::NaiveDateTime as sqlx::Decode<DB>>::decode(value) {
-                            let s = v.to_string();
-                            row_table.insert(col_name, s.as_str());
-                        }
-                    }
-                    DbType::TimestampTz => {
-                        if let Ok(v) =
-                            <chrono::DateTime<chrono::Utc> as sqlx::Decode<DB>>::decode(value)
-                        {
-                            let s = v.to_string();
-                            row_table.insert(col_name, s.as_str());
-                        }
-                    }
-                    DbType::Uuid => {
-                        if let Ok(v) = <uuid::Uuid as sqlx::Decode<DB>>::decode(value) {
-                            let s = v.to_string();
-                            row_table.insert(col_name, s.as_str());
-                        }
-                    }
-                    DbType::Unknown => {
-                        let v: &[u8] = sqlx::decode::Decode::decode(value).unwrap_or(b"");
-                        row_table.insert(col_name, v);
-                    }
-                },
+                }
                 Err(_) => {}
             }
         }
