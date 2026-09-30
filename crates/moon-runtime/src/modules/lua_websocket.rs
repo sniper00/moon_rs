@@ -83,7 +83,7 @@ where
 }
 
 async fn handle_write<S>(
-    mut writer: futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
+    writer: &mut futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
     mut rx: mpsc::Receiver<WsRequest>,
 ) -> Result<(), String>
 where
@@ -129,41 +129,53 @@ async fn run_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (writer, mut reader) = stream.split();
+    let (mut writer, mut reader) = stream.split();
+    let mut peer_closed = false;
 
-    let write = handle_write(writer, rx_writer);
-    tokio::pin!(write);
-    loop {
-        let op = tokio::select! {
-            _ = &mut write => break,
-            op = rx_reader.recv() => match op {
-                Some(op) => op,
-                None => break,
-            },
-        };
-        if let WsRequest::Read(owner, session, read_timeout) = op {
-            let result = tokio::select! {
-                result = &mut write => Err(result.err().unwrap_or_else(|| "closed".to_string())),
-                result = handle_read(read_timeout, &mut reader) => result,
+    {
+        let write = handle_write(&mut writer, rx_writer);
+        tokio::pin!(write);
+        loop {
+            let op = tokio::select! {
+                _ = &mut write => break,
+                op = rx_reader.recv() => match op {
+                    Some(op) => op,
+                    None => break,
+                },
             };
-            let closed = match &result {
-                Ok(message) => message.is_close(),
-                Err(_) => true,
-            };
-            let response = match result {
-                Ok(message) => WsResponse::Read(message),
-                Err(err) => WsResponse::Error(err),
-            };
-            let _ = CONTEXT.send_value(context::PTYPE_WEBSOCKET, owner, session, response);
-            if closed {
-                break;
+            if let WsRequest::Read(owner, session, read_timeout) = op {
+                let result = tokio::select! {
+                    result = &mut write => Err(result.err().unwrap_or_else(|| "closed".to_string())),
+                    result = handle_read(read_timeout, &mut reader) => result,
+                };
+                let closed = match &result {
+                    Ok(message) => {
+                        peer_closed = message.is_close();
+                        peer_closed
+                    }
+                    Err(_) => true,
+                };
+                let response = match result {
+                    Ok(message) => WsResponse::Read(message),
+                    Err(err) => WsResponse::Error(err),
+                };
+                let _ = CONTEXT.send_value(context::PTYPE_WEBSOCKET, owner, session, response);
+                if closed {
+                    break;
+                }
             }
         }
     }
 
+    if peer_closed {
+        // Reading Close queues Tungstenite's automatic reply. Flush it before
+        // dropping the socket, with a bound for peers that stop reading.
+        let _ = timeout(Duration::from_secs(1), writer.flush()).await;
+    }
+
     WS_NET.remove(&fd);
     // Stop accepting reads, then release callers already queued behind the
-    // active read. The writer future is dropped together with the connection.
+    // active read.
     rx_reader.close();
     while let Some(op) = rx_reader.recv().await {
         if let WsRequest::Read(owner, session, _) = op {
@@ -775,6 +787,40 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::Role;
 
     #[tokio::test]
+    async fn peer_close_is_acknowledged_before_disconnect() {
+        for (local_role, peer_role) in [(Role::Server, Role::Client), (Role::Client, Role::Server)]
+        {
+            let (socket, peer) = tokio::io::duplex(4096);
+            let stream = WebSocketStream::from_raw_socket(socket, local_role, None).await;
+            let mut peer = WebSocketStream::from_raw_socket(peer, peer_role, None).await;
+            let (fd, reads, writes) = setup_ws_connection();
+            WS_NET
+                .get(&fd)
+                .unwrap()
+                .tx_reader
+                .try_send(WsRequest::Read(0, 1, 0))
+                .unwrap();
+            let task = tokio::spawn(run_connection(stream, fd, reads, writes));
+            let frame = Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "done".into(),
+            });
+            peer.send(Message::Close(frame.clone())).await.unwrap();
+            let reply = timeout(Duration::from_secs(2), peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply, Message::Close(frame));
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!WS_NET.contains_key(&fd));
+        }
+    }
+
+    #[tokio::test]
     async fn local_close_removes_idle_connection() {
         let (socket, _peer) = tokio::io::duplex(4096);
         let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
@@ -854,9 +900,15 @@ mod tests {
                 .unwrap();
             assert!(!WS_NET.contains_key(&fd));
             for session in [1, 2] {
-                let message = responses
-                    .try_recv()
-                    .expect("waiting reader must be released");
+                let message = loop {
+                    let message = responses
+                        .try_recv()
+                        .expect("waiting reader must be released");
+                    // Other tests can broadcast service exits through CONTEXT.
+                    if message.ptype() == context::PTYPE_WEBSOCKET {
+                        break message;
+                    }
+                };
                 assert_eq!(message.session, session);
                 let context::MessageBody::Boxed(_, value) = message.data else {
                     panic!("expected websocket response")
@@ -868,7 +920,9 @@ mod tests {
                     assert!(matches!(response, WsResponse::Error(_)));
                 }
             }
-            assert!(responses.try_recv().is_err());
+            while let Ok(message) = responses.try_recv() {
+                assert_ne!(message.ptype(), context::PTYPE_WEBSOCKET);
+            }
             CONTEXT.remove_actor(owner, "");
         }
     }
