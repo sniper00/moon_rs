@@ -1,5 +1,7 @@
 use crate::lua_json::{JsonOptions, encode_table};
-use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests, try_send_counted};
+use crate::request_pool::{
+    PendingCounter, QueuedRequest, dispatch_request, drain_queued_requests, notify_shutdown,
+};
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
 use lazy_static::lazy_static;
@@ -492,7 +494,6 @@ fn is_transient_sqlx_error(err: &sqlx::Error) -> bool {
 async fn handle_result(
     database_url: &str,
     failed_times: &mut i32,
-    counter: &PendingCounter,
     protocol_type: u8,
     owner: ActorId,
     session: i64,
@@ -500,21 +501,21 @@ async fn handle_result(
 ) -> bool {
     match res {
         Ok(rows) => {
-            let _ = CONTEXT.send_value(protocol_type, owner, session, rows);
+            if session != 0 {
+                let _ = CONTEXT.send_value(protocol_type, owner, session, rows);
+            }
             if *failed_times > 0 {
                 log::info!(
                     "Database '{}' recover from error. Retry success.",
                     database_url
                 );
             }
-            counter.dec();
             false
         }
         Err(err) => {
             if session != 0 {
                 let _ =
                     CONTEXT.send_value(protocol_type, owner, session, DatabaseResponse::Error(err));
-                counter.dec();
                 false
             } else {
                 // Fire-and-forget (session == 0): there is no caller to receive
@@ -528,7 +529,6 @@ async fn handle_result(
                         database_url,
                         err
                     );
-                    counter.dec();
                     return false;
                 }
                 if *failed_times > 0 {
@@ -555,13 +555,14 @@ async fn database_handler(
     counter: PendingCounter,
 ) {
     while let Some(op) = rx.recv().await {
+        // Keep retries and the full streaming lifetime in the pending count.
+        let _pending = op.owner_session().map(|_| counter.finish_on_drop());
         let mut failed_times = 0;
         match &op {
             DatabaseRequest::Query(owner, session, query_op) => {
                 while handle_result(
                     database_url,
                     &mut failed_times,
-                    &counter,
                     protocol_type,
                     *owner,
                     *session,
@@ -574,7 +575,6 @@ async fn database_handler(
                 while handle_result(
                     database_url,
                     &mut failed_times,
-                    &counter,
                     protocol_type,
                     *owner,
                     *session,
@@ -661,11 +661,6 @@ async fn database_handler(
                     DatabasePool::Postgres(p) => do_stream!(p, PgBatch),
                     DatabasePool::Sqlite(p) => do_stream!(p, SqliteBatch),
                 }
-                // The stream is fully drained / errored / cancelled above; the
-                // operation only stops being in-flight now, so `stats()` reflects
-                // an active stream for its whole lifetime (decrement at the end,
-                // not at entry).
-                counter.dec();
             }
             DatabaseRequest::Close() => {
                 drain_queued_requests(&mut rx, &counter, |owner, session| {
@@ -675,7 +670,8 @@ async fn database_handler(
                         -session,
                         "sqlx connection closed".to_string(),
                     );
-                });
+                })
+                .await;
                 break;
             }
         }
@@ -735,7 +731,7 @@ fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
                         "sqlx '{}' reconnected with the same name; closing the previous connection",
                         name
                     );
-                    let _ = old.tx.send(DatabaseRequest::Close()).await;
+                    notify_shutdown(&old.tx, DatabaseRequest::Close());
                 }
                 let _ =
                     CONTEXT.send_value(protocol_type, owner, session, DatabaseResponse::Connect);
@@ -852,24 +848,12 @@ fn query_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
         unsafe { (*actor).next_session() }
     };
 
-    match try_send_counted(
+    Ok(dispatch_request(
+        state,
         &conn.tx,
         &conn.counter,
         DatabaseRequest::Query(owner, session, DatabaseQuery { sql, binds: params }),
-    ) {
-        Ok(_) => {
-            if forget {
-                laux::lua_push(state, true);
-            } else {
-                laux::lua_push(state, session);
-            }
-            Ok(1)
-        }
-        Err(err) => {
-            push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
-            Ok(1)
-        }
-    }
+    ))
 }
 
 fn query_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -918,7 +902,8 @@ fn query_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
 
-    match try_send_counted(
+    Ok(dispatch_request(
+        state,
         &conn.tx,
         &conn.counter,
         DatabaseRequest::QueryStream(
@@ -927,16 +912,7 @@ fn query_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
             DatabaseQuery { sql, binds: params },
             batch_size,
         ),
-    ) {
-        Ok(_) => {
-            laux::lua_push(state, session);
-            Ok(1)
-        }
-        Err(err) => {
-            push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
-            Ok(1)
-        }
-    }
+    ))
 }
 
 fn push_transaction_query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -1010,7 +986,8 @@ fn transaction_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, Strin
         unsafe { (*actor).next_session() }
     };
 
-    match try_send_counted(
+    Ok(dispatch_request(
+        state,
         &conn.tx,
         &conn.counter,
         DatabaseRequest::Transaction(
@@ -1018,20 +995,7 @@ fn transaction_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, Strin
             session,
             std::mem::take(&mut unsafe { queries_ptr.as_mut() }.queries),
         ),
-    ) {
-        Ok(_) => {
-            if forget {
-                laux::lua_push(state, true);
-            } else {
-                laux::lua_push(state, session);
-            }
-            Ok(1)
-        }
-        Err(err) => {
-            push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
-            Ok(1)
-        }
-    }
+    ))
 }
 
 fn close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -1042,16 +1006,12 @@ fn close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         .ok_or_else(|| "invalid database connection pointer".to_string())?;
     let conn = unsafe { conn_ptr.as_ref() };
 
-    match conn.tx.try_send(DatabaseRequest::Close()) {
-        Ok(_) => {
-            laux::lua_push(state, true);
-            Ok(1)
-        }
-        Err(err) => {
-            push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
-            Ok(1)
-        }
-    }
+    Ok(dispatch_request(
+        state,
+        &conn.tx,
+        &conn.counter,
+        DatabaseRequest::Close(),
+    ))
 }
 
 fn find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {

@@ -906,10 +906,12 @@ async fn worker_loop(
                         session,
                         RedisResponse::Error("redis connection closed".to_string()),
                     );
-                });
+                })
+                .await;
                 break;
             }
         };
+        let _pending = counter.finish_on_drop();
         let mut failed_times = 0;
         loop {
             if conn.is_none() {
@@ -923,7 +925,6 @@ async fn worker_loop(
                                 req.session,
                                 RedisResponse::Error(e),
                             );
-                            counter.dec();
                             break;
                         } else {
                             if failed_times == 0 {
@@ -960,7 +961,6 @@ async fn worker_loop(
                     }
                 };
                 let _ = CONTEXT.send_value(context::PTYPE_REDIS, req.owner, req.session, response);
-                counter.dec();
                 break;
             } else {
                 let result: Result<(), String> = if count == 1 {
@@ -987,7 +987,6 @@ async fn worker_loop(
                 };
                 match result {
                     Ok(()) => {
-                        counter.dec();
                         break;
                     }
                     Err(e) => {
@@ -1153,9 +1152,7 @@ fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
                 "redis '{}' reconnected with the same name; shutting down the previous pool",
                 old.inner.name()
             );
-            for w in old.inner.workers() {
-                let _ = w.tx().send(RedisMessage::Shutdown).await;
-            }
+            old.inner.notify_shutdown(|| RedisMessage::Shutdown);
         }
         let _ = CONTEXT.send_value(
             context::PTYPE_REDIS,
@@ -1358,12 +1355,7 @@ fn close(lua: &mut LuaStack<'_>) -> c_int {
     // Signal every worker to finish any queued requests and then exit, so its
     // task ends and the TCP connection is dropped. Removing the registry entry
     // alone is not enough because the Lua handle still holds a pool `Arc`.
-    for worker in pool.inner.workers() {
-        let tx = worker.tx().clone();
-        CONTEXT.io_runtime().spawn(async move {
-            let _ = tx.send(RedisMessage::Shutdown).await;
-        });
-    }
+    pool.inner.notify_shutdown(|| RedisMessage::Shutdown);
     laux::lua_push(state, true);
     1
 }

@@ -4,8 +4,8 @@
 //! configurations — allow dead code module-wide rather than annotating each.
 #![allow(dead_code)]
 
-use moon_base::laux::{LuaState, LuaTable};
-use moon_runtime::context::ActorId;
+use moon_base::laux::{self, LuaState, LuaTable};
+use moon_runtime::context::{ActorId, CONTEXT};
 use std::sync::{
     Arc,
     atomic::{AtomicI64, AtomicUsize, Ordering},
@@ -73,6 +73,12 @@ impl PendingCounter {
         self.inner.pending.fetch_sub(1, Ordering::Release);
     }
 
+    /// Track one already-counted request until processing (including retries
+    /// and streaming) ends. Dropping the worker future also releases its count.
+    pub(crate) fn finish_on_drop(&self) -> PendingRequest<'_> {
+        PendingRequest(self)
+    }
+
     pub(crate) fn load(&self) -> i64 {
         self.inner.pending.load(Ordering::Acquire)
     }
@@ -89,6 +95,15 @@ impl PendingCounter {
 
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+#[must_use]
+pub(crate) struct PendingRequest<'a>(&'a PendingCounter);
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.0.dec();
     }
 }
 
@@ -111,6 +126,45 @@ pub(crate) fn try_send_counted<M>(
     counter.inc();
     permit.send(msg);
     Ok(())
+}
+
+/// Shared SQLx/MongoDB Lua contract: session for a waiting request, true for
+/// fire-and-forget/control messages, or { kind = "ERROR", message = ... }.
+pub(crate) fn dispatch_request<M: QueuedRequest>(
+    state: LuaState,
+    tx: &mpsc::Sender<M>,
+    counter: &PendingCounter,
+    msg: M,
+) -> i32 {
+    let owner_session = msg.owner_session();
+    let result = if owner_session.is_some() {
+        try_send_counted(tx, counter, msg)
+    } else {
+        tx.try_send(msg)
+    };
+    match result {
+        Ok(()) => match owner_session {
+            Some((_, session)) if session != 0 => laux::lua_push(state, session),
+            _ => laux::lua_push(state, true),
+        },
+        Err(err) => {
+            LuaTable::new(state, 0, 2)
+                .insert("kind", "ERROR")
+                .insert("message", err.to_string());
+        }
+    }
+    1
+}
+
+/// Best-effort shutdown notification without blocking the caller on a full
+/// queue. Control messages never contribute to request counters.
+pub(crate) fn notify_shutdown<M: Send + 'static>(tx: &mpsc::Sender<M>, msg: M) {
+    if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(msg) {
+        let tx = tx.clone();
+        CONTEXT.io_runtime().spawn(async move {
+            let _ = tx.send(msg).await;
+        });
+    }
 }
 
 /// Build a per-connection stats table and leave it on top of the Lua stack.
@@ -137,7 +191,7 @@ pub(crate) trait QueuedRequest {
     fn owner_session(&self) -> Option<(ActorId, i64)>;
 }
 
-pub(crate) fn drain_queued_requests<M, F>(
+pub(crate) async fn drain_queued_requests<M, F>(
     rx: &mut mpsc::Receiver<M>,
     counter: &PendingCounter,
     mut fail_waiting: F,
@@ -145,12 +199,15 @@ pub(crate) fn drain_queued_requests<M, F>(
     M: QueuedRequest,
     F: FnMut(ActorId, i64),
 {
-    while let Ok(queued) = rx.try_recv() {
+    // Closing rejects new reservations. recv() also waits for permits issued
+    // before close, so a concurrent accepted request cannot lose its reply.
+    rx.close();
+    while let Some(queued) = rx.recv().await {
         if let Some((owner, session)) = queued.owner_session() {
+            let _pending = counter.finish_on_drop();
             if session != 0 {
                 fail_waiting(owner, session);
             }
-            counter.dec();
         }
     }
 }
@@ -163,10 +220,6 @@ pub(crate) struct WorkerHandle<M> {
 impl<M> WorkerHandle<M> {
     pub(crate) fn new(tx: mpsc::Sender<M>, counter: PendingCounter) -> Self {
         Self { tx, counter }
-    }
-
-    pub(crate) fn tx(&self) -> &mpsc::Sender<M> {
-        &self.tx
     }
 
     pub(crate) fn counter(&self) -> &PendingCounter {
@@ -213,6 +266,15 @@ impl<M> WorkerSet<M> {
         }
     }
 
+    pub(crate) fn notify_shutdown(&self, make_message: impl Fn() -> M)
+    where
+        M: Send + 'static,
+    {
+        for worker in &self.workers {
+            notify_shutdown(&worker.tx, make_message());
+        }
+    }
+
     pub(crate) fn pending(&self) -> i64 {
         self.workers.iter().map(|w| w.counter.load()).sum()
     }
@@ -254,6 +316,150 @@ mod tests {
                 TestMessage::Shutdown => None,
             }
         }
+    }
+
+    #[test]
+    fn lua_dispatch_preserves_results_and_counts_only_requests() {
+        let state = laux::LuaState::new(unsafe { moon_base::ffi::luaL_newstate() }).unwrap();
+        let _owner = laux::LuaGlobalState::new(state);
+        let mut lua = unsafe { laux::LuaStack::from_raw(state) };
+        let (tx, mut rx) = mpsc::channel(1);
+        let counter = PendingCounter::new();
+        for session in [17, 0] {
+            lua.set_top(0);
+            assert_eq!(
+                dispatch_request(
+                    state,
+                    &tx,
+                    &counter,
+                    TestMessage::Request(TestRequest { owner: 1, session })
+                ),
+                1
+            );
+            if session == 0 {
+                assert!(lua.get::<bool>(-1).unwrap());
+            } else {
+                assert_eq!(lua.get::<i64>(-1).unwrap(), session);
+            }
+            assert_eq!(counter.load(), 1);
+            assert!(matches!(rx.try_recv(), Ok(TestMessage::Request(_))));
+            drop(counter.finish_on_drop());
+        }
+        lua.set_top(0);
+        dispatch_request(state, &tx, &counter, TestMessage::Shutdown);
+        assert!(lua.get::<bool>(-1).unwrap());
+        assert_eq!((counter.load(), counter.total()), (0, 2));
+
+        // A full queue must preserve the existing error table and counters.
+        lua.set_top(0);
+        dispatch_request(
+            state,
+            &tx,
+            &counter,
+            TestMessage::Request(TestRequest {
+                owner: 1,
+                session: 18,
+            }),
+        );
+        assert_eq!(
+            lua.opt_field::<String>(-1, "kind").as_deref(),
+            Some("ERROR")
+        );
+        assert!(
+            lua.opt_field::<String>(-1, "message")
+                .unwrap()
+                .contains("no available capacity")
+        );
+        assert_eq!((counter.load(), counter.total()), (0, 2));
+        drop(rx);
+        lua.set_top(0);
+        dispatch_request(state, &tx, &counter, TestMessage::Shutdown);
+        assert_eq!(
+            lua.opt_field::<String>(-1, "kind").as_deref(),
+            Some("ERROR")
+        );
+        assert!(
+            lua.opt_field::<String>(-1, "message")
+                .unwrap()
+                .contains("closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_processing_releases_its_pending_count() {
+        let counter = PendingCounter::with_value(1);
+        let worker_counter = counter.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _pending = worker_counter.finish_on_drop();
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+        assert_eq!(counter.load(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!((counter.load(), counter.total()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaches_idle_workers_while_another_queue_is_full() {
+        let (tx1, mut rx1) = mpsc::channel(1);
+        let (tx2, mut rx2) = mpsc::channel(1);
+        let pool = WorkerSet::new(
+            "shutdown".into(),
+            vec![
+                WorkerHandle::new(tx1, PendingCounter::new()),
+                WorkerHandle::new(tx2, PendingCounter::new()),
+            ],
+        );
+        pool.dispatch(TestMessage::Request(TestRequest {
+            owner: 1,
+            session: 1,
+        }))
+        .unwrap();
+        pool.notify_shutdown(|| TestMessage::Shutdown);
+        assert!(matches!(rx2.try_recv(), Ok(TestMessage::Shutdown)));
+        assert!(matches!(rx1.try_recv(), Ok(TestMessage::Request(_))));
+        drop(pool.workers()[0].counter().finish_on_drop());
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx1.recv())
+                .await
+                .unwrap(),
+            Some(TestMessage::Shutdown)
+        ));
+        assert_eq!((pool.pending(), pool.total()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_waits_for_previously_reserved_requests() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let counter = PendingCounter::new();
+        let permit = tx.try_reserve().unwrap();
+        counter.inc();
+        let mut failed = Vec::new();
+        {
+            let drain = drain_queued_requests(&mut rx, &counter, |owner, session| {
+                failed.push((owner, session))
+            });
+            tokio::pin!(drain);
+            tokio::select! {
+                biased;
+                _ = &mut drain => panic!("reserved request was skipped"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert!(tx.is_closed());
+            assert!(tx.try_reserve().is_err());
+            permit.send(TestMessage::Request(TestRequest {
+                owner: 7,
+                session: 21,
+            }));
+            tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+                .await
+                .unwrap();
+        }
+        assert_eq!(failed, vec![(7, 21)]);
+        assert_eq!(counter.load(), 0);
     }
 
     #[test]
@@ -349,8 +555,8 @@ mod tests {
         assert_eq!((counter.load(), counter.total(), counter.peak()), (1, 1, 1));
     }
 
-    #[test]
-    fn drain_queued_requests_replies_only_waiting_and_decrements_all() {
+    #[tokio::test]
+    async fn drain_queued_requests_replies_only_waiting_and_decrements_all() {
         let (tx, mut rx) = mpsc::channel(8);
         let counter = PendingCounter::new();
         for session in [11, 0, 12] {
@@ -363,7 +569,8 @@ mod tests {
         let mut failed = Vec::new();
         drain_queued_requests(&mut rx, &counter, |owner, session| {
             failed.push((owner, session));
-        });
+        })
+        .await;
 
         assert_eq!(failed, vec![(7, 11), (7, 12)]);
         assert_eq!(counter.load(), 0);

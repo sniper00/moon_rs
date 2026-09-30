@@ -873,10 +873,12 @@ async fn worker_loop(
                         session,
                         PgResponse::Socket("pg connection closed".to_string()),
                     );
-                });
+                })
+                .await;
                 break;
             }
         };
+        let _pending = counter.finish_on_drop();
         let mut failed_times = 0;
         loop {
             // Ensure a live connection.
@@ -891,7 +893,6 @@ async fn worker_loop(
                                 req.session,
                                 PgResponse::Socket(e),
                             );
-                            counter.dec();
                             break;
                         } else {
                             if failed_times == 0 {
@@ -925,7 +926,6 @@ async fn worker_loop(
                             err.message.as_deref().unwrap_or("unknown")
                         );
                     }
-                    counter.dec();
                     break;
                 }
                 Err(e) => {
@@ -938,7 +938,6 @@ async fn worker_loop(
                             req.session,
                             PgResponse::Socket(e),
                         );
-                        counter.dec();
                         break;
                     } else {
                         if failed_times == 0 {
@@ -1573,9 +1572,7 @@ fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
                 "pg '{}' reconnected with the same name; shutting down the previous pool",
                 old.inner.name()
             );
-            for w in old.inner.workers() {
-                let _ = w.tx().send(PgMessage::Shutdown).await;
-            }
+            old.inner.notify_shutdown(|| PgMessage::Shutdown);
         }
         let _ = CONTEXT.send_value(context::PTYPE_PG, owner, session, PgResponse::Connect(name));
     });
@@ -2016,12 +2013,7 @@ fn close(lua: &mut LuaStack<'_>) -> c_int {
     // Signal every worker to finish any queued requests and then exit, so its
     // task ends and the TCP connection is dropped. Removing the registry entry
     // alone is not enough because the Lua handle still holds a pool `Arc`.
-    for worker in pool.inner.workers() {
-        let tx = worker.tx().clone();
-        CONTEXT.io_runtime().spawn(async move {
-            let _ = tx.send(PgMessage::Shutdown).await;
-        });
-    }
+    pool.inner.notify_shutdown(|| PgMessage::Shutdown);
     laux::lua_push(state, true);
     1
 }

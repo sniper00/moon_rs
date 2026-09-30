@@ -1,4 +1,6 @@
-use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests, try_send_counted};
+use crate::request_pool::{
+    PendingCounter, QueuedRequest, dispatch_request, drain_queued_requests, notify_shutdown,
+};
 use dashmap::DashMap;
 use futures_util::stream::TryStreamExt;
 use lazy_static::lazy_static;
@@ -274,6 +276,7 @@ async fn database_handler(
     counter: PendingCounter,
 ) {
     while let Some(op) = rx.recv().await {
+        let _pending = op.owner_session().map(|_| counter.finish_on_drop());
         // let mut failed_times = 0;
         match op {
             DatabaseRequest::CreateCollection(owner, session, db_name, collection_name) => {
@@ -581,11 +584,11 @@ async fn database_handler(
                         -session,
                         "mongodb connection closed".to_string(),
                     );
-                });
+                })
+                .await;
                 break;
             }
         }
-        counter.dec();
     }
 }
 
@@ -627,7 +630,7 @@ fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
                         "mongodb '{}' reconnected with the same name; closing the previous connection",
                         old.name
                     );
-                    let _ = old.tx.send(DatabaseRequest::Close()).await;
+                    notify_shutdown(&old.tx, DatabaseRequest::Close());
                 }
 
                 let _ = CONTEXT.send_value(
@@ -1074,10 +1077,7 @@ fn lua_mongodb_close(lua: &mut LuaStack<'_>) -> c_int {
     // Stop the handler task (drops the mongodb Client) and drop the registry
     // entry so a later reconnect with the same name doesn't collide with a
     // stale, dead handle.
-    let tx = conn.tx.clone();
-    CONTEXT.io_runtime().spawn(async move {
-        let _ = tx.send(DatabaseRequest::Close()).await;
-    });
+    notify_shutdown(&conn.tx, DatabaseRequest::Close());
     // Only remove our own entry: if a `connect()` with the same name has already
     // replaced this connection, closing through this (now stale) handle must not
     // delete the newer entry. Match on our own pending counter to identify it.
@@ -1161,37 +1161,7 @@ fn operators(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         }
     };
 
-    if matches!(request, DatabaseRequest::Close()) {
-        match conn.tx.try_send(request) {
-            Ok(()) => {
-                laux::lua_push(state, true);
-                Ok(1)
-            }
-            Err(err) => {
-                push_lua_table!(
-                    state,
-                    "kind" => "ERROR",
-                    "message" => err.to_string()
-                );
-                Ok(1)
-            }
-        }
-    } else {
-        match try_send_counted(&conn.tx, &conn.counter, request) {
-            Ok(_) => {
-                laux::lua_push(state, session);
-                Ok(1)
-            }
-            Err(err) => {
-                push_lua_table!(
-                    state,
-                    "kind" => "ERROR",
-                    "message" => err.to_string()
-                );
-                Ok(1)
-            }
-        }
-    }
+    Ok(dispatch_request(state, &conn.tx, &conn.counter, request))
 }
 
 fn push_mongodb_response(state: LuaState, result: DatabaseResponse) -> c_int {
