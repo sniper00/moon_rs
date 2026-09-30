@@ -690,7 +690,8 @@ impl Protobuf {
             .ok_or_else(|| format!("decode_map: no message type for field '{}'", field.name))?;
 
         // Push the pre-created map table (created by fill_message).
-        unsafe { ffi::lua_getfield(state.as_ptr(), table_abs, field.name_c.as_ptr()) };
+        laux::lua_push(state, field.name.as_str());
+        unsafe { ffi::lua_rawget(state.as_ptr(), table_abs) };
         let map_abs = abs_index(state, -1);
 
         let mut sub = stream.read_len_prefixed()?;
@@ -753,7 +754,7 @@ impl Protobuf {
         // Cache for the most-recently-appended non-map repeated field. protobuf
         // encoders emit a repeated field's elements contiguously, so we keep its
         // list table on the Lua stack and track the running length locally,
-        // avoiding a `lua_getfield` + `lua_rawlen` per element. `cached_num ==
+        // avoiding a `lua_rawget` + `lua_rawlen` per element. `cached_num ==
         // -1` means no list is currently held. Correctness for interleaved
         // fields is preserved: switching fields pops the cached table and the
         // next access re-reads the true length via `lua_rawlen`.
@@ -805,7 +806,8 @@ impl Protobuf {
                     if cached_num != -1 {
                         unsafe { ffi::lua_pop(state.as_ptr(), 1) };
                     }
-                    unsafe { ffi::lua_getfield(state.as_ptr(), table_abs, field.name_c.as_ptr()) };
+                    laux::lua_push(state, field.name.as_str());
+                    unsafe { ffi::lua_rawget(state.as_ptr(), table_abs) };
                     cached_list_abs = abs_index(state, -1);
                     cached_len = unsafe { ffi::lua_rawlen(state.as_ptr(), cached_list_abs) }
                         as ffi::lua_Integer;
@@ -1090,7 +1092,7 @@ impl Protobuf {
             write_wire_type(buf, field.number, WireType::LengthDelimited);
             let base = buffer_reserve_varint_space(buf);
             for i in 1..=rawlen {
-                unsafe { ffi::lua_geti(state.as_ptr(), index, i) };
+                unsafe { ffi::lua_rawgeti(state.as_ptr(), index, i) };
                 self.write_field_value(state, buf, field, -1, depth)?;
                 unsafe { ffi::lua_pop(state.as_ptr(), 1) };
             }
@@ -1098,7 +1100,7 @@ impl Protobuf {
             write_len_prefixed(buf, data_len);
         } else {
             for i in 1..=rawlen {
-                unsafe { ffi::lua_geti(state.as_ptr(), index, i) };
+                unsafe { ffi::lua_rawgeti(state.as_ptr(), index, i) };
                 write_wire_type(buf, field.number, field.wtype);
                 self.write_field_value(state, buf, field, -1, depth)?;
                 unsafe { ffi::lua_pop(state.as_ptr(), 1) };
@@ -1539,8 +1541,8 @@ fn do_load(data_slices: &[&[u8]]) -> Result<PbDescriptor, String> {
 ///
 /// # Safety contract
 /// Protobuf encoding must not be re-entered on the same thread while the
-/// returned reference is live. In particular, a repeated table's `__index`
-/// metamethod must not call `protobuf.encode` recursively.
+/// returned reference is live. Raw table reads avoid __index calls, but GC
+/// finalizers must still not call protobuf.encode recursively.
 fn get_thread_encode_buffer() -> &'static mut Buffer {
     thread_local! {
         static ENCODE_BUF: std::cell::UnsafeCell<Buffer> =
@@ -2002,6 +2004,70 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn protobuf_table_reads_ignore_metamethods() {
+        let (state, _guard) = new_vm();
+        for packed in [false, true] {
+            let descriptor = file_set(
+                Some("proto3"),
+                "",
+                &[msg(
+                    "Repeated",
+                    &[fld(
+                        "values",
+                        1,
+                        L_REPEATED,
+                        T_INT32,
+                        "",
+                        Some(packed),
+                        None,
+                    )],
+                    &[],
+                    &[],
+                    false,
+                )],
+                &[],
+            );
+            set_global_bytes(state, "_desc", &descriptor);
+            run(
+                state,
+                r#"
+                local pb = require("protobuf")
+                assert(pb.load(_desc))
+                local values = {}
+                for i = 1, 5 do values[i] = i end
+                values[2] = nil
+                assert(rawlen(values) == 5)
+                local entered = 0
+                local mt = {
+                    __index = function() entered = entered + 1; return 99 end,
+                    __len = function() error("__len must not run") end,
+                    __pairs = function() error("__pairs must not run") end,
+                }
+                setmetatable(values, mt)
+                local input = setmetatable({values = values}, mt)
+                local decoded = pb.decode("Repeated", pb.encode("Repeated", input))
+                assert(entered == 0, "encoding invoked __index")
+                -- Raw nil follows the existing integer conversion (zero),
+                -- rather than obtaining a replacement value from __index.
+                assert(#decoded.values == 5 and decoded.values[2] == 0)
+                for _, i in ipairs({1, 3, 4, 5}) do assert(decoded.values[i] == i) end
+
+                local inherited = setmetatable({}, {__index = {values = {99}}})
+                assert(#pb.decode("Repeated", pb.encode("Repeated", inherited)).values == 0)
+
+                values[2] = 2147483648
+                local ok, err = pcall(pb.encode, "Repeated", input)
+                assert(not ok and err:find("out of i32 range", 1, true))
+                assert(entered == 0)
+                assert(pb.decode("Repeated", pb.encode("Repeated", {values = {7}})).values[1] == 7)
+            "#,
+            )
+            .unwrap();
         }
     }
 
