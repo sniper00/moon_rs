@@ -48,20 +48,22 @@ else
         local bt = moon.clock()
         for i = 1, nsender do
             local receiver = moon.new_service({
-                name = "test",
+                name = "receiver_" .. i,
                 source = "benchmark_call.lua",
                 runner = true,
                 type = "receiver"
             })
+            assert(receiver and receiver ~= 0, "failed to create receiver")
 
             local addr = moon.new_service({
-                name = "test",
+                name = "sender_" .. i,
                 source = "benchmark_call.lua",
                 runner = true,
                 type = "sender",
                 target = receiver,
                 main = moon.id
             })
+            assert(addr and addr ~= 0, "failed to create sender")
             sender_addrs[#sender_addrs + 1] = addr
         end
 

@@ -13,16 +13,16 @@ if conf and conf.slave then
 else
     moon.async(function()
         while true do
-            moon.new_service( {
-                name = "create_service",
+            local id = moon.new_service( {
+                name = "",
                 source = "benchmark_create_service.lua",
                 message = "Hello create_service",
                 slave = true,
                 auto_quit = true
             })
+            assert(id and id ~= 0, "failed to create benchmark service")
         end
     end)
 end
-
 
 

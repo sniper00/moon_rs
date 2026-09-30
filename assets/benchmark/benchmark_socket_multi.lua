@@ -13,6 +13,7 @@ if conf and conf.agent then
         while true do
             local data, err = socket.read(fd, "\r\n")
             if not data then
+                moon.quit()
                 return
             end
 
@@ -33,12 +34,16 @@ if conf and conf.agent then
 else
     moon.async(function()
         local listenfd = assert(socket.listen(host .. ":" .. port, function(fd, addr)
-            moon.new_service({
-                name = "benchmark_socket_agent",
+            local agent = moon.new_service({
+                name = "benchmark_socket_agent_" .. fd,
                 source = "benchmark_socket_multi.lua",
                 agent = true,
                 fd = fd,
             })
+            if not agent or agent == 0 then
+                socket.close(fd)
+                moon.error("failed to create socket benchmark agent")
+            end
         end))
 
         print(string.format([[
