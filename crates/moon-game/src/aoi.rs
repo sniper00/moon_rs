@@ -237,6 +237,16 @@ impl Aoi {
         res.clamp(0, count - 1)
     }
 
+    #[inline]
+    fn tile_world_rect(map: &Rect, tile_size: i32, x: i32, y: i32) -> Rect {
+        Rect::new(
+            map.x + x * tile_size,
+            map.y + y * tile_size,
+            tile_size,
+            tile_size,
+        )
+    }
+
     #[cfg_attr(feature = "prof_noinline", inline(never))]
     fn calc_make_rect(map: &Rect, x: i32, y: i32, w: i32, h: i32) -> Rect {
         let left = (x - w / 2).clamp(map.left(), map.right());
@@ -573,7 +583,7 @@ impl Aoi {
             seen.clear();
             for i in old_tile_view.left()..old_tile_view.right() {
                 for j in old_tile_view.bottom()..old_tile_view.top() {
-                    let rc = Rect::new(i * tile_size, j * tile_size, tile_size, tile_size);
+                    let rc = Self::tile_world_rect(&map, tile_size, i, j);
                     if new_view.contains_rect(&rc) {
                         continue;
                     }
@@ -626,7 +636,7 @@ impl Aoi {
             seen.clear();
             for i in new_tile_view.left()..new_tile_view.right() {
                 for j in new_tile_view.bottom()..new_tile_view.top() {
-                    let rc = Rect::new(i * tile_size, j * tile_size, tile_size, tile_size);
+                    let rc = Self::tile_world_rect(&map, tile_size, i, j);
                     if old_view.contains_rect(&rc) {
                         continue;
                     }
@@ -689,7 +699,7 @@ impl Aoi {
         seen.clear();
         for i in old_tile_view.left()..old_tile_view.right() {
             for j in old_tile_view.bottom()..old_tile_view.top() {
-                let rc = Rect::new(i * tile_size, j * tile_size, tile_size, tile_size);
+                let rc = Self::tile_world_rect(&map, tile_size, i, j);
                 if join_area.contains_rect(&rc) {
                     continue;
                 }
@@ -716,7 +726,7 @@ impl Aoi {
         seen.clear();
         for i in new_tile_view.left()..new_tile_view.right() {
             for j in new_tile_view.bottom()..new_tile_view.top() {
-                let rc = Rect::new(i * tile_size, j * tile_size, tile_size, tile_size);
+                let rc = Self::tile_world_rect(&map, tile_size, i, j);
                 if join_area.contains_rect(&rc) {
                     continue;
                 }
@@ -814,25 +824,25 @@ impl Aoi {
 
     /// Casts a ray from `spos` to `epos` sampling every `step` units, returning
     /// the handle of the first `FIXED` marker whose footprint contains a sample.
+    /// Returns `None` for a non-positive/non-finite step or non-finite distance.
     pub fn raycast(&self, spos: Vec2, epos: Vec2, step: f32) -> Option<Handle> {
+        if !step.is_finite() || step <= 0.0 {
+            return None;
+        }
         let map = self.rect;
         let count = self.count;
         let tile_size = self.tile_size;
 
         let d = spos.distance(&epos);
+        if !d.is_finite() {
+            return None;
+        }
         let dir = (epos - spos).normalized();
         let mut f = 0.0_f32;
-        let mut last = (-1_i32, -1_i32);
         while f < d {
             let pos = spos + dir * f;
             let tile_x = Self::calc_tile_x(&map, tile_size, count, pos.x as i32);
             let tile_y = Self::calc_tile_y(&map, tile_size, count, pos.y as i32);
-            f += step;
-            if (tile_x, tile_y) == last {
-                continue;
-            }
-            last = (tile_x, tile_y);
-
             let node = &self.data[(tile_y * count + tile_x) as usize];
             for &mh in &node.markers {
                 let m = &self.slab[mh as usize];
@@ -843,6 +853,12 @@ impl Aoi {
                     return Some(m.handle);
                 }
             }
+            let next = f + step;
+            // A small step can stop advancing once f loses float precision.
+            if next <= f {
+                break;
+            }
+            f = next;
         }
         None
     }

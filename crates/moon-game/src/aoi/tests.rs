@@ -615,6 +615,43 @@ fn raycast_hit_fixed_marker() {
 }
 
 #[test]
+fn raycast_checks_later_samples_in_same_tile() {
+    let mut a = Aoi::new(0, 0, 100, 100);
+    ins(&mut a, 1, 30, 50, 10, 10, 0, M | F);
+    ins(&mut a, 2, 70, 50, 10, 10, 0, M | F);
+    let start = Vec2::new(10.0, 50.0);
+    let end = Vec2::new(90.0, 50.0);
+    assert_eq!(a.raycast(start, end, 1.0), Some(1));
+    assert_eq!(a.raycast(end, start, 1.0), Some(2));
+    // Keep sampling semantics: a coarse step may miss both footprints.
+    assert_eq!(a.raycast(start, end, 80.0), None);
+}
+
+#[test]
+fn raycast_rejects_invalid_steps() {
+    let a = Aoi::new(0, 0, 100, 10);
+    for step in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(
+            a.raycast(Vec2::new(10.0, 50.0), Vec2::new(90.0, 50.0), step),
+            None,
+            "step={step}"
+        );
+    }
+}
+
+#[test]
+fn raycast_rejects_nonfinite_distance() {
+    let a = Aoi::new(0, 0, 100, 10);
+    for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+        assert_eq!(
+            a.raycast(Vec2::new(10.0, 50.0), Vec2::new(x, 50.0), 1.0),
+            None,
+            "end.x={x}"
+        );
+    }
+}
+
+#[test]
 fn raycast_miss() {
     let mut a = Aoi::new(0, 0, 100, 10);
     ins(&mut a, 1, 50, 50, 20, 20, 0, M | F);
@@ -710,6 +747,56 @@ fn nonzero_origin() {
     a.clear_event();
     ins(&mut a, 2, 1055, 1055, 0, 0, 0, M);
     assert!(has_event(&a, EVENT_ENTER, 1, 2));
+}
+
+#[test]
+fn nonzero_origin_watcher_view_transitions() {
+    for (ox, oy) in [(10, 10), (-10, -10), (17, -13)] {
+        // Zoom out, zoom in, and partial overlap in both directions.
+        for (old, new) in [
+            ((10, 10, 20, 20), (20, 10, 40, 20)),
+            ((20, 10, 40, 20), (10, 10, 20, 20)),
+            ((20, 20, 40, 40), (30, 30, 40, 40)),
+            ((30, 30, 40, 40), (20, 20, 40, 40)),
+        ] {
+            let mut a = Aoi::new(ox, oy, 100, 10);
+            a.set_option(ENABLE_LEAVE_EVENT);
+            ins(&mut a, 0, ox + old.0, oy + old.1, old.2, old.3, 0, W);
+            let old_view = a.make_rect(ox + old.0, oy + old.1, old.2, old.3);
+            let new_view = a.make_rect(ox + new.0, oy + new.1, new.2, new.3);
+            let mut expected = Vec::new();
+            for i in 0..100 {
+                let x = ox + (i % 10) * 10 + 5;
+                let y = oy + (i / 10) * 10 + 5;
+                let handle = i64::from(i + 1);
+                ins(&mut a, handle, x, y, 0, 0, 0, M);
+                match (old_view.contains_point(x, y), new_view.contains_point(x, y)) {
+                    (false, true) => expected.push((EVENT_ENTER, 0, handle)),
+                    (true, false) => expected.push((EVENT_LEAVE, 0, handle)),
+                    _ => {}
+                }
+            }
+            a.clear_event();
+            assert!(a.update(0, ox + new.0, oy + new.1, new.2, new.3, 0));
+            let mut actual: Vec<_> = a
+                .events()
+                .iter()
+                .map(|e| (e.eventid, e.watcher, e.marker))
+                .collect();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "origin=({ox},{oy}), {old:?} -> {new:?}");
+
+            // Future notifications must also reach every newly visible tile.
+            for i in 0..100 {
+                let x = ox + (i % 10) * 10 + 5;
+                let y = oy + (i / 10) * 10 + 5;
+                a.clear_event();
+                a.fire_event_pos(x, y, EVENT_POS);
+                assert_eq!(a.events().len(), usize::from(new_view.contains_point(x, y)));
+            }
+        }
+    }
 }
 
 #[test]
