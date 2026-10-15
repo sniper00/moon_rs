@@ -18,6 +18,23 @@
 //! tiles, every scan that crosses multiple of its tiles is de-duplicated so each
 //! watcher/marker pair produces at most one event per operation.
 //!
+//! `FIXED` objects also register the cells covered by their ray footprint
+//! `[x, x+w) x [y, y+h)`. This extra broad-phase coverage does not change their
+//! centered AOI shape. `query`/`query_objects`/`visit_candidates` expose tile candidates;
+//! `query_rect` performs exact, unique AOI-shape intersection.
+//!
+//! # Lifecycle and events
+//!
+//! `detach` preserves an object's geometry; `attach` restores its membership.
+//! Compatibility `erase(handle, false)` additionally zeroes the geometry.
+//! Geometry updates reattach detached objects. `objects` visits registered
+//! objects once, including detached ones; `is_attached` distinguishes them.
+//!
+//! Event and query order is unspecified. Position updates still notify markers
+//! when the watcher state is unchanged. Leave suppression applies to geometric
+//! moves; watcher layer changes and explicit hide/remove retain their historical
+//! notifications. `clear` clears both objects and pending events.
+//!
 //! # Porting design (slab storage)
 //!
 //! The C++ version stores objects in a node-stable `std::unordered_map` and
@@ -32,12 +49,55 @@
 //! the whole implementation free of `unsafe`.
 
 // Fx hashing (no random seed) instead of std's SipHash: the maps/sets are keyed
-// by small integer handles/slots and are extremely hot (per-tile membership
-// churn and per-op dedup), where SipHash dominates. FxHashMap/FxHashSet are
+// by small integer handles/slots and are extremely hot (handle lookups and
+// per-tile membership churn), where SipHash dominates. FxHashMap/FxHashSet are
 // drop-in.
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 
+use crate::common::{IdSet, VisitMarks};
 use crate::math::{Rect, Vec2};
+
+mod api;
+mod grid;
+// Role-specific transitions share the grid and object store; public lifecycle
+// methods below determine their order (marker, watcher, then self visibility).
+mod marker;
+mod storage;
+mod watcher;
+use grid::{Grid, TileRect, WorldRect};
+use storage::ObjectStore;
+
+/// Square map geometry. Coordinates and tile indices are validated at construction.
+#[derive(Clone, Copy, Debug)]
+pub struct AoiConfig {
+    pub origin: (i32, i32),
+    pub map_size: i32,
+    pub tile_size: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AoiError {
+    InvalidMapSize,
+    InvalidTileSize,
+    UnalignedMapSize,
+    CoordinateOverflow,
+    TooManyTiles,
+    AllocationFailed,
+}
+
+impl std::fmt::Display for AoiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidMapSize => "map size must be positive",
+            Self::InvalidTileSize => "tile size must be positive",
+            Self::UnalignedMapSize => "map size must be a multiple of tile size",
+            Self::CoordinateOverflow => "map coordinates overflow i32",
+            Self::TooManyTiles => "tile count exceeds the supported index range",
+            Self::AllocationFailed => "cannot allocate AOI tiles",
+        })
+    }
+}
+impl std::error::Error for AoiError {}
 
 /// Object identifier. Matches the C++ `object_handle_type` (`int64_t`).
 pub type Handle = i64;
@@ -48,7 +108,7 @@ pub const WATCHER: i32 = 1;
 /// Observable target that watchers can see.
 pub const MARKER: i32 = 1 << 1;
 /// Static object (obstacle/NPC). Drives tile versions and ray casting; skipped
-/// by `update_watcher` enter/leave generation.
+/// by watcher-driven enter/leave generation.
 pub const FIXED: i32 = 1 << 2;
 /// Temporarily invisible: produces no events while set.
 pub const HIDE: i32 = 1 << 3;
@@ -65,14 +125,6 @@ pub const ENABLE_LEAVE_EVENT: i32 = 1 << 0;
 pub const ENABLE_SELF_EVENT: i32 = 1 << 1;
 /// Reserved to mirror the C++ debug flag; currently a no-op.
 pub const ENABLE_DEBUG: i32 = 1 << 2;
-
-/// How a watcher's view changed, controlling which events a tile scan emits.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Vtm {
-    ZoomIn,
-    ZoomOut,
-    Layer,
-}
 
 /// An object tracked by the AOI grid.
 ///
@@ -93,14 +145,21 @@ pub struct AoiObject {
 }
 
 impl AoiObject {
+    /// Non-watchers with positive extents use an area as their AOI shape.
+    /// This does not require MARKER: explicit events also accept other roles.
+    #[inline]
+    fn is_range_marker(&self) -> bool {
+        self.mode & WATCHER == 0 && self.w > 0 && self.h > 0
+    }
+
     /// Footprint containment of a point (C++ `test_object::contains`), using the
     /// object's own `[x, x+w) x [y, y+h)` box. Used by ray casting.
     #[inline]
     fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x as f32
-            && px < (self.x + self.w) as f32
+            && px < (i64::from(self.x) + i64::from(self.w)) as f32
             && py >= self.y as f32
-            && py < (self.y + self.h) as f32
+            && py < (i64::from(self.y) + i64::from(self.h)) as f32
     }
 }
 
@@ -124,7 +183,7 @@ impl AoiEvent {
     }
 }
 
-/// Dense slab index into [`Aoi::slab`]. Stored inside tiles (instead of a
+/// Dense slab index into the object store. Stored inside tiles (instead of a
 /// [`Handle`]) so the hot emit loops resolve an object with a single array index
 /// — the Rust equivalent of the C++ version's `object*` stored per tile.
 type Slot = u32;
@@ -132,7 +191,7 @@ type Slot = u32;
 #[derive(Clone, Debug)]
 struct Tile {
     version: i64,
-    markers: HashSet<Slot>,
+    markers: IdSet,
     watchers: HashSet<Slot>,
 }
 
@@ -141,7 +200,7 @@ impl Default for Tile {
         // C++ tiles start at version 1.
         Self {
             version: 1,
-            markers: HashSet::default(),
+            markers: IdSet::default(),
             watchers: HashSet::default(),
         }
     }
@@ -150,27 +209,14 @@ impl Default for Tile {
 /// Grid-based Area of Interest system. See the module docs for an overview.
 pub struct Aoi {
     option: i32,
-    rect: Rect,
-    tile_size: i32,
-    map_size: i32,
-    count: i32, // map_size / tile_size
+    grid: Grid,
     data: Vec<Tile>,
-    /// Dense object storage. Tiles reference objects by [`Slot`] (index here), so
-    /// the hot emit loops do a direct `slab[slot]` array access instead of a
-    /// per-element `HashMap` lookup. Slots are stable for an object's lifetime;
-    /// freed slots are recycled via `free`.
-    slab: Vec<AoiObject>,
-    /// Recycled (vacant) slab slots, reused before growing `slab`.
-    free: Vec<Slot>,
-    /// Handle → slot mapping for the public, handle-based API.
-    index: HashMap<Handle, Slot>,
+    objects: ObjectStore,
     event_queue: Vec<AoiEvent>,
-    /// Reusable dedup buffer for event emission. Every `insert`/`update`/`erase`/
-    /// `fire_event` needs a per-op "already notified" set; allocating a fresh
-    /// `HashSet` each call dominated profiles (hashbrown resize churn). We
-    /// `mem::take` this out, use it, and put it back so its capacity is retained
-    /// across calls (no more reallocation after warm-up). Uses are never nested.
-    scratch: HashSet<Slot>,
+    /// Per-slot generation marks shared by event emission and exact queries.
+    /// A scan starts a new generation rather than clearing a hash set. Point
+    /// paths which do not need dedup also avoid allocating the mark array.
+    scratch: VisitMarks,
 }
 
 impl Aoi {
@@ -178,184 +224,63 @@ impl Aoi {
     /// into square tiles of `tile_size`.
     ///
     /// # Panics
-    /// If `map_size` is not an exact multiple of `tile_size`, or `tile_size` is
-    /// not positive.
+    /// If the configuration is invalid or allocation fails; see [`Self::try_new`].
     pub fn new(posx: i32, posy: i32, map_size: i32, tile_size: i32) -> Self {
-        assert!(tile_size > 0, "tile_size must be positive");
-        assert!(
-            map_size % tile_size == 0,
-            "map_size must be a multiple of tile_size"
-        );
-        let count = map_size / tile_size;
-        let len = (count * count) as usize;
-        let mut data = Vec::with_capacity(len);
-        data.resize_with(len, Tile::default);
-        Self {
-            option: 0,
-            rect: Rect::new(posx, posy, map_size, map_size),
-            tile_size,
+        Self::try_new(AoiConfig {
+            origin: (posx, posy),
             map_size,
-            count,
+            tile_size,
+        })
+        .expect("invalid AOI configuration")
+    }
+
+    /// Validates the grid and reports invalid dimensions or allocation failure.
+    pub fn try_new(config: AoiConfig) -> Result<Self, AoiError> {
+        let grid = Grid::new(config)?;
+        let len = grid.len();
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| AoiError::AllocationFailed)?;
+        data.resize_with(len, Tile::default);
+        Ok(Self {
+            option: 0,
+            grid,
             data,
-            slab: Vec::new(),
-            free: Vec::new(),
-            index: HashMap::default(),
+            objects: ObjectStore::default(),
             event_queue: Vec::new(),
-            scratch: HashSet::default(),
-        }
-    }
-
-    // ── slab management ────────────────────────────────────────────────────────
-
-    /// Allocates a slab slot for `obj` (recycling a freed one when available),
-    /// registers its handle, and returns the slot.
-    #[inline]
-    fn alloc_slot(&mut self, obj: AoiObject) -> Slot {
-        let slot = if let Some(s) = self.free.pop() {
-            self.slab[s as usize] = obj;
-            s
-        } else {
-            let s = self.slab.len() as Slot;
-            self.slab.push(obj);
-            s
-        };
-        self.index.insert(obj.handle, slot);
-        slot
-    }
-
-    // ── geometry (free-standing so hot loops avoid borrowing all of `self`) ──
-
-    #[inline]
-    fn calc_tile_x(map: &Rect, tile_size: i32, count: i32, v: i32) -> i32 {
-        let res = (v - map.x) / tile_size;
-        res.clamp(0, count - 1)
-    }
-
-    #[inline]
-    fn calc_tile_y(map: &Rect, tile_size: i32, count: i32, v: i32) -> i32 {
-        let res = (v - map.y) / tile_size;
-        res.clamp(0, count - 1)
-    }
-
-    #[inline]
-    fn tile_world_rect(map: &Rect, tile_size: i32, x: i32, y: i32) -> Rect {
-        Rect::new(
-            map.x + x * tile_size,
-            map.y + y * tile_size,
-            tile_size,
-            tile_size,
-        )
-    }
-
-    #[cfg_attr(feature = "prof_noinline", inline(never))]
-    fn calc_make_rect(map: &Rect, x: i32, y: i32, w: i32, h: i32) -> Rect {
-        let left = (x - w / 2).clamp(map.left(), map.right());
-        let right = (x + w / 2).clamp(map.left(), map.right());
-        let bottom = (y - h / 2).clamp(map.bottom(), map.top());
-        let top = (y + h / 2).clamp(map.bottom(), map.top());
-        if w == 0 || h == 0 {
-            return Rect::new(left, bottom, 0, 0);
-        }
-        Rect::new(left, bottom, right - left, top - bottom)
-    }
-
-    fn calc_make_tile_rect(
-        map: &Rect,
-        tile_size: i32,
-        count: i32,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-    ) -> Rect {
-        let left = Self::calc_tile_x(
-            map,
-            tile_size,
-            count,
-            (x - w / 2).clamp(map.left(), map.right()),
-        );
-        let right = Self::calc_tile_x(
-            map,
-            tile_size,
-            count,
-            (x + w / 2).clamp(map.left(), map.right()),
-        ) + 1;
-        let bottom = Self::calc_tile_y(
-            map,
-            tile_size,
-            count,
-            (y - h / 2).clamp(map.bottom(), map.top()),
-        );
-        let top = Self::calc_tile_y(
-            map,
-            tile_size,
-            count,
-            (y + h / 2).clamp(map.bottom(), map.top()),
-        ) + 1;
-        if w == 0 || h == 0 {
-            return Rect::new(left, bottom, 0, 0);
-        }
-        Rect::new(left, bottom, right - left, top - bottom)
-    }
-
-    fn calc_to_tile_rect(
-        map: &Rect,
-        tile_size: i32,
-        count: i32,
-        left_x: i32,
-        left_y: i32,
-        w: i32,
-        h: i32,
-    ) -> Rect {
-        let left = Self::calc_tile_x(map, tile_size, count, left_x.clamp(map.left(), map.right()));
-        let right = Self::calc_tile_x(
-            map,
-            tile_size,
-            count,
-            (left_x + w).clamp(map.left(), map.right()),
-        ) + 1;
-        let bottom =
-            Self::calc_tile_y(map, tile_size, count, left_y.clamp(map.bottom(), map.top()));
-        let top = Self::calc_tile_y(
-            map,
-            tile_size,
-            count,
-            (left_y + h).clamp(map.bottom(), map.top()),
-        ) + 1;
-        if w == 0 || h == 0 {
-            return Rect::new(left, bottom, 0, 0);
-        }
-        Rect::new(left, bottom, right - left, top - bottom)
+            scratch: VisitMarks::default(),
+        })
     }
 
     /// Tile column index of map coordinate `v`, clamped to `[0, count)`.
     #[inline]
     pub fn get_tile_x(&self, v: i32) -> i32 {
-        Self::calc_tile_x(&self.rect, self.tile_size, self.count, v)
+        self.grid.tile_x(v)
     }
 
     /// Tile row index of map coordinate `v`, clamped to `[0, count)`.
     #[inline]
     pub fn get_tile_y(&self, v: i32) -> i32 {
-        Self::calc_tile_y(&self.rect, self.tile_size, self.count, v)
+        self.grid.tile_y(v)
     }
 
     /// View rectangle in world coordinates, centered on `(x, y)` with size
     /// `w x h`, clamped to the map.
     pub fn make_rect(&self, x: i32, y: i32, w: i32, h: i32) -> Rect {
-        Self::calc_make_rect(&self.rect, x, y, w, h)
+        self.grid.clipped_view(x, y, w, h).0
     }
 
     /// View rectangle expressed in tile indices.
     pub fn make_tile_rect(&self, x: i32, y: i32, w: i32, h: i32) -> Rect {
-        Self::calc_make_tile_rect(&self.rect, self.tile_size, self.count, x, y, w, h)
+        self.grid.view_tiles(x, y, w, h).0
     }
 
     // ── insert ──────────────────────────────────────────────────────────────
 
-    /// Inserts an object. Returns `false` if `(x, y)` is outside the map or the
-    /// `handle` already exists.
+    /// Inserts an object. Returns `false` for negative dimensions, coordinates
+    /// outside the map, or a duplicate handle. See also [`Self::insert_object`].
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub fn insert(
         &mut self,
         handle: Handle,
@@ -367,13 +292,7 @@ impl Aoi {
         mode: i32,
         user: i64,
     ) -> bool {
-        if !self.rect.contains_point(x, y) {
-            return false;
-        }
-        if self.index.contains_key(&handle) {
-            return false;
-        }
-        let obj = AoiObject {
+        self.insert_object(AoiObject {
             x,
             y,
             w,
@@ -382,27 +301,45 @@ impl Aoi {
             mode,
             handle,
             user,
+        })
+    }
+
+    /// Inserts an object using named fields. Dimensions must be non-negative.
+    #[inline]
+    pub fn insert_object(&mut self, obj: AoiObject) -> bool {
+        if obj.w < 0 || obj.h < 0 || !self.grid.bounds.contains_point(obj.x, obj.y) {
+            return false;
+        }
+        let Some(slot) = self.objects.insert(obj) else {
+            return false;
         };
-        let slot = self.alloc_slot(obj);
 
-        let map = self.rect;
-        let count = self.count;
-        let tile_size = self.tile_size;
+        self.attach_slot(slot, obj);
+        true
+    }
 
-        let tile_x = Self::calc_tile_x(&map, tile_size, count, x);
-        let tile_y = Self::calc_tile_y(&map, tile_size, count, y);
+    #[inline]
+    fn attach_slot(&mut self, slot: Slot, obj: AoiObject) {
+        self.objects.attached[slot as usize] = true;
+        let AoiObject {
+            x,
+            y,
+            w,
+            h,
+            layer,
+            mode,
+            handle,
+            ..
+        } = obj;
+        let grid = self.grid;
 
         if mode & MARKER != 0 {
-            let is_range = Self::is_range_marker(mode, w, h);
-            let cover = if is_range {
-                Self::calc_make_tile_rect(&map, tile_size, count, x, y, w, h)
-            } else {
-                Rect::new(tile_x, tile_y, 1, 1)
-            };
+            let is_range = obj.is_range_marker();
+            let cover = grid.marker_cover(&obj);
             self.add_marker_tiles(cover, slot);
             if mode & HIDE == 0 {
                 let area = if is_range {
-                    Some(Self::calc_make_rect(&map, x, y, w, h))
+                    Some(grid.view(x, y, w, h))
                 } else {
                     None
                 };
@@ -411,33 +348,8 @@ impl Aoi {
         }
 
         if mode & WATCHER != 0 {
-            let tr = Self::calc_make_tile_rect(&map, tile_size, count, x, y, w, h);
-            let rc = Self::calc_make_rect(&map, x, y, w, h);
-            let option = self.option;
-            let mut seen = std::mem::take(&mut self.scratch);
-            seen.clear();
-            for i in tr.left()..tr.right() {
-                for j in tr.bottom()..tr.top() {
-                    let index = (j * count + i) as usize;
-                    self.data[index].watchers.insert(slot);
-                    Self::update_watcher(
-                        &map,
-                        &self.slab,
-                        option,
-                        &mut self.event_queue,
-                        &self.data[index],
-                        Rect::default(),
-                        rc,
-                        &obj,
-                        Vtm::ZoomOut,
-                        obj.layer,
-                        &mut seen,
-                    );
-                }
-            }
-            self.scratch = seen;
+            self.attach_watcher(slot, obj);
         }
-        true
     }
 
     // ── events triggered explicitly ──────────────────────────────────────────
@@ -445,56 +357,53 @@ impl Aoi {
     /// Re-fires `eventid` to every watcher that can currently see object
     /// `handle` (used e.g. to notify after attribute changes).
     pub fn fire_event(&mut self, handle: Handle, eventid: i32) {
-        let obj = match self.index.get(&handle) {
-            Some(&s) => self.slab[s as usize],
-            None => return,
-        };
-        let map = self.rect;
-        let count = self.count;
-        let tile_size = self.tile_size;
-
-        let is_range = Self::is_range_marker(obj.mode, obj.w, obj.h);
-        let cover = if is_range {
-            Self::calc_make_tile_rect(&map, tile_size, count, obj.x, obj.y, obj.w, obj.h)
-        } else {
-            let tx = Self::calc_tile_x(&map, tile_size, count, obj.x);
-            let ty = Self::calc_tile_y(&map, tile_size, count, obj.y);
-            Rect::new(tx, ty, 1, 1)
-        };
-
-        for i in cover.left()..cover.right() {
-            for j in cover.bottom()..cover.top() {
-                let index = (j * count + i) as usize;
-                Self::update_tile_version(&obj, &mut self.data[index]);
-            }
+        if let Some(&slot) = self.objects.index.get(&handle) {
+            self.fire_event_slot(slot, eventid);
         }
+    }
+
+    #[inline]
+    fn fire_event_slot(&mut self, slot: Slot, eventid: i32) {
+        if !self.objects.attached[slot as usize] {
+            return;
+        }
+        let obj = self.objects.values[slot as usize];
+        let grid = self.grid;
+        let count = self.grid.count;
+
+        let is_range = obj.is_range_marker();
+        let cover = grid.marker_cover(&obj);
+
+        cover.for_each(|i, j| {
+            let index = (j * count + i) as usize;
+            Self::update_tile_version(&obj, &mut self.data[index]);
+        });
 
         if obj.mode & HIDE != 0 {
             return;
         }
         let area = if is_range {
-            Some(Self::calc_make_rect(&map, obj.x, obj.y, obj.w, obj.h))
+            Some(grid.view(obj.x, obj.y, obj.w, obj.h))
         } else {
             None
         };
-        self.emit_to_watchers(cover, obj.x, obj.y, area, obj.layer, handle, eventid);
+        self.emit_to_watchers(cover, obj.x, obj.y, area, obj.layer, obj.handle, eventid);
     }
 
     /// Fires `eventid` to every watcher whose view contains the point `(x, y)`.
     /// The emitted events carry `marker = 0`.
     pub fn fire_event_pos(&mut self, x: i32, y: i32, eventid: i32) {
-        let map = self.rect;
-        let count = self.count;
-        let tile_size = self.tile_size;
+        let grid = self.grid;
+        let count = self.grid.count;
 
-        let tile_x = Self::calc_tile_x(&map, tile_size, count, x);
-        let tile_y = Self::calc_tile_y(&map, tile_size, count, y);
+        let tile_x = grid.tile_x(x);
+        let tile_y = grid.tile_y(y);
         let index = (tile_y * count + tile_x) as usize;
 
         let node = &self.data[index];
         for &wh in &node.watchers {
-            let w = &self.slab[wh as usize];
-            let rc = Self::calc_make_rect(&map, w.x, w.y, w.w, w.h);
+            let w = &self.objects.values[wh as usize];
+            let rc = grid.view(w.x, w.y, w.w, w.h);
             if !rc.contains_point(x, y) {
                 continue;
             }
@@ -505,18 +414,18 @@ impl Aoi {
     /// Toggles the hide flag, emitting a leave (show→hide) or enter (hide→show)
     /// burst to the affected watchers.
     pub fn set_hide(&mut self, handle: Handle, v: bool) {
-        let slot = match self.index.get(&handle) {
+        let slot = match self.objects.index.get(&handle) {
             Some(&s) => s,
             None => return,
         };
-        let mode = self.slab[slot as usize].mode;
+        let mode = self.objects.values[slot as usize].mode;
         if v && (mode & HIDE == 0) {
-            self.fire_event(handle, EVENT_LEAVE);
-            self.slab[slot as usize].mode |= HIDE;
+            self.fire_event_slot(slot, EVENT_LEAVE);
+            self.objects.values[slot as usize].mode |= HIDE;
         }
         if !v && (mode & HIDE != 0) {
-            self.slab[slot as usize].mode &= !HIDE;
-            self.fire_event(handle, EVENT_ENTER);
+            self.objects.values[slot as usize].mode &= !HIDE;
+            self.fire_event_slot(slot, EVENT_ENTER);
         }
     }
 
@@ -526,32 +435,26 @@ impl Aoi {
     /// resulting visibility events. Returns `false` for unknown handles or
     /// negative dimensions. Coordinates are clamped to the map.
     pub fn update(&mut self, handle: Handle, x: i32, y: i32, w: i32, h: i32, layer: i32) -> bool {
+        let Some(&slot) = self.objects.index.get(&handle) else {
+            return false;
+        };
+        self.update_slot(slot, x, y, w, h, layer)
+    }
+
+    #[inline]
+    fn update_slot(&mut self, slot: Slot, x: i32, y: i32, w: i32, h: i32, layer: i32) -> bool {
         if w < 0 || h < 0 {
             return false;
         }
-        let slot = match self.index.get(&handle) {
-            Some(&s) => s,
-            None => return false,
-        };
+        let grid = self.grid;
 
-        let map = self.rect;
-        let count = self.count;
-        let tile_size = self.tile_size;
-        let option = self.option;
+        let x = x.clamp(grid.bounds.x, grid.bounds.right() - 1);
+        let y = y.clamp(grid.bounds.y, grid.bounds.top() - 1);
 
-        let x = x.clamp(map.x, map.x + self.map_size - 1);
-        let y = y.clamp(map.y, map.y + self.map_size - 1);
-
-        let prev = self.slab[slot as usize];
-        let old_view = Self::calc_make_rect(&map, prev.x, prev.y, prev.w, prev.h);
-        let old_tile_view =
-            Self::calc_make_tile_rect(&map, tile_size, count, prev.x, prev.y, prev.w, prev.h);
-        let old_x = prev.x;
-        let old_y = prev.y;
-        let old_layer = prev.layer;
+        let prev = self.objects.values[slot as usize];
 
         {
-            let o = &mut self.slab[slot as usize];
+            let o = &mut self.objects.values[slot as usize];
             o.x = x;
             o.y = y;
             o.h = h;
@@ -560,218 +463,22 @@ impl Aoi {
                 o.layer = layer;
             }
         }
-        let obj = self.slab[slot as usize];
+        let obj = self.objects.values[slot as usize];
+        if !self.objects.attached[slot as usize] {
+            self.attach_slot(slot, obj);
+            return true;
+        }
 
         if obj.mode & MARKER != 0 {
-            self.update_marker(slot, old_x, old_y, prev.w, prev.h, old_layer);
+            self.update_marker(slot, prev);
         }
 
         if obj.mode & WATCHER == 0 {
             return true;
         }
 
-        // Reusable dedup buffer (see the `scratch` field): taken once here,
-        // cleared before each tile-scan loop, and put back at every exit so its
-        // capacity persists across calls instead of reallocating every update.
-        let mut seen = std::mem::take(&mut self.scratch);
-
-        let new_view = Self::calc_make_rect(&map, x, y, w, h);
-        let new_tile_view = Self::calc_make_tile_rect(&map, tile_size, count, x, y, w, h);
-
-        // watcher zoom in: new view fully inside old view
-        if old_view.contains_rect(&new_view) {
-            seen.clear();
-            for i in old_tile_view.left()..old_tile_view.right() {
-                for j in old_tile_view.bottom()..old_tile_view.top() {
-                    let rc = Self::tile_world_rect(&map, tile_size, i, j);
-                    if new_view.contains_rect(&rc) {
-                        continue;
-                    }
-                    let index = (j * count + i) as usize;
-                    if !new_tile_view.contains_point(i, j) {
-                        self.data[index].watchers.remove(&slot);
-                    }
-                    Self::update_watcher(
-                        &map,
-                        &self.slab,
-                        option,
-                        &mut self.event_queue,
-                        &self.data[index],
-                        old_view,
-                        new_view,
-                        &obj,
-                        Vtm::ZoomIn,
-                        old_layer,
-                        &mut seen,
-                    );
-                }
-            }
-            if old_layer != obj.layer {
-                seen.clear();
-                for i in new_tile_view.left()..new_tile_view.right() {
-                    for j in new_tile_view.bottom()..new_tile_view.top() {
-                        let index = (j * count + i) as usize;
-                        Self::update_watcher(
-                            &map,
-                            &self.slab,
-                            option,
-                            &mut self.event_queue,
-                            &self.data[index],
-                            Rect::default(),
-                            new_view,
-                            &obj,
-                            Vtm::Layer,
-                            old_layer,
-                            &mut seen,
-                        );
-                    }
-                }
-            }
-            self.scratch = seen;
-            return true;
-        }
-
-        // watcher zoom out: old view fully inside new view
-        if new_view.contains_rect(&old_view) {
-            seen.clear();
-            for i in new_tile_view.left()..new_tile_view.right() {
-                for j in new_tile_view.bottom()..new_tile_view.top() {
-                    let rc = Self::tile_world_rect(&map, tile_size, i, j);
-                    if old_view.contains_rect(&rc) {
-                        continue;
-                    }
-                    let index = (j * count + i) as usize;
-                    if !old_tile_view.contains_point(i, j) {
-                        self.data[index].watchers.insert(slot);
-                    }
-                    Self::update_watcher(
-                        &map,
-                        &self.slab,
-                        option,
-                        &mut self.event_queue,
-                        &self.data[index],
-                        old_view,
-                        new_view,
-                        &obj,
-                        Vtm::ZoomOut,
-                        old_layer,
-                        &mut seen,
-                    );
-                }
-            }
-            if old_layer != obj.layer {
-                seen.clear();
-                for i in old_tile_view.left()..old_tile_view.right() {
-                    for j in old_tile_view.bottom()..old_tile_view.top() {
-                        let index = (j * count + i) as usize;
-                        Self::update_watcher(
-                            &map,
-                            &self.slab,
-                            option,
-                            &mut self.event_queue,
-                            &self.data[index],
-                            Rect::default(),
-                            old_view,
-                            &obj,
-                            Vtm::Layer,
-                            old_layer,
-                            &mut seen,
-                        );
-                    }
-                }
-            }
-            self.scratch = seen;
-            return true;
-        }
-
-        // general case: partial overlap (or disjoint) views
-        let join_area = new_view.join(&old_view);
-        let join_tile_area = Self::calc_to_tile_rect(
-            &map,
-            tile_size,
-            count,
-            join_area.x,
-            join_area.y,
-            join_area.width,
-            join_area.height,
-        );
-
-        seen.clear();
-        for i in old_tile_view.left()..old_tile_view.right() {
-            for j in old_tile_view.bottom()..old_tile_view.top() {
-                let rc = Self::tile_world_rect(&map, tile_size, i, j);
-                if join_area.contains_rect(&rc) {
-                    continue;
-                }
-                let index = (j * count + i) as usize;
-                if join_tile_area.empty() || !join_tile_area.contains_point(i, j) {
-                    self.data[index].watchers.remove(&slot);
-                }
-                Self::update_watcher(
-                    &map,
-                    &self.slab,
-                    option,
-                    &mut self.event_queue,
-                    &self.data[index],
-                    old_view,
-                    join_area,
-                    &obj,
-                    Vtm::ZoomIn,
-                    old_layer,
-                    &mut seen,
-                );
-            }
-        }
-
-        seen.clear();
-        for i in new_tile_view.left()..new_tile_view.right() {
-            for j in new_tile_view.bottom()..new_tile_view.top() {
-                let rc = Self::tile_world_rect(&map, tile_size, i, j);
-                if join_area.contains_rect(&rc) {
-                    continue;
-                }
-                let index = (j * count + i) as usize;
-                if join_tile_area.empty() || !join_tile_area.contains_point(i, j) {
-                    self.data[index].watchers.insert(slot);
-                }
-                Self::update_watcher(
-                    &map,
-                    &self.slab,
-                    option,
-                    &mut self.event_queue,
-                    &self.data[index],
-                    join_area,
-                    new_view,
-                    &obj,
-                    Vtm::ZoomOut,
-                    old_layer,
-                    &mut seen,
-                );
-            }
-        }
-
-        if old_layer != obj.layer {
-            seen.clear();
-            for i in old_tile_view.left()..old_tile_view.right() {
-                for j in old_tile_view.bottom()..old_tile_view.top() {
-                    let index = (j * count + i) as usize;
-                    Self::update_watcher(
-                        &map,
-                        &self.slab,
-                        option,
-                        &mut self.event_queue,
-                        &self.data[index],
-                        Rect::default(),
-                        join_area,
-                        &obj,
-                        Vtm::Layer,
-                        old_layer,
-                        &mut seen,
-                    );
-                }
-            }
-        }
-        self.scratch = seen;
+        self.update_watcher_state(slot, prev);
+        self.emit_self_transition(prev, obj);
         true
     }
 
@@ -779,41 +486,64 @@ impl Aoi {
 
     /// Visits all markers within the tile rectangle covering `(x, y, w, h)`.
     /// `handler` receives each marker handle and whether its tile is on the
-    /// query's edge (so callers can do precise bounds re-checks on edges).
+    /// query's edge. Objects spanning tiles may repeat; this is a broad-phase
+    /// query. Use [`Self::query_objects`] to read candidates without a handle
+    /// lookup, or [`Self::query_rect`] for exact, unique results.
     pub fn query<F: FnMut(Handle, bool)>(&self, x: i32, y: i32, w: i32, h: i32, mut handler: F) {
-        let tile_rc = Self::calc_make_tile_rect(&self.rect, self.tile_size, self.count, x, y, w, h);
+        self.query_objects(x, y, w, h, |obj, is_edge| handler(obj.handle, is_edge));
+    }
+
+    /// Visits borrowed marker objects in the tiles covering the centered query
+    /// rectangle. Like [`Self::query`], this returns broad-phase candidates:
+    /// objects spanning tiles may repeat, and no exact shape, layer, hidden or
+    /// fixed filtering is applied. The boolean denotes a boundary tile, not
+    /// whether the object intersects the query rectangle.
+    ///
+    /// References point directly into object storage, avoiding a subsequent
+    /// [`Self::find`] lookup. The callback cannot mutate this AOI while it is
+    /// borrowed. Use [`Self::query_rect`] for exact, unique results.
+    pub fn query_objects<F: FnMut(&AoiObject, bool)>(
+        &self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        mut handler: F,
+    ) {
+        let tile_rc = self.grid.view_tiles(x, y, w, h);
         let start_x = tile_rc.x;
         let start_y = tile_rc.y;
         let end_x = tile_rc.right();
         let end_y = tile_rc.top();
 
-        for i in start_x..end_x {
-            let is_x_edge = i == start_x || i == end_x - 1;
-            for j in start_y..end_y {
-                let is_edge = is_x_edge || j == start_y || j == end_y - 1;
-                let node = &self.data[(j * self.count + i) as usize];
+        for j in start_y..end_y {
+            let is_y_edge = j == start_y || j == end_y - 1;
+            for i in start_x..end_x {
+                let is_edge = is_y_edge || i == start_x || i == end_x - 1;
+                let node = &self.data[(j * self.grid.count + i) as usize];
                 for &mh in &node.markers {
-                    handler(self.slab[mh as usize].handle, is_edge);
+                    handler(&self.objects.values[mh as usize], is_edge);
                 }
             }
         }
     }
 
-    /// Visits every object whose `mode` matches `filter`, in tile order.
-    /// `handler` receives `(handle, x, y, tile_x, tile_y)`.
+    /// Visits tile memberships whose object `mode` matches `filter`, in tile
+    /// order. Objects may repeat. `handler` receives `(handle, x, y, tile_x,
+    /// tile_y)`; use [`Self::objects`] to visit registered objects once.
     pub fn for_each_all<F: FnMut(Handle, i32, i32, i32, i32)>(&self, mut handler: F, filter: i32) {
-        let count = self.count;
+        let count = self.grid.count;
         for y in 0..count {
             for x in 0..count {
                 let node = &self.data[(y * count + x) as usize];
                 for &mh in &node.markers {
-                    let m = &self.slab[mh as usize];
+                    let m = &self.objects.values[mh as usize];
                     if m.mode & filter != 0 {
                         handler(m.handle, m.x, m.y, x, y);
                     }
                 }
                 for &wh in &node.watchers {
-                    let w = &self.slab[wh as usize];
+                    let w = &self.objects.values[wh as usize];
                     if w.mode & filter != 0 {
                         handler(w.handle, w.x, w.y, x, y);
                     }
@@ -824,14 +554,14 @@ impl Aoi {
 
     /// Casts a ray from `spos` to `epos` sampling every `step` units, returning
     /// the handle of the first `FIXED` marker whose footprint contains a sample.
+    /// When several markers contain the first hit sample, their tie order is unspecified.
     /// Returns `None` for a non-positive/non-finite step or non-finite distance.
     pub fn raycast(&self, spos: Vec2, epos: Vec2, step: f32) -> Option<Handle> {
         if !step.is_finite() || step <= 0.0 {
             return None;
         }
-        let map = self.rect;
-        let count = self.count;
-        let tile_size = self.tile_size;
+        let grid = self.grid;
+        let count = self.grid.count;
 
         let d = spos.distance(&epos);
         if !d.is_finite() {
@@ -839,13 +569,35 @@ impl Aoi {
         }
         let dir = (epos - spos).normalized();
         let mut f = 0.0_f32;
+        // Cache the tile between boundary crossings, but still test every
+        // sample. Integer bounds preserve float-to-int truncation and the
+        // clamping of samples outside the map (including negative origins).
+        let (mut left, mut right, mut bottom, mut top) = (1, 0, 1, 0);
+        let mut node = &self.data[0];
         while f < d {
             let pos = spos + dir * f;
-            let tile_x = Self::calc_tile_x(&map, tile_size, count, pos.x as i32);
-            let tile_y = Self::calc_tile_y(&map, tile_size, count, pos.y as i32);
-            let node = &self.data[(tile_y * count + tile_x) as usize];
+            let x = pos.x as i32;
+            let y = pos.y as i32;
+            if x < left || x > right || y < bottom || y > top {
+                let tile_x = grid.tile_x(x);
+                let tile_y = grid.tile_y(y);
+                let bounds = grid.tile_world(tile_x, tile_y);
+                left = if tile_x == 0 { i32::MIN } else { bounds.x };
+                bottom = if tile_y == 0 { i32::MIN } else { bounds.y };
+                right = if tile_x == count - 1 {
+                    i32::MAX
+                } else {
+                    bounds.right() - 1
+                };
+                top = if tile_y == count - 1 {
+                    i32::MAX
+                } else {
+                    bounds.top() - 1
+                };
+                node = &self.data[(tile_y * count + tile_x) as usize];
+            }
             for &mh in &node.markers {
-                let m = &self.slab[mh as usize];
+                let m = &self.objects.values[mh as usize];
                 if m.mode & FIXED == 0 {
                     continue;
                 }
@@ -869,67 +621,77 @@ impl Aoi {
     /// registry with its geometry zeroed (soft delete) but unlinked from all
     /// tiles.
     pub fn erase(&mut self, handle: Handle, remove: bool) {
-        let slot = match self.index.get(&handle) {
+        if remove {
+            self.remove(handle);
+            return;
+        }
+        let slot = match self.objects.index.get(&handle) {
             Some(&s) => s,
             None => return,
         };
-        let obj = self.slab[slot as usize];
-        let map = self.rect;
-        let count = self.count;
-        let tile_size = self.tile_size;
+        self.detach_slot(slot);
+        let o = &mut self.objects.values[slot as usize];
+        o.x = 0;
+        o.y = 0;
+        o.w = 0;
+        o.h = 0;
+        o.layer = 0;
+    }
+
+    #[inline]
+    fn detach_slot(&mut self, slot: Slot) {
+        if !self.objects.attached[slot as usize] {
+            return;
+        }
+        self.objects.attached[slot as usize] = false;
+        let obj = self.objects.values[slot as usize];
+        let grid = self.grid;
+        let count = self.grid.count;
 
         if obj.mode & MARKER != 0 {
-            let is_range = Self::is_range_marker(obj.mode, obj.w, obj.h);
-            let cover = if is_range {
-                Self::calc_make_tile_rect(&map, tile_size, count, obj.x, obj.y, obj.w, obj.h)
-            } else {
-                let tile_x = Self::calc_tile_x(&map, tile_size, count, obj.x);
-                let tile_y = Self::calc_tile_y(&map, tile_size, count, obj.y);
-                Rect::new(tile_x, tile_y, 1, 1)
-            };
+            let is_range = obj.is_range_marker();
+            let cover = grid.marker_cover(&obj);
             self.remove_marker_tiles(cover, slot);
             if obj.mode & HIDE == 0 {
                 let area = if is_range {
-                    Some(Self::calc_make_rect(&map, obj.x, obj.y, obj.w, obj.h))
+                    Some(grid.view(obj.x, obj.y, obj.w, obj.h))
                 } else {
                     None
                 };
-                self.emit_to_watchers(cover, obj.x, obj.y, area, obj.layer, handle, EVENT_LEAVE);
+                self.emit_to_watchers(
+                    cover,
+                    obj.x,
+                    obj.y,
+                    area,
+                    obj.layer,
+                    obj.handle,
+                    EVENT_LEAVE,
+                );
             }
         }
 
         if obj.mode & WATCHER != 0 {
-            let tr = Self::calc_make_tile_rect(&map, tile_size, count, obj.x, obj.y, obj.w, obj.h);
-            for i in tr.left()..tr.right() {
-                for j in tr.bottom()..tr.top() {
-                    let index = (j * count + i) as usize;
-                    self.data[index].watchers.remove(&slot);
-                }
-            }
-        }
-
-        if remove {
-            self.index.remove(&handle);
-            self.free.push(slot);
-        } else {
-            let o = &mut self.slab[slot as usize];
-            o.x = 0;
-            o.y = 0;
-            o.w = 0;
-            o.h = 0;
-            o.layer = 0;
+            let tr = grid.view_tiles(obj.x, obj.y, obj.w, obj.h);
+            tr.for_each(|i, j| {
+                let index = (j * count + i) as usize;
+                self.data[index].watchers.remove(&slot);
+            });
         }
     }
 
-    /// Removes all objects and clears every tile.
+    /// Removes all objects and pending events, retaining allocated capacity.
+    /// Occupied tile versions advance so external caches can invalidate them.
     pub fn clear(&mut self) {
         for n in &mut self.data {
+            if !n.markers.is_empty() {
+                n.version += 1;
+            }
             n.markers.clear();
             n.watchers.clear();
         }
-        self.slab.clear();
-        self.free.clear();
-        self.index.clear();
+        self.objects.clear();
+        self.event_queue.clear();
+        self.scratch.reset();
     }
 
     // ── accessors ─────────────────────────────────────────────────────────────
@@ -941,17 +703,20 @@ impl Aoi {
 
     #[inline]
     pub fn has_object(&self, handle: Handle) -> bool {
-        self.index.contains_key(&handle)
+        self.objects.index.contains_key(&handle)
     }
 
     #[inline]
     pub fn find(&self, handle: Handle) -> Option<&AoiObject> {
-        self.index.get(&handle).map(|&s| &self.slab[s as usize])
+        self.objects
+            .index
+            .get(&handle)
+            .map(|&s| &self.objects.values[s as usize])
     }
 
     #[inline]
     pub fn size(&self) -> usize {
-        self.index.len()
+        self.objects.index.len()
     }
 
     #[inline]
@@ -967,7 +732,7 @@ impl Aoi {
     /// Linear tile index for `(tile_x, tile_y)`.
     #[inline]
     pub fn get_index(&self, x: i32, y: i32) -> usize {
-        (y * self.count + x) as usize
+        (y * self.grid.count + x) as usize
     }
 
     /// Monotonic version counter of a tile (bumped by fixed-object changes).
@@ -984,7 +749,7 @@ impl Aoi {
         self.data[index]
             .markers
             .iter()
-            .map(|&s| self.slab[s as usize].handle)
+            .map(|&s| self.objects.values[s as usize].handle)
             .collect()
     }
 
@@ -1000,313 +765,24 @@ impl Aoi {
         }
     }
 
-    /// A marker is a "range marker" (occupies an area / multiple tiles) when it
-    /// is marker-only with positive extent. Watcher+marker objects are points.
-    #[inline]
-    fn is_range_marker(mode: i32, w: i32, h: i32) -> bool {
-        (mode & WATCHER == 0) && w > 0 && h > 0
-    }
-
-    /// The marker's visibility shape: `Some(rect)` for range markers (area), or
-    /// `None` for point markers (use the center point).
-    #[inline]
-    fn marker_area_of(map: &Rect, m: &AoiObject) -> Option<Rect> {
-        if Self::is_range_marker(m.mode, m.w, m.h) {
-            Some(Self::calc_make_rect(map, m.x, m.y, m.w, m.h))
-        } else {
-            None
-        }
-    }
-
     /// Whether a watcher `view` can see a marker: half-open area intersection for
     /// range markers, half-open point containment for point markers.
     #[cfg_attr(feature = "prof_noinline", inline(never))]
     #[cfg_attr(not(feature = "prof_noinline"), inline)]
-    fn marker_seen(view: &Rect, mx: i32, my: i32, area: Option<Rect>) -> bool {
+    fn marker_seen(view: &WorldRect, mx: i32, my: i32, area: Option<WorldRect>) -> bool {
         match area {
             Some(a) => view.intersects_halfopen(&a),
             None => view.contains_point(mx, my),
         }
     }
 
-    /// Registers a marker `slot` into every tile of `cover` (and bumps versions).
-    fn add_marker_tiles(&mut self, cover: Rect, slot: Slot) {
-        let obj = self.slab[slot as usize];
-        let count = self.count;
-        for i in cover.left()..cover.right() {
-            for j in cover.bottom()..cover.top() {
-                let index = (j * count + i) as usize;
-                Self::update_tile_version(&obj, &mut self.data[index]);
-                let inserted = self.data[index].markers.insert(slot);
-                debug_assert!(inserted);
-            }
-        }
-    }
-
-    /// Unregisters a marker `slot` from every tile of `cover` (and bumps versions).
-    fn remove_marker_tiles(&mut self, cover: Rect, slot: Slot) {
-        let obj = self.slab[slot as usize];
-        let count = self.count;
-        for i in cover.left()..cover.right() {
-            for j in cover.bottom()..cover.top() {
-                let index = (j * count + i) as usize;
-                Self::update_tile_version(&obj, &mut self.data[index]);
-                let removed = self.data[index].markers.remove(&slot);
-                debug_assert!(removed);
-            }
-        }
-    }
-
-    /// Emits `eventid` to every watcher (gathered uniquely across `cover` tiles)
-    /// that can currently see the marker at `(mx, my)` with shape `area` and
-    /// layer `mlayer`. Dedup ensures a watcher spanning several of the marker's
-    /// tiles is notified at most once.
-    #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(feature = "prof_noinline", inline(never))]
-    fn emit_to_watchers(
-        &mut self,
-        cover: Rect,
-        mx: i32,
-        my: i32,
-        area: Option<Rect>,
-        mlayer: i32,
-        mhandle: Handle,
-        eventid: i32,
-    ) {
-        let map = self.rect;
-        let count = self.count;
-        let option = self.option;
-        // Dedup is only needed when the marker spans more than one tile (only
-        // then can the same watcher be registered in several scanned tiles). For
-        // the overwhelmingly common single-tile marker, skip the per-watcher
-        // hash-set probe entirely — that hash was pure overhead vs C++.
-        let need_dedup = cover.width > 1 || cover.height > 1;
-        let mut seen = std::mem::take(&mut self.scratch);
-        seen.clear();
-        for i in cover.left()..cover.right() {
-            for j in cover.bottom()..cover.top() {
-                let index = (j * count + i) as usize;
-                for &wh in &self.data[index].watchers {
-                    if need_dedup && !seen.insert(wh) {
-                        continue;
-                    }
-                    let w = &self.slab[wh as usize];
-                    if option & ENABLE_SELF_EVENT == 0 && w.handle == mhandle {
-                        continue;
-                    }
-                    let view = Self::calc_make_rect(&map, w.x, w.y, w.w, w.h);
-                    if w.layer <= mlayer && Self::marker_seen(&view, mx, my, area) {
-                        self.event_queue
-                            .push(AoiEvent::new(eventid, w.handle, mhandle));
-                    }
-                }
-            }
-        }
-        self.scratch = seen;
-    }
-
-    #[cfg_attr(feature = "prof_noinline", inline(never))]
-    fn update_marker(
-        &mut self,
-        slot: Slot,
-        old_x: i32,
-        old_y: i32,
-        old_w: i32,
-        old_h: i32,
-        old_layer: i32,
-    ) {
-        let map = self.rect;
-        let count = self.count;
-        let tile_size = self.tile_size;
-        let option = self.option;
-
-        let obj = self.slab[slot as usize];
-        let old_cx = Self::calc_tile_x(&map, tile_size, count, old_x);
-        let old_cy = Self::calc_tile_y(&map, tile_size, count, old_y);
-        let new_cx = Self::calc_tile_x(&map, tile_size, count, obj.x);
-        let new_cy = Self::calc_tile_y(&map, tile_size, count, obj.y);
-        let new_index = (new_cy * count + new_cx) as usize;
-
-        // A1 fix: diff the *tile coverage* of the marker. A range marker
-        // (marker-only with positive extent) occupies every tile its box
-        // overlaps; the old single-tile move corrupted membership when such a
-        // marker moved. Point markers reduce to a 1x1 coverage rect, so this
-        // path also reproduces the original point-marker behavior.
-        let old_cover = if (obj.mode & WATCHER == 0) && old_w > 0 && old_h > 0 {
-            Self::calc_make_tile_rect(&map, tile_size, count, old_x, old_y, old_w, old_h)
-        } else {
-            Rect::new(old_cx, old_cy, 1, 1)
-        };
-        let new_cover = if (obj.mode & WATCHER == 0) && obj.w > 0 && obj.h > 0 {
-            Self::calc_make_tile_rect(&map, tile_size, count, obj.x, obj.y, obj.w, obj.h)
-        } else {
-            Rect::new(new_cx, new_cy, 1, 1)
-        };
-
-        // tiles no longer covered: drop membership
-        for i in old_cover.left()..old_cover.right() {
-            for j in old_cover.bottom()..old_cover.top() {
-                if new_cover.contains_point(i, j) {
-                    continue;
-                }
-                let index = (j * count + i) as usize;
-                Self::update_tile_version(&obj, &mut self.data[index]);
-                // Membership may already be absent when re-linking a
-                // soft-erased marker (`erase(_, false)` unlinks but keeps the
-                // object); tolerate it like the C++ reference's `[[maybe_unused]]`.
-                self.data[index].markers.remove(&slot);
-            }
-        }
-        // tiles newly covered: add membership
-        for i in new_cover.left()..new_cover.right() {
-            for j in new_cover.bottom()..new_cover.top() {
-                if old_cover.contains_point(i, j) {
-                    continue;
-                }
-                let index = (j * count + i) as usize;
-                Self::update_tile_version(&obj, &mut self.data[index]);
-                self.data[index].markers.insert(slot);
-            }
-        }
-        // A position-only move (coverage unchanged) still bumps the current
-        // tile's version so version-cache consumers notice fixed markers
-        // shifting in place.
-        Self::update_tile_version(&obj, &mut self.data[new_index]);
-
-        if obj.mode & HIDE != 0 {
-            return;
-        }
-
-        // Events use area-intersection visibility for range markers (point
-        // containment for point markers). Visibility is evaluated against the
-        // old state (old pos/extent/layer) vs the new state, so position, extent
-        // and layer changes all map to the correct enter/leave/pos (A2). Candidate
-        // watchers are gathered uniquely across the union of the old and new
-        // coverage tiles, so a watcher spanning several of the marker's tiles is
-        // notified at most once.
-        let old_area = if Self::is_range_marker(obj.mode, old_w, old_h) {
-            Some(Self::calc_make_rect(&map, old_x, old_y, old_w, old_h))
-        } else {
-            None
-        };
-        let new_area = if Self::is_range_marker(obj.mode, obj.w, obj.h) {
-            Some(Self::calc_make_rect(&map, obj.x, obj.y, obj.w, obj.h))
-        } else {
-            None
-        };
-
-        // Scan the union of old/new coverage. When the marker stayed within the
-        // same tile set, a single pass suffices; dedup is only required when more
-        // than one tile is visited (a watcher may then sit in several of them).
-        let both = [old_cover, new_cover];
-        let covers: &[Rect] = if old_cover == new_cover {
-            &both[..1]
-        } else {
-            &both[..]
-        };
-        let need_dedup = covers.len() > 1 || old_cover.width > 1 || old_cover.height > 1;
-        let mut seen = std::mem::take(&mut self.scratch);
-        seen.clear();
-        for &cover in covers {
-            for i in cover.left()..cover.right() {
-                for j in cover.bottom()..cover.top() {
-                    let index = (j * count + i) as usize;
-                    for &wh in &self.data[index].watchers {
-                        if need_dedup && !seen.insert(wh) {
-                            continue;
-                        }
-                        let w = &self.slab[wh as usize];
-                        if option & ENABLE_SELF_EVENT == 0 && w.handle == obj.handle {
-                            continue;
-                        }
-                        let view = Self::calc_make_rect(&map, w.x, w.y, w.w, w.h);
-                        let was = w.layer <= old_layer
-                            && Self::marker_seen(&view, old_x, old_y, old_area);
-                        let is = w.layer <= obj.layer
-                            && Self::marker_seen(&view, obj.x, obj.y, new_area);
-                        if was && !is {
-                            if option & ENABLE_LEAVE_EVENT != 0 {
-                                self.event_queue.push(AoiEvent::new(
-                                    EVENT_LEAVE,
-                                    w.handle,
-                                    obj.handle,
-                                ));
-                            }
-                        } else if !was && is {
-                            self.event_queue
-                                .push(AoiEvent::new(EVENT_ENTER, w.handle, obj.handle));
-                        } else if was && is {
-                            self.event_queue
-                                .push(AoiEvent::new(EVENT_POS, w.handle, obj.handle));
-                        }
-                    }
-                }
-            }
-        }
-        self.scratch = seen;
-    }
-
-    /// Scans a tile's markers and emits enter/leave for a watcher whose view
-    /// transitioned per `vtm`. Takes disjoint borrows so callers can pass
-    /// `&self.slab`, `&mut self.event_queue`, and `&self.data[i]` together.
-    #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(feature = "prof_noinline", inline(never))]
-    fn update_watcher(
-        map: &Rect,
-        slab: &[AoiObject],
-        option: i32,
-        events: &mut Vec<AoiEvent>,
-        tile: &Tile,
-        old_view: Rect,
-        new_view: Rect,
-        obj: &AoiObject,
-        vtm: Vtm,
-        old_layer: i32,
-        seen: &mut HashSet<Slot>,
-    ) {
-        for &mh in &tile.markers {
-            // dedup within this scan pass: a range marker registered to several
-            // of the watcher's tiles must be evaluated only once.
-            if !seen.insert(mh) {
-                continue;
-            }
-            let m = &slab[mh as usize];
-            if (m.mode & (FIXED | HIDE) != 0)
-                || (option & ENABLE_SELF_EVENT == 0 && obj.handle == m.handle)
-            {
-                continue;
-            }
-            let area = Self::marker_area_of(map, m);
-            match vtm {
-                Vtm::ZoomIn => {
-                    if option & ENABLE_LEAVE_EVENT != 0
-                        && m.layer >= old_layer
-                        && m.layer >= obj.layer
-                        && Self::marker_seen(&old_view, m.x, m.y, area)
-                        && !Self::marker_seen(&new_view, m.x, m.y, area)
-                    {
-                        events.push(AoiEvent::new(EVENT_LEAVE, obj.handle, m.handle));
-                    }
-                }
-                Vtm::ZoomOut => {
-                    if m.layer >= obj.layer
-                        && Self::marker_seen(&new_view, m.x, m.y, area)
-                        && !Self::marker_seen(&old_view, m.x, m.y, area)
-                    {
-                        events.push(AoiEvent::new(EVENT_ENTER, obj.handle, m.handle));
-                    }
-                }
-                Vtm::Layer => {
-                    if Self::marker_seen(&new_view, m.x, m.y, area) {
-                        if old_layer > obj.layer && m.layer < old_layer && m.layer >= obj.layer {
-                            events.push(AoiEvent::new(EVENT_ENTER, obj.handle, m.handle));
-                        }
-                        if old_layer < obj.layer && m.layer >= old_layer && m.layer < obj.layer {
-                            events.push(AoiEvent::new(EVENT_LEAVE, obj.handle, m.handle));
-                        }
-                    }
-                }
-            }
+    #[inline]
+    fn transition_event(was: bool, is: bool, leave: bool, position: bool) -> Option<i32> {
+        match (was, is) {
+            (false, true) => Some(EVENT_ENTER),
+            (true, false) if leave => Some(EVENT_LEAVE),
+            (true, true) if position => Some(EVENT_POS),
+            _ => None,
         }
     }
 }

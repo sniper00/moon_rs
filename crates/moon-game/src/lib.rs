@@ -5,8 +5,10 @@
 //! bindings, if needed, live in `moon-runtime` and wrap these types.
 //!
 //! Modules:
+//! - [`common`]: reusable ID containers, deduplication, and rectangle algorithms.
 //! - [`math`]: small integer/float geometry primitives shared across algorithms.
 //! - [`aoi`]: grid-based Area of Interest system (watcher/marker events).
 
 pub mod aoi;
+pub mod common;
 pub mod math;

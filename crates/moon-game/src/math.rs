@@ -48,10 +48,10 @@ impl Rect {
         self.y + self.height
     }
 
-    /// Matches C++ `rect::empty()` for integers (epsilon collapses to 0).
+    /// A half-open rectangle has no area if either dimension is non-positive.
     #[inline]
     pub const fn empty(&self) -> bool {
-        self.width <= 0 && self.height <= 0
+        self.width <= 0 || self.height <= 0
     }
 
     /// Half-open point containment: `x <= px < right() && y <= py < top()`.
@@ -72,14 +72,17 @@ impl Rect {
     /// containment, so this unifies point and area visibility tests.
     #[inline]
     pub const fn intersects_halfopen(&self, rc: &Rect) -> bool {
-        self.x < rc.right() && rc.x < self.right() && self.y < rc.top() && rc.y < self.top()
+        !self.empty()
+            && !rc.empty()
+            && self.x < rc.right()
+            && rc.x < self.right()
+            && self.y < rc.top()
+            && rc.y < self.top()
     }
 
     /// Intersection of two rectangles (C++ `rect::join`).
     ///
-    /// Returns an empty rect if either operand is empty. The result may have a
-    /// non-positive width/height when the rectangles are disjoint; this is
-    /// intentional to stay faithful to the original algorithm.
+    /// Empty or disjoint operands produce the canonical empty rectangle.
     #[inline]
     pub fn join(&self, other: &Rect) -> Rect {
         if self.empty() || other.empty() {
@@ -89,7 +92,11 @@ impl Rect {
         let miny = self.y.max(other.y);
         let maxx = (self.x + self.width).min(other.x + other.width);
         let maxy = (self.y + self.height).min(other.y + other.height);
-        Rect::new(minx, miny, maxx - minx, maxy - miny)
+        if maxx <= minx || maxy <= miny {
+            Rect::default()
+        } else {
+            Rect::new(minx, miny, maxx - minx, maxy - miny)
+        }
     }
 }
 

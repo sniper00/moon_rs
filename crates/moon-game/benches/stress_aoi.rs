@@ -1,4 +1,5 @@
-//! Criterion port of the reference C++ `aoi/stress_aoi.cpp` suite (S1..S25).
+//! Criterion port of the reference C++ `aoi/stress_aoi.cpp` suite (S1..S25),
+//! plus Rust boundary-scan and range-marker dedup workloads (S26..S27).
 //!
 //! Each C++ stress test mixed setup + a timed workload + console reporting.
 //! Here the *timed workload* of every scenario becomes a Criterion benchmark:
@@ -439,14 +440,13 @@ fn bench(c: &mut Criterion) {
                     let qy = rng.range(10000);
                     let qr = Rect::new(qx - 250, qy - 250, 500, 500);
                     let mut found: HashSet<Handle> = HashSet::new();
-                    aoi.query(qx, qy, 500, 500, |h, is_edge| {
+                    aoi.query_objects(qx, qy, 500, 500, |m, is_edge| {
                         if is_edge {
-                            let m = aoi.find(h).unwrap();
                             if !qr.contains_point(m.x, m.y) {
                                 return;
                             }
                         }
-                        found.insert(h);
+                        found.insert(m.handle);
                     });
                     total += found.len();
                 }
@@ -971,6 +971,96 @@ fn bench(c: &mut Criterion) {
                 }
                 black_box(aoi.events().len());
                 aoi // returned so criterion drops it *outside* the timed region
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // S26. Small moves of a view covering ~10,000 tiles: interior tiles stay
+    // visible and should not be visited individually on each update.
+    g.throughput(Throughput::Elements(1000));
+    g.bench_function("S26_large_view_small_moves", |b| {
+        b.iter_batched(
+            || {
+                let mut aoi = Aoi::new(0, 0, 4000, 20);
+                aoi.set_option(ENABLE_LEAVE_EVENT);
+                for i in 0..500i32 {
+                    ins(
+                        &mut aoi,
+                        1000 + i as i64,
+                        i * 73 % 4000,
+                        i * 137 % 4000,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
+                }
+                ins(&mut aoi, 1, 1500, 2000, 2000, 2000, 0, W);
+                aoi
+            },
+            |mut aoi| {
+                for i in 0..1000 {
+                    aoi.clear_event();
+                    aoi.update(1, 1500 + i % 100 * 2, 2000 + i % 150 * 2, 2000, 2000, 0);
+                }
+                black_box(aoi.events().len());
+                aoi
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // S27. Range markers span several tiles populated by the same watchers.
+    // Each watcher must receive at most one event per marker update.
+    g.throughput(Throughput::Elements(20 * 50));
+    g.bench_function("S27_range_marker_moves", |b| {
+        b.iter_batched(
+            || {
+                let mut aoi = Aoi::new(0, 0, 2000, 50);
+                aoi.set_option(ENABLE_LEAVE_EVENT);
+                for i in 0..100i32 {
+                    ins(
+                        &mut aoi,
+                        i as i64,
+                        900 + i % 10 * 20,
+                        900 + i / 10 * 20,
+                        300,
+                        300,
+                        0,
+                        W,
+                    );
+                }
+                for i in 0..50i32 {
+                    ins(
+                        &mut aoi,
+                        1000 + i as i64,
+                        850 + i * 37 % 300,
+                        850 + i * 71 % 300,
+                        200,
+                        200,
+                        0,
+                        M,
+                    );
+                }
+                aoi
+            },
+            |mut aoi| {
+                for tick in 0..20 {
+                    for i in 0..50 {
+                        aoi.clear_event();
+                        aoi.update(
+                            1000 + i as i64,
+                            850 + (i * 37 + tick * 17) % 300,
+                            850 + (i * 71 + tick * 13) % 300,
+                            200,
+                            200,
+                            0,
+                        );
+                    }
+                }
+                black_box(aoi.events().len());
+                aoi
             },
             BatchSize::PerIteration,
         );

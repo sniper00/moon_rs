@@ -1,0 +1,97 @@
+/// Deduplicates compact `u32` IDs across sequential scans using generation marks.
+///
+/// Call [`Self::begin`] before each scan, then [`Self::insert`] for each ID.
+/// IDs must retain their meaning during a scan. Storage grows lazily to the
+/// highest visited ID, so this is intended for dense, bounded ID spaces.
+#[derive(Default)]
+pub struct VisitMarks {
+    marks: Vec<u32>,
+    epoch: u32,
+}
+
+impl VisitMarks {
+    /// Starts a fresh scan, retaining allocated storage.
+    #[inline]
+    pub fn begin(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.restart_epoch();
+        }
+    }
+
+    /// Returns true only on the first visit in the current operation.
+    #[inline]
+    pub fn insert(&mut self, slot: u32) -> bool {
+        debug_assert_ne!(self.epoch, 0, "begin a scan before marking slots");
+        let slot = slot as usize;
+        if slot >= self.marks.len() {
+            self.grow(slot + 1);
+        }
+        let mark = &mut self.marks[slot];
+        if *mark == self.epoch {
+            return false;
+        }
+        *mark = self.epoch;
+        true
+    }
+
+    // Keep allocation and epoch wraparound out of the inlined candidate loops.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, len: usize) {
+        self.marks.resize(len, 0);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn restart_epoch(&mut self) {
+        // Zero means unvisited, including newly allocated slots. Clear all
+        // old generations before reusing epoch 1 after wraparound.
+        self.marks.fill(0);
+        self.epoch = 1;
+    }
+
+    /// Discards all ID history, retaining capacity. Call begin before reuse.
+    pub fn reset(&mut self) {
+        self.marks.clear();
+        self.epoch = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VisitMarks;
+
+    #[test]
+    fn visit_marks_reuse_grow_reset_and_wrap() {
+        let mut marks = VisitMarks::default();
+        marks.begin();
+        assert!(marks.insert(0));
+        assert!(!marks.insert(0));
+        assert!(marks.insert(100));
+        assert!(marks.insert(50));
+        assert!(!marks.insert(100));
+        marks.begin();
+        assert!(marks.insert(100));
+        assert!(!marks.insert(100));
+
+        // Slot 0 still carries epoch 1. Wrapping must not mistake it for a
+        // visit in the new epoch 1, nor newly allocated slots for visited ones.
+        marks.epoch = u32::MAX;
+        assert!(marks.insert(50));
+        marks.begin();
+        assert_eq!(marks.epoch, 1);
+        assert!(marks.insert(0));
+        assert!(marks.insert(50));
+        assert!(marks.insert(101));
+        assert!(!marks.insert(101));
+
+        let capacity = marks.marks.capacity();
+        marks.reset();
+        assert_eq!(marks.marks.capacity(), capacity);
+        marks.begin();
+        assert!(marks.insert(0));
+        assert!(marks.insert(100));
+        assert!(!marks.insert(0));
+    }
+}

@@ -4,6 +4,9 @@
 use super::*;
 use crate::math::Vec2;
 
+mod model;
+mod regressions;
+
 const W: i32 = WATCHER;
 const M: i32 = MARKER;
 const F: i32 = FIXED;
@@ -236,6 +239,47 @@ fn update_watcher_no_change() {
     a.clear_event();
     assert!(a.update(1, 50, 50, 20, 20, 0));
     assert!(a.events().is_empty());
+}
+
+#[test]
+fn unchanged_update_preserves_marker_events_and_versions() {
+    for mode in [M, W | M, W | M | F] {
+        let mut a = Aoi::new(0, 0, 100, 10);
+        ins(&mut a, 1, 50, 50, 40, 40, 0, W);
+        ins(&mut a, 2, 50, 50, 20, 20, 0, mode);
+        let index = a.get_index(5, 5);
+        let version = a.get_version(index);
+        a.clear_event();
+        assert!(a.update(2, 50, 50, 20, 20, -1));
+        assert_eq!(a.events(), &[AoiEvent::new(EVENT_POS, 1, 2)]);
+        assert_eq!(a.get_version(index) > version, mode & F != 0);
+    }
+}
+
+#[test]
+fn watcher_shrink_without_leave_events_keeps_membership_consistent() {
+    let mut a = Aoi::new(0, 0, 100, 10);
+    ins(&mut a, 1, 50, 50, 80, 80, 0, W);
+    ins(&mut a, 2, 20, 20, 0, 0, 0, M);
+    a.clear_event();
+    assert!(a.update(1, 50, 50, 20, 20, 0));
+    assert!(a.events().is_empty());
+    a.fire_event_pos(55, 55, EVENT_POS);
+    assert_eq!(a.events(), &[AoiEvent::new(EVENT_POS, 1, 0)]);
+    // Check unlinking as well as visibility: an obsolete tile must not retain
+    // the watcher when leave-event scanning is disabled.
+    let slot = a.objects.index[&1];
+    assert!(!a.data[a.get_index(2, 2)].watchers.contains(&slot));
+}
+
+#[test]
+fn tile_rect_preserves_odd_and_zero_dimensions() {
+    let a = Aoi::new(10, -10, 100, 10);
+    assert_eq!(a.make_tile_rect(30, 10, 1, 1), Rect::new(2, 2, 1, 1));
+    assert_eq!(a.make_tile_rect(30, 10, 3, 3), Rect::new(1, 1, 2, 2));
+    assert_eq!(a.make_tile_rect(30, 10, 0, 20), Rect::new(2, 1, 0, 0));
+    assert_eq!(a.make_tile_rect(30, 10, 20, 0), Rect::new(1, 2, 0, 0));
+    assert_eq!(a.make_tile_rect(10, -10, 40, 40), Rect::new(0, 0, 3, 3));
 }
 
 #[test]
@@ -1218,6 +1262,23 @@ fn range_marker_move_within_view_pos_dedup() {
 }
 
 #[test]
+fn range_marker_move_scans_old_new_and_overlapping_watchers_once() {
+    let mut a = Aoi::new(0, 0, 100, 10);
+    a.set_option(ENABLE_LEAVE_EVENT);
+    ins(&mut a, 1, 22, 50, 4, 4, 0, W);
+    ins(&mut a, 2, 65, 50, 4, 4, 0, W);
+    ins(&mut a, 3, 45, 50, 60, 60, 0, W);
+    ins(&mut a, 4, 45, 50, 60, 60, 5, W);
+    ins(&mut a, 5, 40, 50, 40, 40, 0, M);
+    a.clear_event();
+    assert!(a.update(5, 50, 50, 40, 40, 1));
+    assert_eq!(a.events().len(), 3);
+    assert_eq!(count_event(&a, EVENT_LEAVE, 1, 5), 1);
+    assert_eq!(count_event(&a, EVENT_ENTER, 2, 5), 1);
+    assert_eq!(count_event(&a, EVENT_POS, 3, 5), 1);
+}
+
+#[test]
 fn multiple_range_markers_one_watcher() {
     let mut a = Aoi::new(0, 0, 100, 10);
     ins(&mut a, 1, 50, 50, 80, 80, 0, W); // big view
@@ -1574,7 +1635,7 @@ fn profile_flamegraph() {
     }
 
     // S12: 10 layers x 50 point markers + 1 big watcher; 10 layer switches
-    // (Vtm::Layer scan of a single dense tile cluster).
+    // (Watcher layer scan of a single dense tile cluster).
     {
         let mut a = Aoi::new(0, 0, 5000, 100);
         a.set_option(ENABLE_LEAVE_EVENT);
