@@ -22,7 +22,7 @@ use sqlx::{
     postgres::{PgPoolOptions, PgRow},
     sqlite::{SqlitePoolOptions, SqliteRow},
 };
-use std::{ffi::c_int, time::Duration};
+use std::{ffi::c_int, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -310,7 +310,7 @@ impl DatabasePool {
     /// trusted, statically-known statement; never build it by concatenating
     /// untrusted input. Use `$1`/`?` placeholders + binds for all values.
     fn make_query<DB: sqlx::Database>(
-        sql: String,
+        sql: Arc<String>,
         binds: &[QueryParams],
     ) -> Result<sqlx::query::Query<'static, DB, <DB as sqlx::Database>::Arguments>, sqlx::Error>
     where
@@ -474,7 +474,7 @@ enum QueryParams {
 
 #[derive(Debug, Clone)]
 struct DatabaseQuery {
-    sql: String,
+    sql: Arc<String>,
     binds: Vec<QueryParams>,
 }
 
@@ -863,7 +863,14 @@ fn query_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
         state,
         &conn.tx,
         &conn.counter,
-        DatabaseRequest::Query(owner, session, DatabaseQuery { sql, binds: params }),
+        DatabaseRequest::Query(
+            owner,
+            session,
+            DatabaseQuery {
+                sql: Arc::new(sql),
+                binds: params,
+            },
+        ),
     ))
 }
 
@@ -920,7 +927,10 @@ fn query_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         DatabaseRequest::QueryStream(
             owner,
             session,
-            DatabaseQuery { sql, binds: params },
+            DatabaseQuery {
+                sql: Arc::new(sql),
+                binds: params,
+            },
             batch_size,
         ),
     ))
@@ -948,9 +958,10 @@ fn push_transaction_query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         }
     }
 
-    unsafe { queries_ptr.as_mut() }
-        .queries
-        .push(DatabaseQuery { sql, binds: params });
+    unsafe { queries_ptr.as_mut() }.queries.push(DatabaseQuery {
+        sql: Arc::new(sql),
+        binds: params,
+    });
 
     Ok(0)
 }

@@ -337,13 +337,11 @@ impl Buffer {
         &mut self.data[offset..offset + len]
     }
 
-    pub fn into_vec(mut self) -> Vec<u8> {
-        if self.rpos == 0 {
-            self.data
-        } else {
-            self.data.drain(..self.rpos);
-            self.data
-        }
+    /// Transfer the allocation and its readable offset without moving the
+    /// remaining bytes. Callers that can represent a slice of the allocation
+    /// can avoid the compaction performed by `into_vec`.
+    pub fn into_vec_with_offset(self) -> (Vec<u8>, usize) {
+        (self.data, self.rpos)
     }
 }
 

@@ -798,12 +798,6 @@ fn extract_index_options(lua: &mut LuaStack<'_>, index: i32) -> Result<IndexOpti
                     index_options.unique = Some(value);
                 }
             }
-            b"background" => {
-                let value = entry.value();
-                if let Some(value) = value.as_bool() {
-                    index_options.background = Some(value);
-                }
-            }
             b"sparse" => {
                 let value = entry.value();
                 if let Some(value) = value.as_bool() {

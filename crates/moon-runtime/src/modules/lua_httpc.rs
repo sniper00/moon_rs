@@ -145,7 +145,14 @@ fn version_to_string(version: &reqwest::Version) -> &str {
 /// present) is rejected up-front; the streamed total is also enforced because
 /// the header may be absent or untruthful (e.g. chunked transfer).
 async fn read_body_capped(mut response: reqwest::Response) -> Result<bytes::Bytes, Box<dyn Error>> {
+    enum BodyBuffer {
+        Empty,
+        Single(bytes::Bytes),
+        Joined(Vec<u8>),
+    }
+
     let limit = crate::LIMITS.max_network_read_bytes;
+    let mut capacity_hint = 0;
     if let Some(len) = response.content_length() {
         if len > limit as u64 {
             return Err(format!(
@@ -154,16 +161,44 @@ async fn read_body_capped(mut response: reqwest::Response) -> Result<bytes::Byte
             )
             .into());
         }
+        capacity_hint = len as usize;
     }
 
-    let mut buf: Vec<u8> = Vec::new();
+    let mut body = BodyBuffer::Empty;
     while let Some(chunk) = response.chunk().await? {
-        if buf.len() + chunk.len() > limit {
+        if chunk.is_empty() {
+            continue;
+        }
+        let buffered = match &body {
+            BodyBuffer::Empty => 0,
+            BodyBuffer::Single(first) => first.len(),
+            BodyBuffer::Joined(buf) => buf.len(),
+        };
+        let total = buffered
+            .checked_add(chunk.len())
+            .ok_or("http response body size overflow")?;
+        if total > limit {
             return Err(format!("http response body exceeds limit of {} bytes", limit).into());
         }
-        buf.extend_from_slice(&chunk);
+        body = match body {
+            BodyBuffer::Empty => BodyBuffer::Single(chunk),
+            BodyBuffer::Single(first) => {
+                let mut joined = Vec::with_capacity(total.max(capacity_hint));
+                joined.extend_from_slice(&first);
+                joined.extend_from_slice(&chunk);
+                BodyBuffer::Joined(joined)
+            }
+            BodyBuffer::Joined(mut joined) => {
+                joined.extend_from_slice(&chunk);
+                BodyBuffer::Joined(joined)
+            }
+        };
     }
-    Ok(bytes::Bytes::from(buf))
+    Ok(match body {
+        BodyBuffer::Empty => bytes::Bytes::new(),
+        BodyBuffer::Single(chunk) => chunk,
+        BodyBuffer::Joined(buf) => bytes::Bytes::from(buf),
+    })
 }
 
 async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {

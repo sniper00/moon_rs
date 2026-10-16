@@ -202,7 +202,7 @@ struct StreamHandle {
     /// Feed the outbound request stream (client/bidi streaming). `Some(bytes)`
     /// is a message; `None` half-closes the request stream. `None` for
     /// server-streaming RPCs (no client messages).
-    tx_send: Option<mpsc::UnboundedSender<Option<Vec<u8>>>>,
+    tx_send: Option<mpsc::UnboundedSender<Option<Bytes>>>,
     cancel: CancellationToken,
 }
 
@@ -400,10 +400,10 @@ fn grpc_find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
 // ---------------------------------------------------------------------------
 
 /// Validate & read the request body (raw protobuf bytes) at `index`.
-fn read_body(lua: &LuaStack<'_>, index: i32) -> Result<Vec<u8>, String> {
+fn read_body(lua: &LuaStack<'_>, index: i32) -> Result<Bytes, String> {
     let value = lua.value(index);
     let body = match value.kind() {
-        laux::LuaType::String => value.as_bytes().unwrap_or_default().to_vec(),
+        laux::LuaType::String => Bytes::copy_from_slice(value.as_bytes().unwrap_or_default()),
         laux::LuaType::LightUserData => {
             let ptr = value
                 .as_light_userdata()
@@ -412,7 +412,12 @@ fn read_body(lua: &LuaStack<'_>, index: i32) -> Result<Vec<u8>, String> {
                 return Err("grpc: request body pointer is null".to_string());
             }
             let buf = unsafe { Box::from_raw(ptr as *mut moon_runtime::buffer::Buffer) };
-            buf.into_vec()
+            let (data, offset) = buf.into_vec_with_offset();
+            if offset == data.len() {
+                Bytes::new()
+            } else {
+                Bytes::from(data).slice(offset..)
+            }
         }
         _ => return Err("grpc: request body must be a string or buffer".to_string()),
     };
@@ -466,7 +471,7 @@ fn conn_unary(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         // without first calling poll_reserve").
         let result = match client.ready().await {
             Ok(_) => {
-                let mut request = Request::new(Bytes::from(body));
+                let mut request = Request::new(body);
                 apply_metadata(&mut request, &metadata);
                 let call = client.unary::<Bytes, Bytes, _>(request, path, BytesCodec);
                 if timeout > 0 {
@@ -627,7 +632,7 @@ fn conn_server_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         let mut client = grpc_client(channel);
         let result = match client.ready().await {
             Ok(_) => {
-                let mut request = Request::new(Bytes::from(body));
+                let mut request = Request::new(body);
                 apply_metadata(&mut request, &metadata);
                 let call = client.server_streaming::<Bytes, Bytes, _>(request, path, BytesCodec);
                 if timeout > 0 {
@@ -713,12 +718,12 @@ fn conn_bidi_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let session = unsafe { (*actor).next_session() };
 
     CONTEXT.io_runtime().spawn(async move {
-        let (tx_send, rx_send) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
+        let (tx_send, rx_send) = mpsc::unbounded_channel::<Option<Bytes>>();
         // Turn the request channel into a `Stream<Item = Bytes>`; `None` ends it
         // (half-close the request side).
         let req_stream = UnboundedReceiverStream::new(rx_send)
-            .take_while(|item: &Option<Vec<u8>>| futures_util::future::ready(item.is_some()))
-            .map(|item| Bytes::from(item.unwrap()));
+            .take_while(|item: &Option<Bytes>| futures_util::future::ready(item.is_some()))
+            .map(|item| item.unwrap());
 
         let mut request = Request::new(req_stream);
         apply_metadata(&mut request, &metadata);
@@ -1198,7 +1203,7 @@ fn server_send(lua: &mut LuaStack<'_>) -> c_int {
         Err(e) => return crate::lua_push_error_tuple(state, &e),
     };
 
-    match ud.tx_resp.send(Some(Ok(Bytes::from(body)))) {
+    match ud.tx_resp.send(Some(Ok(body))) {
         Ok(_) => {
             laux::lua_push(state, true);
             1

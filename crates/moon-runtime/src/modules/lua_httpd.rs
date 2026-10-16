@@ -441,7 +441,7 @@ struct HttpSrvRequest {
     path: String,
     query_string: String,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: Bytes,
     response_tx: oneshot::Sender<HttpSrvResponse>,
 }
 
@@ -485,7 +485,7 @@ async fn handle_request(
 
     let limited = Limited::new(req.into_body(), max_body_size);
     let body = match limited.collect().await {
-        Ok(collected) => collected.to_bytes().to_vec(),
+        Ok(collected) => collected.to_bytes(),
         Err(_) => {
             return Ok(error_response(413, "Payload Too Large"));
         }
@@ -640,7 +640,7 @@ fn push_httpd_request(state: LuaState, req: HttpSrvRequest) -> c_int {
         .insert("method", req.method.as_str())
         .insert("path", req.path.as_str())
         .insert("query_string", req.query_string.as_str())
-        .insert("body", req.body.as_slice())
+        .insert("body", req.body.as_ref())
         .rawset_x("headers", || {
             let headers = LuaTable::new(state, 0, req.headers.len());
             for (k, v) in &req.headers {

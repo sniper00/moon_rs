@@ -13,6 +13,7 @@
 use crate::request_pool::{
     PendingCounter, QueuedRequest, WorkerHandle, WorkerSet, drain_queued_requests,
 };
+use bytes::Bytes;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use moon_base::laux::{LuaStack, LuaState};
@@ -217,7 +218,7 @@ enum RedisReply {
     Status(String),
     Error(String),
     Integer(i64),
-    Bulk(Option<Vec<u8>>),
+    Bulk(Option<Bytes>),
     Array(Option<Vec<RedisReply>>),
 }
 
@@ -746,9 +747,19 @@ impl RedisConn {
                 &mut self.raw_scanner,
                 &mut self.pending_reply,
             )? {
-                let reply = parse_owned_reply(&self.pending_reply, &mut 0);
+                // Simple replies contain no bulk slices, so keep this Vec for
+                // the next read. Bulk replies move it into Bytes for sharing.
+                let reply = if matches!(self.pending_reply.first(), Some(b'+' | b'-' | b':')) {
+                    let parsed = find_crlf(&self.pending_reply, 1).and_then(|end| {
+                        parse_simple_reply(self.pending_reply[0], &self.pending_reply[1..end])
+                    });
+                    self.pending_reply.clear();
+                    parsed
+                } else {
+                    let raw = Bytes::from(std::mem::take(&mut self.pending_reply));
+                    parse_owned_reply(&raw, &mut 0)
+                };
                 self.typed_read_active = false;
-                self.pending_reply.clear();
                 return reply;
             }
             self.refill_raw_buffer().await?;
@@ -1525,7 +1536,7 @@ fn push_reply_to_lua(state: LuaState, reply: &RedisReply) -> Result<(), String> 
             laux::lua_pushnil(state);
         }
         RedisReply::Bulk(Some(b)) => {
-            laux::lua_push(state, b.as_slice());
+            laux::lua_push(state, b.as_ref());
         }
         RedisReply::Array(None) => {
             laux::lua_pushnil(state);
@@ -1547,12 +1558,9 @@ fn push_reply_to_lua(state: LuaState, reply: &RedisReply) -> Result<(), String> 
 
 // Only called on a complete frame validated by RawReplyScanner, including its
 // length and nesting bounds. Pub/sub and fire-and-forget need owned values;
-// awaited commands instead decode the same wire representation directly to Lua.
-fn parse_owned_reply(raw: &[u8], pos: &mut usize) -> Result<RedisReply, String> {
-    let tag = *raw.get(*pos).ok_or("unexpected end of RESP data")?;
-    let end = find_crlf(raw, *pos + 1)?;
-    let data = &raw[*pos + 1..end];
-    *pos = end + 2;
+// bulk strings share the complete frame allocation until delivery. Awaited
+// commands decode the same wire representation directly to Lua.
+fn parse_simple_reply(tag: u8, data: &[u8]) -> Result<RedisReply, String> {
     match tag {
         b'+' => Ok(RedisReply::Status(
             String::from_utf8_lossy(data).into_owned(),
@@ -1563,6 +1571,17 @@ fn parse_owned_reply(raw: &[u8], pos: &mut usize) -> Result<RedisReply, String> 
         b':' => Ok(RedisReply::Integer(
             lexical_core::parse::<i64>(data).map_err(|e| format!("invalid integer: {}", e))?,
         )),
+        c => Err(format!("unknown RESP type: {}", c as char)),
+    }
+}
+
+fn parse_owned_reply(raw: &Bytes, pos: &mut usize) -> Result<RedisReply, String> {
+    let tag = *raw.get(*pos).ok_or("unexpected end of RESP data")?;
+    let end = find_crlf(raw, *pos + 1)?;
+    let data = &raw[*pos + 1..end];
+    *pos = end + 2;
+    match tag {
+        b'+' | b'-' | b':' => parse_simple_reply(tag, data),
         b'$' => {
             let len = lexical_core::parse::<i64>(data)
                 .map_err(|e| format!("invalid bulk length: {}", e))?;
@@ -1570,7 +1589,8 @@ fn parse_owned_reply(raw: &[u8], pos: &mut usize) -> Result<RedisReply, String> 
                 return Ok(RedisReply::Bulk(None));
             }
             let end = *pos + len as usize;
-            let value = raw.get(*pos..end).ok_or("truncated bulk string")?.to_vec();
+            raw.get(*pos..end).ok_or("truncated bulk string")?;
+            let value = raw.slice(*pos..end);
             *pos = end + 2;
             Ok(RedisReply::Bulk(Some(value)))
         }
@@ -1750,6 +1770,18 @@ pub extern "C-unwind" fn luaopen_redis(state: LuaState) -> c_int {
 mod tests {
     use super::*;
 
+    #[test]
+    fn owned_bulk_shares_the_reply_frame() {
+        let wire = b"$7\r\npayload\r\n".to_vec();
+        let raw = Bytes::from(wire);
+        let payload_ptr = raw[4..].as_ptr();
+        let RedisReply::Bulk(Some(payload)) = parse_owned_reply(&raw, &mut 0).unwrap() else {
+            panic!("expected bulk reply");
+        };
+        assert_eq!(payload.as_ref(), b"payload");
+        assert_eq!(payload.as_ptr(), payload_ptr);
+    }
+
     // Exercise every split point: RESP boundaries need not align with socket
     // reads, and bulk payloads can themselves contain RESP-looking bytes.
     #[test]
@@ -1857,6 +1889,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simple_replies_reuse_the_typed_read_buffer() {
+        let (mut conn, mut server) = raw_test_connection(1000).await;
+        conn.pending_reply.reserve(128);
+        let storage = conn.pending_reply.as_ptr();
+        server
+            .write_all(b"+OK\r\n:42\r\n-ERR failed\r\n")
+            .await
+            .unwrap();
+
+        assert!(matches!(conn.read_reply().await.unwrap(), RedisReply::Status(s) if s == "OK"));
+        assert_eq!(conn.pending_reply.as_ptr(), storage);
+        assert!(matches!(
+            conn.read_reply().await.unwrap(),
+            RedisReply::Integer(42)
+        ));
+        assert_eq!(conn.pending_reply.as_ptr(), storage);
+        assert!(
+            matches!(conn.read_reply().await.unwrap(), RedisReply::Error(e) if e == "ERR failed")
+        );
+        assert_eq!(conn.pending_reply.as_ptr(), storage);
+    }
+
+    #[tokio::test]
     async fn raw_reader_retains_pipeline_tail_for_typed_reader() {
         let (mut conn, mut server) = raw_test_connection(1000).await;
         // Exceed BufReader's capacity and include binary payload/CRLF bytes.
@@ -1920,7 +1975,7 @@ mod tests {
         let RedisReply::Array(Some(items)) = conn.read_reply().await.unwrap() else {
             panic!("expected array");
         };
-        assert!(matches!(&items[0], RedisReply::Bulk(Some(value)) if value == b"hello"));
+        assert!(matches!(&items[0], RedisReply::Bulk(Some(value)) if value.as_ref() == b"hello"));
         assert!(matches!(&items[1], RedisReply::Integer(42)));
         assert!(matches!(conn.read_reply().await.unwrap(), RedisReply::Status(s) if s == "NEXT"));
     }
@@ -2241,9 +2296,9 @@ mod tests {
     #[test]
     fn pubsub_delivery_message() {
         let reply = RedisReply::Array(Some(vec![
-            RedisReply::Bulk(Some(b"message".to_vec())),
-            RedisReply::Bulk(Some(b"chan".to_vec())),
-            RedisReply::Bulk(Some(b"payload".to_vec())),
+            RedisReply::Bulk(Some(Bytes::from_static(b"message"))),
+            RedisReply::Bulk(Some(Bytes::from_static(b"chan"))),
+            RedisReply::Bulk(Some(Bytes::from_static(b"payload"))),
         ]));
         assert!(is_pubsub_delivery(&reply));
     }
@@ -2251,10 +2306,10 @@ mod tests {
     #[test]
     fn pubsub_delivery_pmessage() {
         let reply = RedisReply::Array(Some(vec![
-            RedisReply::Bulk(Some(b"pmessage".to_vec())),
-            RedisReply::Bulk(Some(b"pattern*".to_vec())),
-            RedisReply::Bulk(Some(b"chan".to_vec())),
-            RedisReply::Bulk(Some(b"data".to_vec())),
+            RedisReply::Bulk(Some(Bytes::from_static(b"pmessage"))),
+            RedisReply::Bulk(Some(Bytes::from_static(b"pattern*"))),
+            RedisReply::Bulk(Some(Bytes::from_static(b"chan"))),
+            RedisReply::Bulk(Some(Bytes::from_static(b"data"))),
         ]));
         assert!(is_pubsub_delivery(&reply));
     }
@@ -2262,8 +2317,8 @@ mod tests {
     #[test]
     fn pubsub_delivery_subscribe_is_not_delivery() {
         let reply = RedisReply::Array(Some(vec![
-            RedisReply::Bulk(Some(b"subscribe".to_vec())),
-            RedisReply::Bulk(Some(b"chan".to_vec())),
+            RedisReply::Bulk(Some(Bytes::from_static(b"subscribe"))),
+            RedisReply::Bulk(Some(Bytes::from_static(b"chan"))),
             RedisReply::Integer(1),
         ]));
         assert!(!is_pubsub_delivery(&reply));
@@ -2286,7 +2341,7 @@ mod tests {
     fn pubsub_delivery_first_element_integer_not_delivery() {
         let reply = RedisReply::Array(Some(vec![
             RedisReply::Integer(1),
-            RedisReply::Bulk(Some(b"message".to_vec())),
+            RedisReply::Bulk(Some(Bytes::from_static(b"message"))),
         ]));
         assert!(!is_pubsub_delivery(&reply));
     }

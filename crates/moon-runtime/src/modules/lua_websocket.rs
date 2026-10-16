@@ -1,5 +1,6 @@
 use std::{ffi::c_int, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use lazy_static::lazy_static;
@@ -11,7 +12,7 @@ use tokio::{
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config, connect_async_with_config,
     tungstenite::{
-        Message,
+        Message, Utf8Bytes,
         handshake::server::{
             ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
         },
@@ -261,22 +262,43 @@ fn ws_read(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     }
 }
 
-fn to_message(data: Vec<u8>, kind: &str) -> Message {
+fn to_message(data: impl Into<Bytes>, kind: &str) -> Message {
+    let data = data.into();
     match kind {
         "c" => Message::Close(Some(CloseFrame {
             code: CloseCode::Normal,
-            reason: String::from_utf8_lossy(&data).into_owned().into(),
+            reason: lossy_utf8_bytes(data),
         })),
-        "t" => Message::Text(String::from_utf8_lossy(&data).into_owned().into()),
-        "p" => Message::Ping(data.into()),
-        _ => Message::Binary(data.into()),
+        "t" => Message::Text(lossy_utf8_bytes(data)),
+        "p" => Message::Ping(data),
+        _ => Message::Binary(data),
     }
+}
+
+fn lossy_utf8_bytes(data: Bytes) -> Utf8Bytes {
+    // TryFrom checks UTF-8 and keeps the Bytes allocation. The shallow clone
+    // leaves the original available for the existing lossy fallback.
+    match Utf8Bytes::try_from(data.clone()) {
+        Ok(text) => text,
+        Err(_) => String::from_utf8_lossy(&data).into_owned().into(),
+    }
+}
+
+fn message_from_buffer(buf: moon_runtime::buffer::Buffer, kind: &str) -> Message {
+    // Keep the original allocation even when the Buffer has consumed a
+    // prefix. Bytes can expose its unread suffix without moving those bytes.
+    let (data, offset) = buf.into_vec_with_offset();
+    let payload = Bytes::from(data).slice(offset..);
+    to_message(payload, kind)
 }
 
 fn check_message(lua: &LuaStack<'_>, index: i32, kind: &str) -> Result<Message, String> {
     let value = lua.value(index);
-    let data = match value.kind() {
-        laux::LuaType::String => value.as_bytes().unwrap_or_default().to_vec(),
+    match value.kind() {
+        laux::LuaType::String => Ok(to_message(
+            value.as_bytes().unwrap_or_default().to_vec(),
+            kind,
+        )),
         laux::LuaType::LightUserData => {
             let ptr = value
                 .as_light_userdata()
@@ -287,23 +309,16 @@ fn check_message(lua: &LuaStack<'_>, index: i32, kind: &str) -> Result<Message, 
                     index
                 ));
             }
-            // Take ownership of the heap `Buffer` created on the Lua side
-            // (e.g. `buffer.concat` -> `Box::into_raw`). `to_vec` moves the
-            // underlying `Vec` out when nothing has been consumed (zero-copy),
-            // and dropping the `Box` at the end of this scope frees the
-            // allocation instead of leaking it.
+            // Take ownership of the heap `Buffer` created on the Lua side.
             let buf = unsafe { Box::from_raw(ptr as *mut moon_runtime::buffer::Buffer) };
-            buf.into_vec()
+            Ok(message_from_buffer(*buf, kind))
         }
-        _ => {
-            return Err(format!(
-                "bad argument #{} (string or lightuserdata expected, got {})",
-                index,
-                value.name()
-            ));
-        }
-    };
-    Ok(to_message(data, kind))
+        _ => Err(format!(
+            "bad argument #{} (string or lightuserdata expected, got {})",
+            index,
+            value.name()
+        )),
+    }
 }
 
 fn ws_write(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -785,6 +800,70 @@ pub extern "C-unwind" fn luaopen_websocket(state: LuaState) -> c_int {
 mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::protocol::Role;
+
+    #[test]
+    fn binary_and_ping_keep_the_unread_buffer_allocation() {
+        for kind in ["b", "p"] {
+            let mut buffer = moon_runtime::buffer::Buffer::from_slice(b"prefix-payload");
+            buffer.consume(7);
+            let pointer = buffer.data().as_ptr();
+            let message = message_from_buffer(buffer, kind);
+            let payload = match &message {
+                Message::Binary(payload) | Message::Ping(payload) => payload,
+                _ => panic!("unexpected message kind"),
+            };
+            assert_eq!(payload.as_ref(), b"payload");
+            assert_eq!(payload.as_ptr(), pointer);
+        }
+    }
+
+    #[test]
+    fn text_and_close_keep_the_unread_buffer_allocation() {
+        for kind in ["t", "c"] {
+            let mut buffer = moon_runtime::buffer::Buffer::from_slice(b"prefix-payload");
+            buffer.consume(7);
+            let pointer = buffer.data().as_ptr();
+            let message = message_from_buffer(buffer, kind);
+            let payload = match &message {
+                Message::Text(text) => text.as_bytes(),
+                Message::Close(Some(frame)) => frame.reason.as_bytes(),
+                _ => panic!("unexpected message kind"),
+            };
+            assert_eq!(payload, b"payload");
+            assert_eq!(payload.as_ptr(), pointer);
+        }
+    }
+
+    #[test]
+    fn text_and_close_keep_lossy_utf8_behavior() {
+        let text = b"hello".to_vec();
+        let pointer = text.as_ptr();
+        let message = to_message(text, "t");
+        let Message::Text(payload) = &message else {
+            panic!("expected text message");
+        };
+        assert_eq!(payload.as_bytes().as_ptr(), pointer);
+        assert_eq!(message, Message::Text("hello".into()));
+        assert_eq!(
+            to_message(b"\xff".to_vec(), "t"),
+            Message::Text("\u{fffd}".into())
+        );
+        assert_eq!(
+            to_message(b"\xff".to_vec(), "c"),
+            Message::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "\u{fffd}".into(),
+            }))
+        );
+        for kind in ["t", "c"] {
+            let mut buffer = moon_runtime::buffer::Buffer::from_slice(b"prefix-\xff");
+            buffer.consume(7);
+            assert_eq!(
+                message_from_buffer(buffer, kind),
+                to_message(b"\xff".to_vec(), kind)
+            );
+        }
+    }
 
     #[tokio::test]
     async fn peer_close_is_acknowledged_before_disconnect() {
