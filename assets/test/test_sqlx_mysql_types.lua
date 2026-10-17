@@ -58,7 +58,7 @@ moon.async(function()
     -- 1. 连接
     -----------------------------------------------------------------
     print("\n===== 1. 连接测试 =====")
-    local db = sqlx.connect("mysql://root:root@127.0.0.1:3306/mysql?ssl-mode=DISABLED", "mysql_test")
+    local db = sqlx.connect((os.getenv("MOON_MYSQL_TEST_URL") or "mysql://root:root@127.0.0.1:3306/mysql?ssl-mode=DISABLED"), "mysql_test", 5000, 1)
     assert_not_nil("connect returns object", db)
 
     -----------------------------------------------------------------
@@ -194,7 +194,7 @@ moon.async(function()
     assert_match("timestamp epoch25",res[1].col_timestamp, "2025%-01%-01")
     assert_eq("date 2025-12-31",     res[2].col_date,     "2025-12-31")
     assert_eq("time 23:59:59",       res[2].col_time,     "23:59:59")
-    assert_match("datetime eoy",     res[2].col_datetime,  "2025%-12%-31 23:59:59")
+    assert_match("datetime eoy",     res[2].col_datetime,  "2025%-12%-31T23:59:59")
     assert_match("timestamp eoy",    res[2].col_timestamp, "2025%-12%-31")
     assert_eq("date epoch",          res[3].col_date,     "1970-01-01")
     assert_eq("time 12:30",          res[3].col_time,     "12:30:00")
@@ -369,6 +369,22 @@ moon.async(function()
     -----------------------------------------------------------------
     -- 18. 清理
     -----------------------------------------------------------------
+    local exact = db:query([[SELECT CAST(42.000 AS DECIMAL(20,3)) AS whole,
+        CAST(1.125 AS DECIMAL(20,3)) AS fraction,
+        CAST(18446744073709551615 AS UNSIGNED) AS maximum]])[1]
+    assert_eq("decimal integral", exact.whole, 42)
+    assert_match("decimal fraction exact", exact.fraction, "^1%.1250*$")
+    assert_eq("unsigned max exact", exact.maximum, "18446744073709551615")
+    db:query("CREATE TEMPORARY TABLE unsigned_test (tiny TINYINT UNSIGNED, small SMALLINT UNSIGNED, middle MEDIUMINT UNSIGNED, normal INT UNSIGNED, large BIGINT UNSIGNED)")
+    db:query("INSERT INTO unsigned_test VALUES (255, 65535, 16777215, 4294967295, 18446744073709551615)")
+    local unsigned = db:query("SELECT * FROM unsigned_test")[1]
+    assert_eq("unsigned tiny", unsigned.tiny, 255)
+    assert_eq("unsigned small", unsigned.small, 65535)
+    assert_eq("unsigned medium", unsigned.middle, 16777215)
+    assert_eq("unsigned int", unsigned.normal, 4294967295)
+    assert_eq("unsigned bigint", unsigned.large, "18446744073709551615")
+    db:query("DROP TABLE unsigned_test")
+
     print("\n===== 18. 清理 =====")
     db:query("DROP TABLE IF EXISTS sqlx_test;")
     db:close()

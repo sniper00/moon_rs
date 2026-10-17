@@ -42,7 +42,7 @@ local function section(name)
     print(string.format("===== %s =====", name))
 end
 
-local DB_URL = "mongodb://root:root@127.0.0.1:27017"
+local DB_URL = (os.getenv("MOON_MONGO_TEST_URL") or "mongodb://root:root@127.0.0.1:27017")
 local DB_NAME = "moon_rs_test"
 local COLL_NAME = "test_stream_collection"
 

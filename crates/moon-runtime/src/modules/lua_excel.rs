@@ -26,7 +26,8 @@ fn read_csv(state: LuaState, path: &Path, max_row: usize) -> i32 {
 
             laux::lua_push(state, "data");
 
-            let sheet_data = LuaTable::new(state, reader.records().count(), 0);
+            // Counting records would consume the reader before the actual read loop.
+            let sheet_data = LuaTable::new(state, 0, 0);
 
             for (i, result) in reader.records().enumerate() {
                 if i == max_row {

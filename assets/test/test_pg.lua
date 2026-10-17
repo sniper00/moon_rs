@@ -8,7 +8,7 @@ local moon = require("moon")
 local json = require("json")
 local pg   = require("moon.db.pg")
 
-local DB_URL = "postgres://postgres:123456@127.0.0.1:5432/postgres"
+local DB_URL = (os.getenv("MOON_PG_TEST_URL") or "postgres://postgres:123456@127.0.0.1:5432/postgres")
 
 ---------------------------------------------------------------------------
 -- Test harness
@@ -109,13 +109,13 @@ local function test_connection()
 
     test("connect with bad password", function()
         local res = pg.connect(
-            "postgres://postgres:wrong_password@127.0.0.1:5432/postgres?name=bad_pw&connect_timeout=2000&max_connections=1")
+            DB_URL:gsub("://([^:]+):[^@]+@", "://%1:wrong_password@") .. "?name=bad_pw&connect_timeout=2000&max_connections=1")
         assert(res.code, "expected auth error")
     end)
 
     test("connect with bad database", function()
         local res = pg.connect(
-            "postgres://postgres:123456@127.0.0.1:5432/nonexistent_db_xyz?name=bad_db&connect_timeout=2000&max_connections=1")
+            DB_URL:gsub("/[^/]*$", "/nonexistent_db_xyz") .. "?name=bad_db&connect_timeout=2000&max_connections=1")
         assert(res.code, "expected database error")
     end)
 

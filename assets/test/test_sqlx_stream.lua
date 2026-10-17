@@ -42,7 +42,7 @@ local function section(name)
     print(string.format("\n===== %s =====", name))
 end
 
-local DB_URL = "mysql://root:root@127.0.0.1:3306/mysql?ssl-mode=DISABLED"
+local DB_URL = (os.getenv("MOON_MYSQL_TEST_URL") or "mysql://root:root@127.0.0.1:3306/mysql?ssl-mode=DISABLED")
 
 moon.async(function()
     section("1. 连接")

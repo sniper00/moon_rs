@@ -40,6 +40,7 @@ enum DbType {
     Null,
     Bool,
     Integer,
+    UnsignedInteger,
     Float32,
     Float64,
     Text,
@@ -68,6 +69,11 @@ static DB_TYPE_MAP: phf::Map<&'static str, DbType> = phf_map! {
     "MEDIUMINT" => DbType::Integer,
     "BIGINT" => DbType::Integer,
     "INTEGER" => DbType::Integer,
+    "TINYINT UNSIGNED" => DbType::UnsignedInteger,
+    "SMALLINT UNSIGNED" => DbType::UnsignedInteger,
+    "INT UNSIGNED" => DbType::UnsignedInteger,
+    "MEDIUMINT UNSIGNED" => DbType::UnsignedInteger,
+    "BIGINT UNSIGNED" => DbType::UnsignedInteger,
     // Decimal
     "NUMERIC" => DbType::Decimal,
     "DECIMAL" => DbType::Decimal,
@@ -107,6 +113,24 @@ impl DbType {
         DB_TYPE_MAP.get(name).copied().unwrap_or(Self::Unknown)
     }
 }
+
+// MySQL unsigned integers have distinct metadata and may exceed Lua's i64 range.
+struct UnsignedValue(u64);
+macro_rules! impl_unsigned_decode {
+    ($db:ty, $integer:ty) => {
+        impl<'r> sqlx::Decode<'r, $db> for UnsignedValue {
+            fn decode(
+                value: <$db as Database>::ValueRef<'r>,
+            ) -> Result<Self, sqlx::error::BoxDynError> {
+                let value = <$integer as sqlx::Decode<$db>>::decode(value)?;
+                Ok(Self(value.try_into()?))
+            }
+        }
+    };
+}
+impl_unsigned_decode!(MySql, u64);
+impl_unsigned_decode!(Postgres, i64);
+impl_unsigned_decode!(Sqlite, i64);
 
 // Local wrapper keeps the generic row decoder usable with SQLite, for which
 // SQLx deliberately does not implement BigDecimal decoding.
@@ -162,6 +186,7 @@ where
     chrono::DateTime<chrono::Utc>: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
     uuid::Uuid: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
     DecimalValue: sqlx::Decode<'a, DB>,
+    UnsignedValue: sqlx::Decode<'a, DB>,
     serde_json::Value: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
 {
     let table = LuaTable::new(state, rows.len(), 0);
@@ -203,6 +228,18 @@ where
                                 col_name,
                                 sqlx::decode::Decode::decode(value).unwrap_or(0i64),
                             );
+                        }
+                        DbType::UnsignedInteger => {
+                            if let Ok(UnsignedValue(value)) = sqlx::Decode::decode(value) {
+                                match i64::try_from(value) {
+                                    Ok(integer) => {
+                                        row_table.insert(col_name, integer);
+                                    }
+                                    Err(_) => {
+                                        row_table.insert(col_name, value.to_string());
+                                    }
+                                }
+                            }
                         }
                         DbType::Float32 => {
                             let v: f32 = sqlx::decode::Decode::decode(value).unwrap_or(0.0);

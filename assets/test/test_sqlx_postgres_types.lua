@@ -62,7 +62,7 @@ moon.async(function()
     -- 1. 连接
     -----------------------------------------------------------------
     print("\n===== 1. 连接测试 =====")
-    local db = sqlx.connect("postgres://postgres:123456@localhost/postgres", "pg_test")
+    local db = sqlx.connect((os.getenv("MOON_PG_TEST_URL") or "postgres://postgres:123456@localhost/postgres"), "pg_test")
     assert_not_nil("connect returns object", db)
 
     -----------------------------------------------------------------
@@ -204,20 +204,20 @@ moon.async(function()
     assert_eq("date 2025-01-01",    res[1].col_date,        "2025-01-01")
     assert_eq("time midnight",      res[1].col_time,        "00:00:00")
     assert_eq("time6 midnight",     res[1].col_time6,       "00:00:00")
-    assert_eq("timestamp epoch",    res[1].col_timestamp,   "2025-01-01 00:00:00")
-    assert_eq("timestamptz utc",    res[1].col_timestamptz, "2025-01-01 00:00:00 UTC")
+    assert_eq("timestamp epoch",    res[1].col_timestamp,   "2025-01-01T00:00:00")
+    assert_eq("timestamptz utc",    res[1].col_timestamptz, "2025-01-01T00:00:00+00:00")
     -- Row 2: end of 2025
     assert_eq("date 2025-12-31",    res[2].col_date,        "2025-12-31")
     assert_eq("time 23:59:59",      res[2].col_time,        "23:59:59")
     assert_eq("time6 precision",    res[2].col_time6,       "23:59:59.999999")
-    assert_match("timestamp eoy",   res[2].col_timestamp,   "2025%-12%-31 23:59:59")
-    assert_match("timestamptz eoy", res[2].col_timestamptz, "2025%-12%-31 15:59:59")
+    assert_match("timestamp eoy",   res[2].col_timestamp,   "2025%-12%-31T23:59:59")
+    assert_match("timestamptz eoy", res[2].col_timestamptz, "2025%-12%-31T15:59:59")
     -- Row 3: Unix epoch
     assert_eq("date epoch",         res[3].col_date,        "1970-01-01")
     assert_eq("time noon",          res[3].col_time,        "12:00:00")
     assert_eq("time6 half sec",     res[3].col_time6,       "12:00:00.500")
-    assert_eq("timestamp unix",     res[3].col_timestamp,   "1970-01-01 00:00:00")
-    assert_eq("timestamptz unix",   res[3].col_timestamptz, "1970-01-01 00:00:00 UTC")
+    assert_eq("timestamp unix",     res[3].col_timestamp,   "1970-01-01T00:00:00")
+    assert_eq("timestamptz unix",   res[3].col_timestamptz, "1970-01-01T00:00:00+00:00")
 
     -----------------------------------------------------------------
     -- 8. UUID
@@ -435,6 +435,12 @@ moon.async(function()
     -----------------------------------------------------------------
     -- 19. 清理
     -----------------------------------------------------------------
+    local exact = db:query([[SELECT 42.000::numeric AS whole,
+        1.125::numeric AS fraction, 9223372036854775808::numeric AS large]])[1]
+    assert_eq("numeric integral", exact.whole, 42)
+    assert_match("numeric fraction exact", exact.fraction, "^1%.1250*$")
+    assert_eq("numeric out of i64 exact", exact.large, "9223372036854775808")
+
     print("\n===== 19. 清理 =====")
     db:query("DROP TABLE IF EXISTS sqlx_test;")
     db:close()

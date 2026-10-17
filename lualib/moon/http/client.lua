@@ -104,8 +104,9 @@ local function next_sse_event(stream)
 
         while true do
             local start, finish = pending:find("\n\n", 1, true)
-            if not start then
-                start, finish = pending:find("\r\n\r\n", 1, true)
+            local crlf_start, crlf_finish = pending:find("\r\n\r\n", 1, true)
+            if crlf_start and (not start or crlf_start < start) then
+                start, finish = crlf_start, crlf_finish
             end
 
             if start then

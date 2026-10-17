@@ -9,7 +9,7 @@ local redis = require("moon.db.redis")
 local RedisStream = dofile("redis_stream.lua")
 
 local HOST = "127.0.0.1"
-local PORT = 6379
+local PORT = tonumber(os.getenv("MOON_REDIS_TEST_PORT")) or 6379
 local TIMEOUT = 5000
 
 local pass_count = 0

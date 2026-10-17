@@ -11,6 +11,9 @@
 local moon = require "moon"
 local cluster = require "moon.cluster"
 
+-- Unique echo actors must explicitly exit during global shutdown.
+moon.shutdown(function() moon.quit() end)
+
 local conf = ...
 
 if not conf or not conf.name then
