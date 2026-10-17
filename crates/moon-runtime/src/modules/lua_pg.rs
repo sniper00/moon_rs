@@ -17,6 +17,9 @@
 //!    Lua tables on the actor thread (single copy: wire bytes -> Lua values).
 //!  - Async delivery via `PTYPE_PG` + `moon.wait(session)`.
 
+#[path = "lua_pg/array.rs"]
+mod array;
+
 use crate::lua_json::{JsonOptions, encode_table};
 use crate::request_pool::{
     PendingCounter, QueuedRequest, WorkerHandle, WorkerSet, drain_queued_requests,
@@ -460,6 +463,8 @@ impl PgConn {
         write_cstr(&mut body, params.database.as_bytes());
         write_cstr(&mut body, b"application_name");
         write_cstr(&mut body, params.application_name.as_bytes());
+        write_cstr(&mut body, b"options");
+        write_cstr(&mut body, b"-c array_nulls=on");
         body.push(0); // terminator
 
         let mut msg = Vec::with_capacity(body.len() + 4);
@@ -720,6 +725,37 @@ impl PgConn {
     /// for fire-and-forget requests, but errors and transaction status survive.
     async fn execute(&mut self, data: &[u8], capture: bool) -> Result<QueryResult, String> {
         self.write_all(data).await?;
+        self.read_result(capture).await
+    }
+
+    /// Parameterized requests use text arrays, whose NULL tokens depend on
+    /// array_nulls. Restore it even if a preceding request changed the session.
+    /// Queue both cycles before reading so there is no additional round trip.
+    async fn execute_request(&mut self, data: &[u8], capture: bool) -> Result<QueryResult, String> {
+        if data.first() == Some(&b'Q') {
+            return self.execute(data, capture).await;
+        }
+        let mut setup = Vec::new();
+        let stub = start_message(&mut setup, b'Q');
+        write_cstr(&mut setup, b"SET array_nulls = on");
+        end_message(&mut setup, stub);
+        self.write_all(&setup).await?;
+        self.write_all(data).await?;
+        let mut setup = self.read_result(capture).await?;
+        if setup.error.is_some() || setup.txn_status != b'I' {
+            return Err("failed to restore array_nulls before parameter binding".into());
+        }
+        let mut result = self.read_result(capture).await?;
+        // Notifications can arrive at either cycle boundary. Hide the internal
+        // SET result, but preserve notifications in their original order.
+        if !setup.notifications.is_empty() {
+            setup.notifications.append(&mut result.notifications);
+            result.notifications = setup.notifications;
+        }
+        Ok(result)
+    }
+
+    async fn read_result(&mut self, capture: bool) -> Result<QueryResult, String> {
         let mut collector = QueryCollector::new(capture, crate::LIMITS.db_query_rows);
         let mut scratch = Vec::new();
         loop {
@@ -907,7 +943,7 @@ async fn worker_loop(
             }
 
             let c = conn.as_mut().unwrap();
-            match c.execute(&req.data, req.session != 0).await {
+            match c.execute_request(&req.data, req.session != 0).await {
                 Ok(mut result) => {
                     if c.finish_request(&mut result).await.is_err() {
                         conn = None;
@@ -1210,15 +1246,40 @@ fn quote_ident(id: &str) -> String {
     s
 }
 
-/// Validate a PG type name: only `[a-zA-Z0-9_ \[\]]` allowed (covers
-/// `bigint`, `character varying`, `integer[]`, etc.)
+/// Accept unquoted type identifiers, known multiword built-ins and [] suffixes.
+/// Character filtering alone would also accept SQL expressions such as
+/// `bigint OR true`, which alter the generated UPDATE's WHERE clause.
 fn validate_type_name(t: &str) -> Result<(), String> {
-    if t.is_empty() {
+    let mut base = t.trim();
+    if base.is_empty() {
         return Err("empty type name".to_string());
     }
-    if t.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b' ' || b == b'[' || b == b']')
-    {
+    while let Some(element) = base.strip_suffix("[]") {
+        base = element.trim_end();
+    }
+    let mut bytes = base.bytes();
+    let identifier = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    let builtin = matches!(
+        base.split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+            .as_str(),
+        "double precision"
+            | "character varying"
+            | "char varying"
+            | "bit varying"
+            | "national character"
+            | "national character varying"
+            | "timestamp with time zone"
+            | "timestamp without time zone"
+            | "time with time zone"
+            | "time without time zone"
+    );
+    if identifier || builtin {
         Ok(())
     } else {
         Err(format!("invalid type name: {:?}", t))
@@ -1402,14 +1463,15 @@ fn build_insert_sql(
 /// key needs an explicit cast. With `key_type` (e.g. "bigint") we cast the
 /// param (`_d._k::bigint`), keeping the table's index usable. Without it we
 /// cast the table column to text (`_t.key::text = _d._k`), which works for any
-/// type but cannot use an index on the key. The SET assignments rely on the
-/// normal assignment cast (text -> column type), so they need no annotation.
+/// type but cannot use an index on the key. SET columns can supply explicit
+/// types, since text values cannot be assigned implicitly to e.g. array columns.
 fn build_update_sql(
     table: &str,
     key: &str,
     set_cols: &[String],
     tuple_count: usize,
     key_type: Option<&str>,
+    set_types: Option<&[String]>,
 ) -> String {
     let cols_per_tuple = 1 + set_cols.len();
     let qt = quote_ident(table);
@@ -1426,6 +1488,10 @@ fn build_update_sql(
         s.push_str(&qc);
         s.push_str(" = _d.");
         s.push_str(&qc);
+        if let Some(types) = set_types {
+            s.push_str("::");
+            s.push_str(&types[i]);
+        }
     }
     s.push_str(" FROM (VALUES ");
     let mut param_no = 1usize;
@@ -1901,7 +1967,7 @@ fn insert_many_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, Strin
     }
 }
 
-/// `handle:update_many(session, table, key_column, set_columns, rows, key_type?)`
+/// `handle:update_many(table, key_column, set_columns, rows, key_type?, set_types?)`
 /// — bulk UPDATE via `UPDATE ... FROM (VALUES ...)`. Each row is `{ key, set1,
 /// set2, ... }` (key first, then one value per `set_columns` entry). Auto-chunked
 /// and wrapped in a transaction across chunks, like `insert_many`.
@@ -1958,12 +2024,32 @@ fn update_many_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, Strin
         None
     };
 
+    let set_types = if !matches!(laux::lua_type(state, 7), LuaType::Nil | LuaType::None) {
+        let types = read_string_array(state, 7, "update_many: set_types")?;
+        if types.len() != set_cols.len() {
+            return Err("update_many: set_types must match set_columns length".into());
+        }
+        for ty in &types {
+            validate_type_name(ty)?;
+        }
+        Some(types)
+    } else {
+        None
+    };
+
     laux::lua_checkstack(state, 4, std::ptr::null())?;
     let options = JsonOptions::default();
     let cols_per_tuple = 1 + set_cols.len();
     let mut data = Vec::with_capacity(128 + table.len() + nrows * cols_per_tuple * 8);
     let build = |tuple_count: usize| {
-        build_update_sql(&table, &key, &set_cols, tuple_count, key_type.as_deref())
+        build_update_sql(
+            &table,
+            &key,
+            &set_cols,
+            tuple_count,
+            key_type.as_deref(),
+            set_types.as_deref(),
+        )
     };
     if let Err(err) = encode_many(
         lua,
@@ -2040,8 +2126,18 @@ fn stats(lua: &mut LuaStack<'_>) -> c_int {
 // Response decoding (runs on the actor thread; raw bytes -> Lua tables)
 // ---------------------------------------------------------------------------
 
-/// PG type OIDs that map to a Lua number/boolean; everything else stays text.
-fn convert_value(state: LuaState, oid: i32, value: &[u8]) {
+/// Decode common arrays; unknown types retain their PostgreSQL text form.
+fn convert_value(state: LuaState, oid: i32, value: &[u8]) -> Result<(), String> {
+    if let Some(element) = array::element_oid(oid) {
+        array::decode(state, element, value)
+    } else {
+        convert_scalar(state, oid, value);
+        Ok(())
+    }
+}
+
+/// PG scalar OIDs that map to a Lua number/boolean; everything else stays text.
+fn convert_scalar(state: LuaState, oid: i32, value: &[u8]) {
     let s = || std::str::from_utf8(value).unwrap_or_default();
     match oid {
         16 => laux::lua_push(state, value == b"t"), // bool
@@ -2157,7 +2253,7 @@ fn push_statement_result(state: LuaState, stmt: &Statement) -> Result<(), String
                     } else {
                         laux::lua_push(state, name.as_ref());
                     }
-                    convert_value(state, *oid, value);
+                    convert_value(state, *oid, value)?;
                     unsafe { ffi::lua_rawset(state.as_ptr(), row_table.index()) };
                 }
             }
@@ -2311,12 +2407,15 @@ pub unsafe extern "C-unwind" fn decode_pg_message(
 
 pub extern "C-unwind" fn luaopen_pg(state: LuaState) -> c_int {
     let l = [
+        lreg_try!("array", array::encode),
         lreg_try!("connect", connect),
         lreg_try!("find_connection", find_connection),
         lreg!("stats", stats),
         lreg_null!(),
     ];
     luaL_newlib!(state, l);
+    laux::lua_pushlightuserdata(state, std::ptr::null_mut());
+    unsafe { ffi::lua_setfield(state.as_ptr(), -2, cstr!("NULL")) };
     1
 }
 
@@ -2654,6 +2753,236 @@ mod scram {
 mod tests {
     use super::*;
 
+    fn register_array_api(state: LuaState) {
+        luaopen_pg(state);
+        unsafe { ffi::lua_setglobal(state.as_ptr(), cstr!("pg")) };
+    }
+
+    #[test]
+    fn array_encoder_escapes_strings_and_preserves_nulls_and_shapes() {
+        let (state, _owner) = test_lua();
+        register_array_api(state);
+        check_lua(
+            state,
+            r#"
+            assert(pg.array({}) == '{}')
+            assert(pg.array({1, pg.NULL, -3}) == '{1,NULL,-3}')
+            assert(pg.array({true, false}) == '{true,false}')
+            assert(pg.array({{1,2}, {3,4}}) == '{{1,2},{3,4}}')
+            assert(pg.array({'NULL', '', 'a,b', '{x}', 'a"b', 'a\\b'}) ==
+                [[{"NULL","","a,b","{x}","a\"b","a\\b"}]])
+        "#,
+        );
+        for (oid, expression, assertion) in [
+            (
+                1009,
+                r#"{'NULL', '', 'a,b', '{x}', 'a"b', 'a\\b', pg.NULL}"#,
+                r#"assert(a[1]=='NULL' and a[2]=='' and a[3]=='a,b' and a[4]=='{x}' and a[5]=='a"b' and a[6]=='a\\b' and a[7]==pg.NULL and #a==7)"#,
+            ),
+            (1007, "{{1,2},{3,4}}", "assert(a[1][2]==2 and a[2][1]==3)"),
+            (
+                1000,
+                "{true, false, pg.NULL}",
+                "assert(a[1]==true and a[2]==false and a[3]==pg.NULL)",
+            ),
+        ] {
+            check_lua(state, &format!("return pg.array({expression})"));
+            let encoded = unsafe { LuaStack::from_raw(state) }
+                .value(-1)
+                .as_bytes()
+                .unwrap()
+                .to_vec();
+            laux::lua_pop(state, 1);
+            convert_value(state, oid, &encoded).unwrap();
+            unsafe { ffi::lua_setglobal(state.as_ptr(), cstr!("a")) };
+            check_lua(state, assertion);
+        }
+    }
+
+    #[test]
+    fn array_encoder_rejects_holes_maps_cycles_and_ragged_shapes() {
+        let (state, _owner) = test_lua();
+        register_array_api(state);
+        check_lua(
+            state,
+            r#"
+            for _, value in ipairs({
+                {1, {2}}, {{1}, {2,3}}, {{}, {}},
+                {[1]=1, [3]=3}, {x=1}, {['1']=1}, {function() end}, {'a\0b'}
+            }) do
+                assert(not pcall(pg.array, value))
+            end
+            local cycle = {}; cycle[1] = cycle
+            assert(not pcall(pg.array, cycle))
+            assert(not pcall(pg.array, 'not a table'))
+            assert(pg.array({1,2}) == '{1,2}')
+        "#,
+        );
+        assert_eq!(laux::lua_top(state), 0);
+    }
+
+    #[test]
+    fn array_decoder_handles_bounds_escapes_and_exact_numeric_text() {
+        let (state, _owner) = test_lua();
+        register_array_api(state);
+        for (oid, wire, assertion) in [
+            (1007, "[1:2][1:2]={{1,2},{3,4}}", "assert(a[2][2]==4)"),
+            (
+                1009,
+                r#"{NULL,"NULL",null,"",a\,b,\NULL}"#,
+                "assert(#a==6 and a[1]==pg.NULL and a[2]=='NULL' and a[3]==pg.NULL and a[4]=='' and a[5]=='a,b' and a[6]=='NULL')",
+            ),
+            (
+                1016,
+                "{9223372036854775807,-9223372036854775808}",
+                "assert(a[1]==math.maxinteger and a[2]==math.mininteger)",
+            ),
+            (
+                1231,
+                "{12345678901234567890.123456789,NaN,NULL}",
+                "assert(a[1]=='12345678901234567890.123456789' and a[2]=='NaN' and a[3]==pg.NULL)",
+            ),
+            (1009, "{}", "assert(type(a)=='table' and #a==0)"),
+        ] {
+            convert_value(state, oid, wire.as_bytes()).unwrap();
+            unsafe { ffi::lua_setglobal(state.as_ptr(), cstr!("a")) };
+            check_lua(state, assertion);
+        }
+        convert_value(state, 99999, b"unknown text").unwrap();
+        assert_eq!(
+            unsafe { LuaStack::from_raw(state) }
+                .value(-1)
+                .as_bytes()
+                .unwrap(),
+            b"unknown text"
+        );
+    }
+
+    #[test]
+    fn malformed_arrays_restore_stack_and_surface_protocol_errors() {
+        let (state, _owner) = test_lua();
+        laux::lua_push(state, 42i64);
+        for text in [
+            "",
+            "{",
+            "{1,}",
+            "{,1}",
+            "{1,,2}",
+            "{\"unterminated}",
+            "{\"a\"junk}",
+            "{1}junk",
+            "{{1},{2,3}}",
+            "{1,{2}}",
+            "{{}}",
+            "[0:1]={1,2}",
+            "[1:3]={1,2}",
+            "[1:9223372036854775808]={1}",
+            "{{{{{{{1}}}}}}}",
+        ] {
+            assert!(
+                convert_value(state, 1007, text.as_bytes()).is_err(),
+                "{text}"
+            );
+            assert_eq!(laux::lua_top(state), 1, "{text}");
+        }
+        let mut rows = DataRows::default();
+        let row = data_row(&[Some(b"[0:1]={1,2}")]);
+        rows.begin(row.len()).extend_from_slice(&row);
+        let stmt = Statement {
+            row_desc: Some(description(&[("ids", 1007)])),
+            data_rows: rows,
+            command_tag: Some(b"SELECT 1\0".to_vec()),
+        };
+        assert!(push_statement_result(state, &stmt).is_err());
+    }
+
+    #[test]
+    fn lua_wrapper_exports_arrays_and_forwards_update_types() {
+        let (state, _owner) = test_lua();
+        register_array_api(state);
+        check_lua(
+            state,
+            r#"
+            package.preload['moon'] = function()
+                return { PTYPE_PG=1, register_protocol=function() end }
+            end
+            package.preload['pg.core'] = function() return pg end
+        "#,
+        );
+        check_lua(state, include_str!("../../../../lualib/moon/db/pg.lua"));
+        unsafe { ffi::lua_setglobal(state.as_ptr(), cstr!("wrapper")) };
+        check_lua(
+            state,
+            r#"
+            assert(wrapper.NULL == pg.NULL)
+            assert(wrapper.array({1, wrapper.NULL}) == '{1,NULL}')
+            local calls = 0
+            local function update(self, t, k, cols, rows, kt, types)
+                assert(t == 'example' and k == 'id' and kt == 'bigint')
+                assert(types[1] == 'int4[]' and rows[1][2] == '{1,2}')
+                calls = calls + 1
+                return {}
+            end
+            local db = setmetatable({obj={update_many=update, exec_update_many=function(...)
+                update(...)
+            end}}, wrapper)
+            db:update_many('example', 'id', {'ids'}, {{1,wrapper.array({1,2})}}, 'bigint', {'int4[]'})
+            db:execute_update_many('example', 'id', {'ids'}, {{1,wrapper.array({1,2})}}, 'bigint', {'int4[]'})
+            assert(calls == 2)
+        "#,
+        );
+    }
+
+    #[test]
+    fn encoded_arrays_use_existing_bind_parameter_path() {
+        let (state, _owner) = test_lua();
+        register_array_api(state);
+        check_lua(state, "return pg.array({1, pg.NULL, 3})");
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let mut wire = Vec::new();
+        write_param(&mut wire, &mut lua, 1, &JsonOptions::default()).unwrap();
+        assert_eq!(read_i32(&wire, 0), 10);
+        assert_eq!(&wire[4..], b"{1,NULL,3}");
+        wire.clear();
+        append_statement(
+            &mut wire,
+            &mut lua,
+            b"SELECT $1::int4[]",
+            1..2,
+            &JsonOptions::default(),
+        )
+        .unwrap();
+        assert!(wire.windows(10).any(|part| part == b"{1,NULL,3}"));
+        laux::lua_settop(state, 0);
+        check_lua(
+            state,
+            "return {{pg.array({1, pg.NULL, 3})}, {pg.array({})}}",
+        );
+        wire.clear();
+        encode_many(
+            &mut lua,
+            &mut wire,
+            1,
+            2,
+            1,
+            &JsonOptions::default(),
+            &|n| build_insert_sql("example", &["ids".into()], n, None),
+        )
+        .unwrap();
+        assert!(wire.windows(10).any(|part| part == b"{1,NULL,3}"));
+        assert!(wire.windows(2).any(|part| part == b"{}"));
+        let sql = build_update_sql(
+            "example",
+            "id",
+            &["ids".into()],
+            2,
+            Some("bigint"),
+            Some(&["int4[]".into()]),
+        );
+        assert!(sql.contains("\"ids\" = _d.\"ids\"::int4[]"));
+        assert!(sql.contains("($1,$2),($3,$4)"));
+    }
+
     fn wire_frame(kind: u8, body: &[u8]) -> Vec<u8> {
         let mut wire = vec![kind];
         wire.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
@@ -2896,6 +3225,11 @@ mod tests {
             let mut startup = vec![0; len - 4];
             stream.read_exact(&mut startup).await.unwrap();
             assert_eq!(read_i32(&startup, 0), 196608);
+            assert!(
+                startup
+                    .windows(b"options\0-c array_nulls=on\0".len())
+                    .any(|part| part == b"options\0-c array_nulls=on\0")
+            );
             let mut reply = wire_frame(b'R', &0i32.to_be_bytes());
             reply.extend(wire_frame(b'S', b"client_encoding\0UTF8\0"));
             reply.extend(wire_frame(b'K', &[0; 8]));
@@ -2921,6 +3255,50 @@ mod tests {
             data_row(&[Some(b"1")])
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parameterized_setup_cycle_is_drained_without_changing_results() {
+        for capture in [true, false] {
+            let (mut conn, mut server) = test_connection(1024, 1000).await;
+            let (state, _owner) = test_lua();
+            let mut lua = unsafe { LuaStack::from_raw(state) };
+            let mut request = Vec::new();
+            append_statement(
+                &mut request,
+                &mut lua,
+                b"SELECT 1",
+                0..0,
+                &JsonOptions::default(),
+            )
+            .unwrap();
+            append_sync(&mut request);
+            let mut reply = wire_frame(b'A', b"\0\0\0\x07events\0setup\0");
+            reply.extend(wire_frame(b'C', b"SET\0"));
+            reply.extend(wire_frame(b'Z', b"I"));
+            reply.extend(wire_frame(b'T', &description(&[("one", 23)])));
+            reply.extend(wire_frame(b'D', &data_row(&[Some(b"1")])));
+            reply.extend(wire_frame(b'C', b"SELECT 1\0"));
+            reply.extend(wire_frame(b'A', b"\0\0\0\x07events\0query\0"));
+            reply.extend(wire_frame(b'Z', b"I"));
+            server.write_all(&reply).await.unwrap();
+            let result = conn.execute_request(&request, capture).await.unwrap();
+            assert!(result.error.is_none());
+            assert_eq!(result.statements.len(), usize::from(capture));
+            assert_eq!(result.notifications.len(), if capture { 2 } else { 0 });
+            if capture {
+                assert_eq!(result.statements[0].data_rows.count, 1);
+                assert_eq!(result.notifications[0].payload, "setup");
+                assert_eq!(result.notifications[1].payload, "query");
+            }
+            let setup = wire_frame(b'Q', b"SET array_nulls = on\0");
+            let mut sent = vec![0; setup.len() + request.len()];
+            server.read_exact(&mut sent).await.unwrap();
+            assert_eq!(&sent[..setup.len()], setup);
+            assert_eq!(&sent[setup.len()..], request);
+            server.write_all(&wire_frame(b'Z', b"I")).await.unwrap();
+            assert!(conn.execute(b"", false).await.unwrap().error.is_none());
+        }
     }
 
     #[tokio::test]
@@ -3304,6 +3682,14 @@ mod tests {
         assert!(validate_type_name("integer[]").is_ok());
         assert!(validate_type_name("text").is_ok());
         assert!(validate_type_name("double_precision").is_ok());
+        for ty in [
+            "DOUBLE PRECISION[]",
+            "timestamp with time zone[][]",
+            "my_enum[]",
+            " int4 [] ",
+        ] {
+            assert!(validate_type_name(ty).is_ok(), "{ty}");
+        }
     }
 
     #[test]
@@ -3316,6 +3702,18 @@ mod tests {
         assert!(validate_type_name("int; DROP TABLE").is_err());
         assert!(validate_type_name("int--comment").is_err());
         assert!(validate_type_name("int'").is_err());
+        for ty in [
+            "bigint OR true",
+            "boolean OR true",
+            "int4[] IS NULL",
+            "int4[1]",
+            "[]",
+            "1int",
+            "text COLLATE default",
+            "text FROM users",
+        ] {
+            assert!(validate_type_name(ty).is_err(), "{ty}");
+        }
     }
 
     // -- build_update_sql -----------------------------------------------------
@@ -3323,7 +3721,7 @@ mod tests {
     #[test]
     fn build_update_sql_single_row_with_key_type() {
         let set_cols = vec!["name".to_string(), "value".to_string()];
-        let sql = build_update_sql("items", "id", &set_cols, 1, Some("bigint"));
+        let sql = build_update_sql("items", "id", &set_cols, 1, Some("bigint"), None);
         assert_eq!(
             sql,
             "UPDATE \"items\" AS _t SET \"name\" = _d.\"name\", \"value\" = _d.\"value\" \
@@ -3335,7 +3733,7 @@ mod tests {
     #[test]
     fn build_update_sql_multi_row_without_key_type() {
         let set_cols = vec!["score".to_string()];
-        let sql = build_update_sql("players", "uid", &set_cols, 3, None);
+        let sql = build_update_sql("players", "uid", &set_cols, 3, None, None);
         assert_eq!(
             sql,
             "UPDATE \"players\" AS _t SET \"score\" = _d.\"score\" \
@@ -3347,7 +3745,7 @@ mod tests {
     #[test]
     fn build_update_sql_quoted_identifiers() {
         let set_cols = vec!["col\"x".to_string()];
-        let sql = build_update_sql("my\"table", "k\"ey", &set_cols, 1, None);
+        let sql = build_update_sql("my\"table", "k\"ey", &set_cols, 1, None, None);
         assert!(sql.contains("\"my\"\"table\""));
         assert!(sql.contains("\"k\"\"ey\""));
         assert!(sql.contains("\"col\"\"x\""));

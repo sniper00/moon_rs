@@ -115,6 +115,41 @@ local total = pg.stats()         -- total pending across all pools
 db:close()
 ```
 
+## Arrays
+
+`pg.array(values)` encodes a dense Lua sequence as PostgreSQL array text for
+bound parameters. Use explicit SQL casts when the target type cannot be inferred:
+
+```lua
+db:query_params("INSERT INTO items(ids) VALUES ($1::int4[])",
+    pg.array({1, pg.NULL, 3}))
+db:update_many("items", "id", {"ids"}, {
+    {1, pg.array({4, 5})},
+}, "bigint", {"int4[]"}) -- optional set_types, in set_columns order
+```
+
+Common built-in arrays decode to Lua sequences, including rectangular nested
+arrays up to six dimensions. `pg.NULL` (equal to `json.null`) preserves NULL
+array elements; an entire SQL NULL column retains the existing missing-key
+behavior. Empty arrays use `{}`. Numeric array elements remain exact strings;
+date/time, UUID, JSON and bytea elements retain PostgreSQL text formatting.
+Bytea values are not decoded from their PostgreSQL hex/escape representation.
+Unknown array OIDs retain raw text. Arrays with non-one lower bounds return a
+`PROTOCOL` error rather than losing their indexing information. Sparse input,
+ragged input and empty nested arrays are rejected.
+
+Type hints (`key_type` and `set_types`) accept simple unquoted identifiers,
+known multiword built-in types and `[]` suffixes; SQL expressions, quoted names,
+and schema-qualified names are rejected. Connections start with `array_nulls=on`.
+Before each parameterized request the driver pipelines a setting reset and drains
+its response separately, preserving results and NULL elements even if a preceding
+request disabled the setting. Do not disable `array_nulls` inside the same pipeline
+or a function used by the request.
+
+Run the temporary-table integration test with `MOON_PG_TEST_URL` set:
+`moon_rs assets/test/test_pg_array.lua`. Use a single connection for session-local
+temporary tables.
+
 ## Result Format
 
 Successful query:

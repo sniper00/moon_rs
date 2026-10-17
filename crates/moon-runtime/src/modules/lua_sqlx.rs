@@ -2,6 +2,7 @@ use crate::lua_json::{JsonOptions, encode_table};
 use crate::request_pool::{
     PendingCounter, QueuedRequest, dispatch_request, drain_queued_requests, notify_shutdown,
 };
+use bigdecimal::{BigDecimal, ToPrimitive};
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
 use lazy_static::lazy_static;
@@ -48,6 +49,8 @@ enum DbType {
     Timestamp,
     TimestampTz,
     Uuid,
+    Binary,
+    Decimal,
     Unknown,
 }
 
@@ -65,11 +68,13 @@ static DB_TYPE_MAP: phf::Map<&'static str, DbType> = phf_map! {
     "MEDIUMINT" => DbType::Integer,
     "BIGINT" => DbType::Integer,
     "INTEGER" => DbType::Integer,
+    // Decimal
+    "NUMERIC" => DbType::Decimal,
+    "DECIMAL" => DbType::Decimal,
     // Float
     "FLOAT4" => DbType::Float32,
     "REAL" => DbType::Float32,
     "FLOAT8" => DbType::Float64,
-    "NUMERIC" => DbType::Float64,
     "FLOAT" => DbType::Float64,
     "DOUBLE" => DbType::Float64,
     // Text
@@ -90,12 +95,51 @@ static DB_TYPE_MAP: phf::Map<&'static str, DbType> = phf_map! {
     "TIMESTAMPTZ" => DbType::TimestampTz,
     // UUID
     "UUID" => DbType::Uuid,
+    // Binary blob
+    "BLOB" => DbType::Binary,
+    "BYTEA" => DbType::Binary,
+    "BINARY" => DbType::Binary,
+    "VARBINARY" => DbType::Binary,
 };
 
 impl DbType {
     fn from_name(name: &str) -> Self {
         DB_TYPE_MAP.get(name).copied().unwrap_or(Self::Unknown)
     }
+}
+
+// Local wrapper keeps the generic row decoder usable with SQLite, for which
+// SQLx deliberately does not implement BigDecimal decoding.
+struct DecimalValue(BigDecimal);
+
+macro_rules! impl_decimal_decode {
+    ($db:ty) => {
+        impl<'r> sqlx::Decode<'r, $db> for DecimalValue {
+            fn decode(
+                value: <$db as Database>::ValueRef<'r>,
+            ) -> Result<Self, sqlx::error::BoxDynError> {
+                <BigDecimal as sqlx::Decode<$db>>::decode(value).map(Self)
+            }
+        }
+    };
+}
+
+impl_decimal_decode!(Postgres);
+impl_decimal_decode!(MySql);
+
+impl<'r> sqlx::Decode<'r, Sqlite> for DecimalValue {
+    fn decode(value: <Sqlite as Database>::ValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        // SQLite normally reports INTEGER/REAL/TEXT storage types. If decimal
+        // metadata is encountered, parse its textual representation; precision
+        // already lost to SQLite REAL storage cannot be recovered here.
+        let text = <&str as sqlx::Decode<Sqlite>>::decode(value)?;
+        Ok(Self(text.parse()?))
+    }
+}
+
+fn decimal_integer(value: &BigDecimal) -> Option<i64> {
+    // ToPrimitive alone truncates fractional values.
+    value.is_integer().then(|| value.to_i64()).flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +161,7 @@ where
     chrono::NaiveDateTime: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
     chrono::DateTime<chrono::Utc>: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
     uuid::Uuid: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    DecimalValue: sqlx::Decode<'a, DB>,
     serde_json::Value: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
 {
     let table = LuaTable::new(state, rows.len(), 0);
@@ -169,6 +214,18 @@ where
                                 sqlx::decode::Decode::decode(value).unwrap_or(0.0f64),
                             );
                         }
+                        DbType::Decimal => {
+                            if let Ok(DecimalValue(v)) =
+                                <DecimalValue as sqlx::Decode<DB>>::decode(value)
+                            {
+                                if let Some(integer) = decimal_integer(&v) {
+                                    row_table.insert(col_name, integer);
+                                } else {
+                                    let s = v.to_string();
+                                    row_table.insert(col_name, s.as_str());
+                                }
+                            }
+                        }
                         DbType::Text => {
                             let v: &str = sqlx::decode::Decode::decode(value).unwrap_or("");
                             row_table.insert(col_name, v);
@@ -195,7 +252,7 @@ where
                             if let Ok(v) =
                                 <chrono::NaiveDateTime as sqlx::Decode<DB>>::decode(value)
                             {
-                                let s = v.to_string();
+                                let s = v.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
                                 row_table.insert(col_name, s.as_str());
                             }
                         }
@@ -203,7 +260,7 @@ where
                             if let Ok(v) =
                                 <chrono::DateTime<chrono::Utc> as sqlx::Decode<DB>>::decode(value)
                             {
-                                let s = v.to_string();
+                                let s = v.to_rfc3339();
                                 row_table.insert(col_name, s.as_str());
                             }
                         }
@@ -213,7 +270,7 @@ where
                                 row_table.insert(col_name, s.as_str());
                             }
                         }
-                        DbType::Unknown => {
+                        DbType::Binary | DbType::Unknown => {
                             let v: &[u8] = sqlx::decode::Decode::decode(value).unwrap_or(b"");
                             row_table.insert(col_name, v);
                         }
@@ -1223,4 +1280,70 @@ pub extern "C-unwind" fn luaopen_sqlx(state: LuaState) -> c_int {
     luaL_newlib!(state, l);
 
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moon_base::laux::LuaGlobalState;
+    use std::ptr::NonNull;
+
+    #[test]
+    fn decimal_integer_preserves_fractions_and_range() {
+        for (text, expected) in [
+            ("42.000", Some(42)),
+            ("-42", Some(-42)),
+            ("1e3", Some(1000)),
+            ("0.001", None),
+            ("-1.9", None),
+            ("9223372036854775807", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("9223372036854775808", None),
+            ("9223372036854775807.1", None),
+        ] {
+            assert_eq!(decimal_integer(&text.parse().unwrap()), expected, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_rows_preserve_binary_and_timestamp_without_assuming_timezone() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(
+            "CREATE TABLE sample (payload BLOB, created TIMESTAMP)",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(
+            "INSERT INTO sample VALUES (X'00FF41', '2026-10-17 12:34:56.123456')",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows = sqlx::query(sqlx::AssertSqlSafe("SELECT * FROM sample"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).unwrap();
+        let _owner = LuaGlobalState::new(state);
+        assert_eq!(process_rows::<Sqlite>(state, &rows), 1);
+        unsafe {
+            ffi::lua_rawgeti(state.as_ptr(), -1, 1);
+            ffi::lua_getfield(state.as_ptr(), -1, cstr!("payload"));
+        }
+        let lua = unsafe { LuaStack::from_raw(state) };
+        assert_eq!(lua.value(-1).as_bytes().unwrap(), b"\x00\xffA");
+        unsafe {
+            ffi::lua_settop(state.as_ptr(), 2);
+            ffi::lua_getfield(state.as_ptr(), -1, cstr!("created"));
+        }
+        assert_eq!(
+            lua.value(-1).as_str().unwrap(),
+            "2026-10-17T12:34:56.123456"
+        );
+    }
 }

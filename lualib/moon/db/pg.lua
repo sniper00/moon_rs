@@ -38,6 +38,23 @@ moon.register_protocol {
 local M = {}
 M.__index = M
 
+---SQL NULL sentinel, also accepted inside arrays (same value as json.null).
+M.NULL = c.NULL
+
+---Encode a dense Lua sequence as PostgreSQL array text for bound parameters.
+---Use explicit casts such as `$1::int4[]` when the SQL cannot infer the type.
+---Nested sequences must be rectangular (up to six dimensions); use pg.NULL
+---for NULL elements. Strings are escaped; empty arrays become "{}".
+---Pass the result to query_params, execute_params, pipe, or bulk-write methods.
+---Common array results decode to nested sequences. Numeric elements stay exact
+---strings; other textual types keep PostgreSQL formatting. Non-one lower bounds
+---are rejected. Decoded bytea strings retain PostgreSQL hex/escape notation.
+---@param values table
+---@return string
+function M.array(values)
+    return c.array(values)
+end
+
 ---Look up an already-connected pool by name and wrap it.
 ---@param name string
 ---@return pg
@@ -228,9 +245,10 @@ end
 ---@param set_columns string[] columns to assign, e.g. { "value", "name" }
 ---@param rows table @ array of `{ key, set1, set2, ... }`
 ---@param key_type? string e.g. "bigint" — cast the join key to keep its index usable
+---@param set_types? string[] SQL types matching set_columns, e.g. { "int4[]", "text" }; required when text assignment needs an explicit cast
 ---@return pg_result
-function M:update_many(table_name, key_column, set_columns, rows, key_type)
-    local res = self.obj:update_many(table_name, key_column, set_columns, rows, key_type)
+function M:update_many(table_name, key_column, set_columns, rows, key_type, set_types)
+    local res = self.obj:update_many(table_name, key_column, set_columns, rows, key_type, set_types)
     if type(res) == "table" then
         return res
     end
@@ -243,8 +261,9 @@ end
 ---@param set_columns string[] columns to assign
 ---@param rows table @ array of `{ key, set1, set2, ... }`
 ---@param key_type? string e.g. "bigint" — cast the join key to keep its index usable
-function M:execute_update_many(table_name, key_column, set_columns, rows, key_type)
-    local res = self.obj:exec_update_many(table_name, key_column, set_columns, rows, key_type)
+---@param set_types? string[] SQL types matching set_columns, e.g. { "int4[]", "text" }; required when text assignment needs an explicit cast
+function M:execute_update_many(table_name, key_column, set_columns, rows, key_type, set_types)
+    local res = self.obj:exec_update_many(table_name, key_column, set_columns, rows, key_type, set_types)
     if type(res) == "table" then
         moon.error(table.tostring(res))
     end

@@ -47,7 +47,8 @@ httparse = "1.8.0"
 percent-encoding = "2.3.1"
 url = "2.5.0"
 
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "mysql-rsa", "postgres", "sqlite", "mysql", "chrono", "uuid", "json"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "mysql-rsa", "postgres", "sqlite", "mysql", "chrono", "uuid", "json", "bigdecimal"] }
+bigdecimal = "0.4"
 phf = { version = "0.14", features = ["macros"] }
 uuid = "1"
 mongodb = { version = "3.2", default-features = false, features = ["compat-3-0-0", "dns-resolver", "rustls-tls-aws-lc"] }

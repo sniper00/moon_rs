@@ -13,7 +13,7 @@ default = ["excel", "httpc", "httpd", "websocket", "pg", "redis", "cluster", "pr
 excel = ["dep:calamine", "dep:csv"]
 httpc = ["dep:reqwest", "dep:httparse", "dep:percent-encoding", "dep:url"]
 httpd = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-util", "dep:futures-util", "dep:httpdate"]
-sqlx = ["dep:sqlx", "dep:phf", "dep:uuid", "dep:futures-util"]
+sqlx = ["dep:bigdecimal", "dep:sqlx", "dep:phf", "dep:uuid", "dep:futures-util"]
 mongodb = ["dep:mongodb", "dep:futures-util"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 pg = ["dep:url"]
@@ -79,6 +79,7 @@ tokio-util = { workspace = true, optional = true }
 
 # Optional: SQLx
 sqlx = { workspace = true, optional = true }
+bigdecimal = { workspace = true, optional = true }
 phf = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
