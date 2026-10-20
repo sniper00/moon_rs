@@ -166,7 +166,7 @@ fn write_table_hash(
     buf: &mut Vec<u8>,
     depth: i32,
     array_size: usize,
-) -> Result<i32, String> {
+) -> Result<(), String> {
     for mut entry in lua.table_cursor(index) {
         let (key_index, key_kind, skip) = {
             let key = entry.key();
@@ -194,36 +194,7 @@ fn write_table_hash(
 
     write_nil(buf);
 
-    Ok(0)
-}
-
-#[cfg(test)]
-fn write_table_hash_ffi(
-    lua: &mut LuaStack<'_>,
-    index: i32,
-    buf: &mut Vec<u8>,
-    depth: i32,
-    array_size: usize,
-) -> Result<i32, String> {
-    unsafe {
-        ffi::lua_pushnil(lua.as_ptr());
-        while ffi::lua_next(lua.as_ptr(), index) != 0 {
-            let key_kind = laux::lua_type(lua.state(), -2);
-            let skip = key_kind == LuaType::Integer && {
-                let key = ffi::lua_tointeger(lua.as_ptr(), -2);
-                key > 0 && (key as usize) <= array_size
-            };
-            if !skip {
-                let value_kind = laux::lua_type(lua.state(), -1);
-                pack_value(lua, -2, key_kind, buf, depth)?;
-                pack_value(lua, -1, value_kind, buf, depth)?;
-            }
-            ffi::lua_pop(lua.as_ptr(), 1);
-        }
-    }
-
-    write_nil(buf);
-    Ok(0)
+    Ok(())
 }
 
 fn write_table_metapairs(
@@ -231,7 +202,7 @@ fn write_table_metapairs(
     index: i32,
     buf: &mut Vec<u8>,
     depth: i32,
-) -> Result<i32, String> {
+) -> Result<(), String> {
     let n = combine_type!(TYPE_TABLE, 0);
     buf.push(n);
 
@@ -261,7 +232,7 @@ fn write_table_metapairs(
 
     write_nil(buf);
 
-    Ok(0)
+    Ok(())
 }
 
 /// Pop and format the error object left on top of the stack by a failed
@@ -282,7 +253,7 @@ fn write_table(
     index: i32,
     buf: &mut Vec<u8>,
     depth: i32,
-) -> Result<i32, String> {
+) -> Result<(), String> {
     let state = lua.state();
     laux::lua_checkstack(state, ffi::LUA_MINSTACK, cstr!("serialize"))?;
     let index = lua.abs_index(index);
@@ -297,7 +268,7 @@ fn write_table(
             write_table_hash(lua, index, buf, depth, array_size)?;
         }
     }
-    Ok(0)
+    Ok(())
 }
 
 fn pack_one(
@@ -445,64 +416,34 @@ impl ReadBlock<'_> {
         Some(b)
     }
 
+    fn read_array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let mut bytes = [0u8; N];
+        bytes.copy_from_slice(self.consume(N)?);
+        Some(bytes)
+    }
+
     fn read_u16(&mut self) -> Option<u16> {
-        let mut n = [0u8; 2];
-        if self.len() < n.len() {
-            invalid_stream!(self);
-        }
-        n.copy_from_slice(&self.buf[self.pos..self.pos + 2]);
-        self.pos += 2;
-        Some(u16::from_le_bytes(n))
+        Some(u16::from_le_bytes(self.read_array()?))
     }
 
     fn read_u32(&mut self) -> Option<u32> {
-        let mut n = [0u8; 4];
-        if self.len() < n.len() {
-            invalid_stream!(self);
-        }
-        n.copy_from_slice(&self.buf[self.pos..self.pos + 4]);
-        self.pos += 4;
-        Some(u32::from_le_bytes(n))
+        Some(u32::from_le_bytes(self.read_array()?))
     }
 
     fn read_i32(&mut self) -> Option<i32> {
-        let mut n = [0u8; 4];
-        if self.len() < n.len() {
-            invalid_stream!(self);
-        }
-        n.copy_from_slice(&self.buf[self.pos..self.pos + 4]);
-        self.pos += 4;
-        Some(i32::from_le_bytes(n))
+        Some(i32::from_le_bytes(self.read_array()?))
     }
 
     fn read_i64(&mut self) -> Option<i64> {
-        let mut n = [0u8; 8];
-        if self.len() < n.len() {
-            invalid_stream!(self);
-        }
-        n.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
-        self.pos += 8;
-        Some(i64::from_le_bytes(n))
+        Some(i64::from_le_bytes(self.read_array()?))
     }
 
     fn read_real(&mut self) -> Option<f64> {
-        let mut n = [0u8; 8];
-        if self.len() < n.len() {
-            invalid_stream!(self);
-        }
-        n.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
-        self.pos += 8;
-        Some(f64::from_le_bytes(n))
+        Some(f64::from_le_bytes(self.read_array()?))
     }
 
     fn read_pointer(&mut self) -> Option<*mut std::ffi::c_void> {
-        let mut n = [0u8; std::mem::size_of::<usize>()];
-        if self.len() < n.len() {
-            invalid_stream!(self);
-        }
-        n.copy_from_slice(&self.buf[self.pos..self.pos + std::mem::size_of::<usize>()]);
-        self.pos += std::mem::size_of::<usize>();
-        Some(usize::from_le_bytes(n) as *mut std::ffi::c_void)
+        Some(usize::from_le_bytes(self.read_array()?) as *mut std::ffi::c_void)
     }
 
     fn consume(&mut self, len: usize) -> Option<&[u8]> {
@@ -632,29 +573,26 @@ fn unpack_table(
     }
 }
 
+fn pack_args(lua: &mut LuaStack<'_>) -> Result<Buffer, String> {
+    let mut buf = Buffer::new();
+    for i in 1..=lua.top() {
+        // SAFETY: pack_one only appends; the read position stays zero.
+        pack_one(lua, i, unsafe { buf.as_mut_vec() }, 0)?;
+    }
+    Ok(buf)
+}
+
 fn pack(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let state = lua.state();
-    let n = laux::lua_top(state);
-    let mut buf = Box::new(Buffer::new());
-    for i in 1..=n {
-        pack_one(lua, i, buf.as_mut_vec(), 0)?;
-    }
-
+    let buf = Box::new(pack_args(lua)?);
     laux::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);
-
     Ok(1)
 }
 
 fn pack_string(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let state = lua.state();
-    let n = laux::lua_top(state);
-    let mut buf = Box::new(Buffer::new());
-    for i in 1..=n {
-        pack_one(lua, i, buf.as_mut_vec(), 0)?;
-    }
-
+    let buf = pack_args(lua)?;
     laux::lua_push(state, buf.as_slice());
-
     Ok(1)
 }
 
@@ -693,7 +631,9 @@ fn unpack(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
             return Err("deserialize null pointer".to_string());
         }
 
-        decode_bytes(state, std::slice::from_raw_parts(data, len))
+        // Keep the input string rooted while decoded values allocate in Lua.
+        laux::lua_settop(state, 1);
+        decode_bytes(state, std::slice::from_raw_parts(data, len), 1)
             .map_err(|error| error.to_string())
     }
 }
@@ -710,23 +650,28 @@ pub unsafe extern "C-unwind" fn decode_buffer_message(
     m: *mut moon_runtime::context::Message,
 ) -> c_int {
     match unsafe { crate::message_decode::borrow_buffer(m) } {
-        Ok(buf) => match unsafe { decode_bytes(state, buf.as_slice()) } {
-            Ok(count) => count,
-            Err(e) => {
-                laux::lua_settop(state, 0);
-                crate::lua_push_error_tuple(state, &e.to_string())
+        Ok(buf) => {
+            laux::lua_settop(state, 0);
+            match unsafe { decode_bytes(state, buf.as_slice(), 0) } {
+                Ok(count) => count,
+                Err(e) => {
+                    laux::lua_settop(state, 0);
+                    crate::lua_push_error_tuple(state, &e.to_string())
+                }
             }
-        },
+        }
         Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
-unsafe fn decode_bytes(state: LuaState, data: &[u8]) -> Result<c_int, DecodeError> {
+unsafe fn decode_bytes(
+    state: LuaState,
+    data: &[u8],
+    base_top: c_int,
+) -> Result<c_int, DecodeError> {
     if data.is_empty() {
         return Ok(0);
     }
-
-    laux::lua_settop(state, 0);
 
     let br = &mut ReadBlock {
         buf: data,
@@ -753,7 +698,7 @@ unsafe fn decode_bytes(state: LuaState, data: &[u8]) -> Result<c_int, DecodeErro
         }
     }
 
-    Ok(laux::lua_top(state) as c_int)
+    Ok(laux::lua_top(state) - base_top)
 }
 
 fn peek_one(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -819,192 +764,5 @@ pub unsafe extern "C-unwind" fn luaopen_seri(state: LuaState) -> c_int {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use moon_base::laux::LuaGlobalState;
-    use std::{hint::black_box, ptr::NonNull, time::Instant};
-
-    #[test]
-    fn empty_pack_returns_a_buffer_and_preserves_zero_values() {
-        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).unwrap();
-        let _owner = LuaGlobalState::new(state);
-        let mut lua = unsafe { LuaStack::from_raw(state) };
-        assert_eq!(pack(&mut lua).unwrap(), 1);
-        let ptr = unsafe { ffi::lua_touserdata(state.as_ptr(), -1) } as *mut Buffer;
-        let buf = unsafe { Box::from_raw(ptr) };
-        assert!(buf.as_slice().is_empty());
-        assert!(matches!(
-            unsafe { decode_bytes(state, buf.as_slice()) },
-            Ok(0)
-        ));
-        unsafe {
-            ffi::lua_settop(state.as_ptr(), 0);
-        }
-        assert_eq!(pack_string(&mut lua).unwrap(), 1);
-        assert_eq!(laux::lua_type(state, -1), LuaType::String);
-        assert_eq!(unsafe { ffi::lua_rawlen(state.as_ptr(), -1) }, 0);
-        unsafe {
-            ffi::lua_settop(state.as_ptr(), 0);
-            ffi::lua_pushnil(state.as_ptr());
-        }
-        assert_eq!(pack_string(&mut lua).unwrap(), 1);
-        assert!(unsafe { ffi::lua_rawlen(state.as_ptr(), -1) } > 0);
-    }
-
-    fn push_benchmark_table(state: LuaState, array_size: usize, hash_size: usize) {
-        unsafe {
-            ffi::lua_createtable(state.as_ptr(), array_size as i32, hash_size as i32);
-            for i in 1..=array_size {
-                ffi::lua_pushinteger(state.as_ptr(), i as ffi::lua_Integer);
-                ffi::lua_rawseti(state.as_ptr(), -2, i as ffi::lua_Integer);
-            }
-            for i in 1..=hash_size {
-                let key = format!("field{i}");
-                ffi::lua_pushlstring(state.as_ptr(), key.as_ptr().cast(), key.len());
-                ffi::lua_pushinteger(state.as_ptr(), i as ffi::lua_Integer);
-                ffi::lua_rawset(state.as_ptr(), -3);
-            }
-        }
-    }
-
-    fn run_hash_writer(
-        lua: &mut LuaStack<'_>,
-        array_size: usize,
-        iterations: usize,
-        lazy: bool,
-        buf: &mut Vec<u8>,
-    ) {
-        for _ in 0..iterations {
-            buf.clear();
-            if lazy {
-                write_table_hash(lua, 1, buf, 0, array_size).expect("lazy hash writer");
-            } else {
-                write_table_hash_ffi(lua, 1, buf, 0, array_size).expect("FFI hash writer");
-            }
-            black_box(buf.len());
-        }
-    }
-
-    #[test]
-    #[ignore = "manual release benchmark"]
-    fn benchmark_lazy_hash_cursor_against_ffi() {
-        const ITERATIONS: usize = 1_000_000;
-        const ROUNDS: usize = 6;
-
-        for (name, array_size, hash_size) in
-            [("array32", 32, 0), ("hash16", 0, 16), ("mixed32_8", 32, 8)]
-        {
-            let state =
-                NonNull::new(unsafe { ffi::luaL_newstate() }).expect("Lua state allocation");
-            let _owner = LuaGlobalState::new(state);
-            push_benchmark_table(state, array_size, hash_size);
-            let mut lua = unsafe { LuaStack::from_raw(state) };
-            let mut ffi_buf = Vec::with_capacity(512);
-            let mut lazy_buf = Vec::with_capacity(512);
-
-            run_hash_writer(&mut lua, array_size, 10_000, false, &mut ffi_buf);
-            run_hash_writer(&mut lua, array_size, 10_000, true, &mut lazy_buf);
-            assert_eq!(lazy_buf, ffi_buf);
-
-            let mut ffi_elapsed = 0.0;
-            let mut lazy_elapsed = 0.0;
-            for round in 0..ROUNDS {
-                if round % 2 == 0 {
-                    let started = Instant::now();
-                    run_hash_writer(&mut lua, array_size, ITERATIONS, false, &mut ffi_buf);
-                    ffi_elapsed += started.elapsed().as_secs_f64();
-
-                    let started = Instant::now();
-                    run_hash_writer(&mut lua, array_size, ITERATIONS, true, &mut lazy_buf);
-                    lazy_elapsed += started.elapsed().as_secs_f64();
-                } else {
-                    let started = Instant::now();
-                    run_hash_writer(&mut lua, array_size, ITERATIONS, true, &mut lazy_buf);
-                    lazy_elapsed += started.elapsed().as_secs_f64();
-
-                    let started = Instant::now();
-                    run_hash_writer(&mut lua, array_size, ITERATIONS, false, &mut ffi_buf);
-                    ffi_elapsed += started.elapsed().as_secs_f64();
-                }
-            }
-
-            assert_eq!(lazy_buf, ffi_buf);
-            let operations = (ITERATIONS * ROUNDS) as f64;
-            eprintln!(
-                "{name}: ffi={:.2} ns lazy={:.2} ns delta={:+.2}%",
-                ffi_elapsed / operations * 1e9,
-                lazy_elapsed / operations * 1e9,
-                (lazy_elapsed / ffi_elapsed - 1.0) * 100.0,
-            );
-        }
-    }
-
-    #[test]
-    fn mixed_table_round_trip_preserves_all_array_and_hash_entries() {
-        const ARRAY_SIZE: usize = 32;
-        const HASH_SIZE: usize = 8;
-
-        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).expect("Lua state allocation");
-        let _owner = LuaGlobalState::new(state);
-        unsafe {
-            ffi::lua_createtable(state.as_ptr(), ARRAY_SIZE as i32, HASH_SIZE as i32);
-            for i in 1..=ARRAY_SIZE {
-                ffi::lua_pushinteger(state.as_ptr(), (i as ffi::lua_Integer) * 10);
-                ffi::lua_rawseti(state.as_ptr(), -2, i as ffi::lua_Integer);
-            }
-            for i in 1..=HASH_SIZE {
-                let key = format!("field{i}");
-                ffi::lua_pushlstring(state.as_ptr(), key.as_ptr().cast(), key.len());
-                ffi::lua_pushinteger(state.as_ptr(), 1_000 + i as ffi::lua_Integer);
-                ffi::lua_rawset(state.as_ptr(), -3);
-            }
-        }
-
-        let encoded = {
-            let mut lua = unsafe { LuaStack::from_raw(state) };
-            let mut encoded = Vec::new();
-            pack_one(&mut lua, 1, &mut encoded, 0).expect("pack mixed table");
-            encoded
-        };
-
-        let count = match unsafe { decode_bytes(state, &encoded) } {
-            Ok(count) => count,
-            Err(error) => panic!("unpack mixed table: {error}"),
-        };
-        assert_eq!(count, 1);
-        assert_eq!(unsafe { ffi::lua_gettop(state.as_ptr()) }, 1);
-        assert_eq!(
-            unsafe { ffi::lua_rawlen(state.as_ptr(), 1) },
-            ARRAY_SIZE,
-            "the encoded table header and array payload must agree"
-        );
-
-        for i in 1..=ARRAY_SIZE {
-            unsafe {
-                ffi::lua_rawgeti(state.as_ptr(), 1, i as ffi::lua_Integer);
-                assert_eq!(
-                    ffi::lua_tointeger(state.as_ptr(), -1),
-                    (i as ffi::lua_Integer) * 10,
-                    "array entry {i} was not preserved"
-                );
-                ffi::lua_pop(state.as_ptr(), 1);
-            }
-        }
-
-        for i in 1..=HASH_SIZE {
-            let key = format!("field{i}");
-            unsafe {
-                ffi::lua_pushlstring(state.as_ptr(), key.as_ptr().cast(), key.len());
-                ffi::lua_rawget(state.as_ptr(), 1);
-                assert_eq!(
-                    ffi::lua_tointeger(state.as_ptr(), -1),
-                    1_000 + i as ffi::lua_Integer,
-                    "hash entry {key} was not preserved"
-                );
-                ffi::lua_pop(state.as_ptr(), 1);
-            }
-        }
-
-        assert_eq!(unsafe { ffi::lua_gettop(state.as_ptr()) }, 1);
-    }
-}
+#[path = "../../tests/unit/modules/lua_seri.rs"]
+mod tests;

@@ -1,5 +1,6 @@
 local moon = require "moon"
 local c = require "sqlx.core"
+local cursor_iterator = require "moon.db.cursor"
 local json = require("json")
 moon.register_protocol {
     name = "sqlx",
@@ -127,51 +128,7 @@ function M:query_stream(sql, batch_size, ...)
         ---@diagnostic disable-next-line: return-type-mismatch, missing-return-value
         return nil, res.message or res.kind
     end
-    local current_session = res
-    local buffer
-    local idx = 0
-    local done = false
-    local pending_cursor
-
-    local stream_state = setmetatable({}, {
-        __close = function()
-            if pending_cursor then
-                pending_cursor:close()
-                pending_cursor = nil
-            end
-        end,
-    })
-
-    ---@async
-    local function iter()
-        while true do
-            if buffer and idx < #buffer then
-                idx = idx + 1
-                return buffer[idx]
-            end
-            if done then
-                return nil
-            end
-            if pending_cursor then
-                current_session = pending_cursor:next()
-                pending_cursor = nil
-            end
-            local rows, cursor_handle = moon.wait(current_session)
-            if not rows or #rows == 0 then
-                done = true
-                return nil
-            end
-            buffer = rows
-            idx = 0
-            if cursor_handle then
-                pending_cursor = cursor_handle
-            else
-                done = true
-            end
-        end
-    end
-
-    return iter, nil, nil, stream_state
+    return cursor_iterator(res)
 end
 
 --- Wrap a value as an explicit JSON query parameter. Use this instead of

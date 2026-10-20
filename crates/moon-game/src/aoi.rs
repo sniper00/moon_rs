@@ -788,4 +788,5 @@ impl Aoi {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/aoi.rs"]
 mod tests;

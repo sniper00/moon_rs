@@ -68,13 +68,14 @@ function buffer.write(buf, ...) end
 ---@return boolean
 function buffer.seek(buf, pos) end
 
---- Advance the write cursor by `n` bytes after a `prepare` call.
+--- Advance the write cursor by `n` initialized bytes after a `prepare` call.
+--- Native writers must initialize every byte they commit and stay within the prepared region.
 ---@param buf buffer_ptr
 ---@param n integer
 ---@return boolean
 function buffer.commit(buf, n) end
 
---- Ensure at least `n` writable bytes; returns a writable pointer.
+--- Ensure `n` writable bytes, initialized to zero; returns a writable pointer.
 ---@param buf buffer_ptr
 ---@param n integer
 ---@return lightuserdata void*

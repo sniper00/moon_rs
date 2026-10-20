@@ -3,6 +3,7 @@ use colored::*;
 use log::{Level, Metadata, Record};
 use std::{
     error::Error,
+    fmt::{self, Write as _},
     fs::{self, File, OpenOptions},
     io::prelude::*,
     path::Path,
@@ -50,28 +51,25 @@ impl log::Log for Logger {
             // Append the source location (file:line) captured by the `log` macros so
             // every Rust log carries it automatically, matching the manual
             // `({file}:{line})` convention used elsewhere.
-            let suffix = format!(
-                " ({}:{})",
-                record.file().unwrap_or("<unknown>"),
-                record.line().unwrap_or(0)
-            );
-            if let Some(str_record) = record.args().as_str() {
-                let mut line =
-                    self.make_line(true, record.level(), str_record.len() + suffix.len());
-                // Non-actor logs use a zero address so they align with the
-                // `{actor_id:08X}| ` column emitted for per-actor logs.
-                line.write_str("00000000| ");
-                line.write_str(str_record);
-                line.write_str(&suffix);
-                self.write(line);
-            } else {
-                let str_record = record.args().to_string();
-                let mut line =
-                    self.make_line(true, record.level(), str_record.len() + suffix.len());
-                line.write_str("00000000| ");
-                line.write_str(str_record.as_str());
-                line.write_str(&suffix);
-                self.write(line);
+            let size_hint = record.args().as_str().map_or(128, str::len);
+            let result = self
+                .make_line(true, record.level(), size_hint + 64)
+                .and_then(|mut line| {
+                    write!(
+                        line,
+                        "00000000| {} ({}:{})",
+                        record.args(),
+                        record.file().unwrap_or("<unknown>"),
+                        record.line().unwrap_or(0)
+                    )?;
+                    Ok(line)
+                });
+            match result {
+                Ok(line) => self.write(line),
+                Err(err) => {
+                    // Log::log cannot return errors; do not recurse into this logger.
+                    let _ = writeln!(std::io::stderr().lock(), "log formatting failed: {err}");
+                }
             }
         }
     }
@@ -122,12 +120,20 @@ impl Logger {
                                     Level::Trace => line.to_string().normal(),
                                 };
 
-                                println!("{}", console_str);
+                                let _ = writeln!(std::io::stdout().lock(), "{console_str}");
                             }
 
-                            if let Some(ref mut file) = file {
-                                file.write_all(line.as_slice()).unwrap();
-                                file.write_all(b"\n").unwrap();
+                            if let Some(target) = file.as_mut() {
+                                if let Err(err) = target
+                                    .write_all(line.as_slice())
+                                    .and_then(|_| target.write_all(b"\n"))
+                                {
+                                    let _ = writeln!(
+                                        std::io::stderr().lock(),
+                                        "log file write failed: {err}"
+                                    );
+                                    file = None;
+                                }
                             }
                         }
                         LogMessage::File(new_file) => {
@@ -196,7 +202,12 @@ impl Logger {
         }
     }
 
-    pub fn make_line(&self, mut enable_stdout: bool, level: Level, data_size: usize) -> Buffer {
+    pub fn make_line(
+        &self,
+        mut enable_stdout: bool,
+        level: Level,
+        data_size: usize,
+    ) -> Result<Buffer, fmt::Error> {
         if level == Level::Error {
             CONTEXT.increment_error_count();
         }
@@ -213,18 +224,15 @@ impl Logger {
         line.write(if enable_stdout { 1 } else { 0 });
         line.write(Logger::level_to_u8(level));
 
-        line.write_str(
-            CONTEXT
-                .now()
-                .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S.%3f ")
-                .to_string()
-                .as_str(),
-        );
+        CONTEXT
+            .now()
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S.%3f ")
+            .write_to(&mut line)?;
 
         line.write_str(Self::level_to_string(level));
 
-        line
+        Ok(line)
     }
 
     pub fn write(&self, data: Buffer) {
@@ -293,8 +301,12 @@ impl Logger {
             }
         }
 
-        log::set_logger(self).expect("set logger failed");
+        log::set_logger(self).map_err(|err| err.to_string())?;
         log::set_max_level(Level::Debug.to_level_filter());
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/log.rs"]
+mod tests;

@@ -9,7 +9,7 @@ use std::{
     ffi::{c_char, c_int, c_void},
     fmt,
     fs::File,
-    io::Read,
+    io::{Read, Write},
 };
 
 use moon_runtime::buffer::{BUFFER_HEAD_RESERVE, Buffer};
@@ -390,6 +390,132 @@ fn encode_object(
     Ok(())
 }
 
+enum TableShape {
+    Array(usize),
+    Object(bool),
+}
+
+fn table_shape(lua: &mut LuaStack<'_>, index: i32, options: &JsonOptions) -> TableShape {
+    if options.has_metatfield {
+        if lua.has_metafield(index, JSON_ARRAY_META) {
+            return TableShape::Array(lua.raw_len(index));
+        }
+        if lua.has_metafield(index, JSON_OBJECT_META) {
+            return TableShape::Object(true);
+        }
+    }
+    match lua.array_len(index) {
+        0 => TableShape::Object(false),
+        size => TableShape::Array(size),
+    }
+}
+
+/// Convert SQLx's default JSON table representation without an intermediate
+/// document string. Return None when the old text-to-Value step would fail
+/// (e.g. invalid UTF-8), preserving its binary-parameter fallback.
+#[cfg(feature = "sqlx")]
+pub(crate) fn table_to_json_value(
+    lua: &mut LuaStack<'_>,
+    index: i32,
+    depth: i32,
+) -> Result<Option<serde_json::Value>, String> {
+    use serde_json::Value;
+    let depth = depth + 1;
+    if depth > 64 {
+        return Err("json encode: too depth".to_string());
+    }
+    laux::lua_checkstack(lua.state(), 6, cstr!("json.encode.table"))?;
+    match table_shape(lua, index, &JsonOptions::default()) {
+        TableShape::Array(size) => {
+            let mut values = Vec::with_capacity(size);
+            let mut cursor = lua.array_cursor_len(index, size);
+            while let Some(value) = cursor.next() {
+                let index = value.index();
+                let Some(value) = (unsafe { stack_to_json_value(cursor.lua_mut(), index, depth) })?
+                else {
+                    return Ok(None);
+                };
+                values.push(value);
+            }
+            Ok(Some(Value::Array(values)))
+        }
+        TableShape::Object(force) => {
+            let mut values = serde_json::Map::new();
+            for mut entry in lua.table_cursor(index) {
+                let key = entry.key();
+                let key = match key.kind() {
+                    LuaType::String => {
+                        let Some(key) = key.as_str() else { return Ok(None) };
+                        key.to_owned()
+                    }
+                    LuaType::Integer => key.as_integer().unwrap_or_default().to_string(),
+                    _ => return Err("json encode: unsupported table key type (only string/integer keys are allowed).".to_string()),
+                };
+                let index = entry.value().index();
+                let Some(value) = (unsafe { stack_to_json_value(entry.lua_mut(), index, depth) })?
+                else {
+                    return Ok(None);
+                };
+                values.insert(key, value);
+            }
+            Ok(Some(if values.is_empty() && !force {
+                Value::Array(Vec::new())
+            } else {
+                Value::Object(values)
+            }))
+        }
+    }
+}
+
+#[cfg(feature = "sqlx")]
+fn stack_to_json_value(
+    lua: &mut LuaStack<'_>,
+    index: i32,
+    depth: i32,
+) -> Result<Option<serde_json::Value>, String> {
+    use serde_json::Value;
+    let value = lua.value(index);
+    let converted = match value.kind() {
+        LuaType::Table => return table_to_json_value(lua, index, depth),
+        LuaType::Nil => Value::Null,
+        LuaType::Boolean => Value::Bool(value.as_bool().unwrap_or(false)),
+        LuaType::Integer => Value::from(value.as_integer().unwrap_or_default()),
+        LuaType::String => {
+            let Some(text) = value.as_str() else {
+                return Ok(None);
+            };
+            Value::String(text.to_owned())
+        }
+        LuaType::LightUserData if value.as_light_userdata().is_some_and(|ptr| ptr.is_null()) => {
+            Value::Null
+        }
+        // Keep the text encoder's number normalization (1.0 -> integer, -0.0
+        // -> negative zero) and serde's rounding, using only a stack buffer.
+        LuaType::Number => {
+            use std::io::Write;
+            let number = value.as_number().unwrap_or_default();
+            if !number.is_finite() {
+                return Err(
+                    "json encode: cannot encode a non-finite number (NaN or Infinity)".to_string(),
+                );
+            }
+            let mut text = std::io::Cursor::new([0u8; 384]);
+            write!(text, "{number}")
+                .map_err(|err| format!("json number formatting failed: {err}"))?;
+            match serde_json::from_slice(&text.get_ref()[..text.position() as usize]) {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            }
+        }
+        _ => {
+            // Reuse the encoder's errors for unsupported scalar values.
+            encode_stack_value(&mut Vec::new(), value)?;
+            return Ok(None);
+        }
+    };
+    Ok(Some(converted))
+}
+
 pub fn encode_table(
     writer: &mut Vec<u8>,
     lua: &mut LuaStack<'_>,
@@ -405,22 +531,9 @@ pub fn encode_table(
 
     laux::lua_checkstack(lua.state(), 6, cstr!("json.encode.table"))?;
 
-    if options.has_metatfield {
-        if lua.has_metafield(index, JSON_ARRAY_META) {
-            let size = lua.raw_len(index);
-            return encode_array(writer, lua, index, size, depth, fmt, options);
-        }
-
-        if lua.has_metafield(index, JSON_OBJECT_META) {
-            return encode_object(writer, lua, index, depth, fmt, options, true);
-        }
-    }
-
-    let arr_size = lua.array_len(index);
-    if arr_size > 0 {
-        encode_array(writer, lua, index, arr_size, depth, fmt, options)?;
-    } else {
-        encode_object(writer, lua, index, depth, fmt, options, false)?;
+    match table_shape(lua, index, options) {
+        TableShape::Array(size) => encode_array(writer, lua, index, size, depth, fmt, options)?,
+        TableShape::Object(force) => encode_object(writer, lua, index, depth, fmt, options, force)?,
     }
 
     Ok(())
@@ -717,7 +830,7 @@ fn concat(lua: &mut laux::LuaStack<'_>) -> Result<c_int, String> {
     if laux::lua_type(state, 1) == LuaType::String {
         let slc = lua.value(1).as_bytes().unwrap_or_default();
         let mut buf = Box::new(Buffer::with_capacity(slc.len() + BUFFER_HEAD_RESERVE));
-        let _ = buf.commit(BUFFER_HEAD_RESERVE);
+        buf.write_slice(&[0; BUFFER_HEAD_RESERVE]);
         buf.write_slice(slc);
         buf.seek(BUFFER_HEAD_RESERVE as isize);
         laux::lua_pushlightuserdata(state, Box::into_raw(buf) as *mut c_void);
@@ -728,15 +841,19 @@ fn concat(lua: &mut laux::LuaStack<'_>) -> Result<c_int, String> {
     laux::lua_settop(state, 1);
 
     let mut writer = Box::new(Buffer::new());
-    let _ = writer.commit(BUFFER_HEAD_RESERVE);
+    writer.write_slice(&[0; BUFFER_HEAD_RESERVE]);
     {
         let mut cursor = lua.array_cursor(1);
         while let Some(val) = cursor.next() {
             let index = val.index();
             match val.kind() {
                 LuaType::String => writer.write_slice(val.as_bytes().unwrap_or_default()),
-                LuaType::Number => writer.write_chars(val.as_number().unwrap_or_default()),
-                LuaType::Integer => writer.write_chars(val.as_integer().unwrap_or_default()),
+                LuaType::Number => writer
+                    .write_chars(val.as_number().unwrap_or_default())
+                    .map_err(|err| err.to_string())?,
+                LuaType::Integer => writer
+                    .write_chars(val.as_integer().unwrap_or_default())
+                    .map_err(|err| err.to_string())?,
                 LuaType::Boolean => {
                     let val = val.as_bool().unwrap_or(false);
                     if val {
@@ -799,11 +916,23 @@ fn hash_string(s: &str) -> u64 {
 }
 
 #[inline]
-fn write_resp(writer: &mut Buffer, cmd: &[u8]) {
+fn write_resp(writer: &mut Buffer, cmd: &[u8]) -> Result<(), String> {
     writer.write_slice(b"\r\n$");
-    writer.write_chars(cmd.len());
+    writer
+        .write_chars(cmd.len())
+        .map_err(|err| err.to_string())?;
     writer.write_slice(b"\r\n");
     writer.write_slice(cmd);
+    Ok(())
+}
+
+fn write_resp_number(writer: &mut Buffer, value: impl fmt::Display) -> Result<(), String> {
+    // Default Display for f64 needs up to 327 bytes, including subnormals.
+    // Keep its existing formatting (including -0) without a temporary String.
+    let mut number = std::io::Cursor::new([0u8; 384]);
+    write!(number, "{value}")
+        .map_err(|err| format!("numeric RESP argument formatting failed: {err}"))?;
+    write_resp(writer, &number.get_ref()[..number.position() as usize])
 }
 
 fn concat_resp_one(
@@ -817,18 +946,8 @@ fn concat_resp_one(
         LuaType::Nil => {
             writer.write_slice(b"\r\n$-1");
         }
-        LuaType::Number => write_resp(
-            writer,
-            value.as_number().unwrap_or_default().to_string().as_bytes(),
-        ),
-        LuaType::Integer => write_resp(
-            writer,
-            value
-                .as_integer()
-                .unwrap_or_default()
-                .to_string()
-                .as_bytes(),
-        ),
+        LuaType::Number => write_resp_number(writer, value.as_number().unwrap_or_default())?,
+        LuaType::Integer => write_resp_number(writer, value.as_integer().unwrap_or_default())?,
         LuaType::Boolean => write_resp(
             writer,
             if value.as_bool().unwrap_or(false) {
@@ -836,11 +955,13 @@ fn concat_resp_one(
             } else {
                 JSON_FALSE
             },
-        ),
+        )?,
         LuaType::String => {
             let val = value.as_bytes().unwrap_or_default();
             writer.write_slice(b"\r\n$");
-            writer.write_chars(val.len());
+            writer
+                .write_chars(val.len())
+                .map_err(|err| err.to_string())?;
             writer.write_slice(b"\r\n");
             writer.write_slice(val);
         }
@@ -854,8 +975,9 @@ fn concat_resp_one(
                 }
             } else {
                 let mut w = Buffer::new();
-                encode_table(w.as_mut_vec(), lua, index, 0, false, options)?;
-                write_resp(writer, w.as_slice());
+                // SAFETY: the encoder only appends; the read position stays zero.
+                encode_table(unsafe { w.as_mut_vec() }, lua, index, 0, false, options)?;
+                write_resp(writer, w.as_slice())?;
             }
         }
         _ => {
@@ -879,7 +1001,7 @@ fn concat_resp(lua: &mut laux::LuaStack<'_>) -> Result<c_int, String> {
     let options = fetch_options(lua)?;
 
     let mut writer = Box::new(Buffer::new());
-    let _ = writer.commit(BUFFER_HEAD_RESERVE);
+    writer.write_slice(&[0; BUFFER_HEAD_RESERVE]);
     let hash = {
         let key = lua.value(1).as_str();
         let hash_part = if n > 2 && key.is_some_and(|key| key.starts_with(['h', 'H'])) {
@@ -897,7 +1019,7 @@ fn concat_resp(lua: &mut laux::LuaStack<'_>) -> Result<c_int, String> {
     };
 
     writer.write(b'*');
-    writer.write_chars(n);
+    writer.write_chars(n).map_err(|err| err.to_string())?;
     for i in 1..=n {
         concat_resp_one(&mut writer, lua, i, &options)?;
     }
@@ -997,3 +1119,7 @@ pub extern "C-unwind" fn luaopen_json(state: LuaState) -> i32 {
 
     1
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/modules/lua_json.rs"]
+mod tests;

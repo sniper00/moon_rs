@@ -25,8 +25,12 @@ fn concat_array(
         let index = value.index();
         match value.kind() {
             LuaType::Nil => {}
-            LuaType::Number => writer.write_chars(value.as_number().unwrap_or_default()),
-            LuaType::Integer => writer.write_chars(value.as_integer().unwrap_or_default()),
+            LuaType::Number => writer
+                .write_chars(value.as_number().unwrap_or_default())
+                .map_err(|err| err.to_string())?,
+            LuaType::Integer => writer
+                .write_chars(value.as_integer().unwrap_or_default())
+                .map_err(|err| err.to_string())?,
             LuaType::Boolean => {
                 let s = if value.as_bool().unwrap_or(false) {
                     "true"
@@ -62,8 +66,12 @@ fn concat_one(
     let value = lua.value(index);
     match value.kind() {
         LuaType::Nil => {}
-        LuaType::Number => writer.write_chars(value.as_number().unwrap_or_default()),
-        LuaType::Integer => writer.write_chars(value.as_integer().unwrap_or_default()),
+        LuaType::Number => writer
+            .write_chars(value.as_number().unwrap_or_default())
+            .map_err(|err| err.to_string())?,
+        LuaType::Integer => writer
+            .write_chars(value.as_integer().unwrap_or_default())
+            .map_err(|err| err.to_string())?,
         LuaType::Boolean => {
             let s = if value.as_bool().unwrap_or(false) {
                 "true"
@@ -274,8 +282,12 @@ fn write_string(lua: &LuaStack<'_>, buf: &mut Buffer, index: i32) -> Result<(), 
         LuaType::String => {
             buf.write_slice(value.as_bytes().unwrap_or_default());
         }
-        LuaType::Number => buf.write_chars(value.as_number().unwrap_or_default()),
-        LuaType::Integer => buf.write_chars(value.as_integer().unwrap_or_default()),
+        LuaType::Number => buf
+            .write_chars(value.as_number().unwrap_or_default())
+            .map_err(|err| err.to_string())?,
+        LuaType::Integer => buf
+            .write_chars(value.as_integer().unwrap_or_default())
+            .map_err(|err| err.to_string())?,
         LuaType::Boolean => {
             let val = value.as_bool().unwrap_or(false);
             let s = if val { "true" } else { "false" };
@@ -317,7 +329,9 @@ fn commit(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     // SAFETY: this callback holds the only mutable reference to the Buffer.
     let buf = unsafe { buf_ptr.as_mut() };
     let len = lua.get(2)?;
-    laux::lua_push(state, buf.commit(len));
+    // SAFETY: native callers initialize the region returned by prepare before
+    // committing it. The Lua prepare wrapper also zero-initializes its region.
+    laux::lua_push(state, unsafe { buf.commit(len) });
     Ok(1)
 }
 
@@ -327,7 +341,11 @@ fn prepare(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     // SAFETY: this callback holds the only mutable reference to the Buffer.
     let buf = unsafe { buf_ptr.as_mut() };
     let len = lua.get(2)?;
-    let space: *mut u8 = buf.prepare(len);
+    let space = buf.spare_capacity_mut(len);
+    for byte in space.iter_mut() {
+        byte.write(0);
+    }
+    let space = space.as_mut_ptr().cast::<u8>();
     laux::lua_pushlightuserdata(state, space as *mut c_void);
     Ok(1)
 }

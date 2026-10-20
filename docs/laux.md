@@ -363,6 +363,16 @@ Before using this API, prove each condition:
 When any condition cannot be proved, copy into a `Vec<u8>` or `String`. Asynchronous APIs must own
 their data.
 
+`Buffer::prepare` returns uninitialized spare capacity. Rust callers must
+initialize bytes before calling the unsafe `commit`; asynchronous readers use
+`spare_capacity_mut` with Tokio's `ReadBuf`. Initialize reserved headers with
+`write_slice(&[0; N])`. `unsafe_write` requires spare capacity, and mutable access
+to the underlying Vec must preserve the read position even if a write panics.
+For textual output, Buffer implements `fmt::Write` so `write!` and `write_chars`
+can format directly into its storage.
+`write_chars` returns `fmt::Result`; propagate formatting errors to the callback's
+`Result` rather than unwrapping them at the Lua boundary.
+
 ## Stack Discipline and Raw FFI
 
 `LuaStack` is a borrowed view, not a stack guard. Every callback must still follow the Lua C API

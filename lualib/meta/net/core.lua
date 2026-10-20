@@ -44,7 +44,7 @@ function net.start_read_frame(fd, read_timeout) end
 --- Write data to a socket. Accepts `buffer_arc_ptr` or string/buffer.
 ---@param fd integer
 ---@param data buffer_arc_ptr|string|buffer_ptr
----@param max_write_capacity? integer @ Backpressure limit (default `65535`)
+---@param max_write_capacity? integer @ Optional pending-write limit; omitted or `65535` disables the limit
 ---@param close? boolean @ Close after write
 ---@return boolean success
 ---@return false? err
@@ -54,7 +54,7 @@ function net.write(fd, data, max_write_capacity, close) end
 --- Write length-prefixed frame data.
 ---@param fd integer
 ---@param data buffer_arc_ptr|string|buffer_ptr
----@param max_write_capacity? integer
+---@param max_write_capacity? integer @ Optional pending-write limit; omitted or `65535` disables the limit
 ---@param close? boolean
 ---@return boolean success
 ---@return false? err

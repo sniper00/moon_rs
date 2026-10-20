@@ -78,6 +78,18 @@ local ip = socket.host()           -- get local IP
 socket.unlink(fd)                   -- release fd from tracking (ownership transfer)
 ```
 
+Write channels are unbounded. Callers can supply `max_write_capacity` to
+`socket.write` or `socket.write_frame` to reject writes and request closure when
+the number of queued operations exceeds that value. Omitting the argument (or
+passing `65535`) disables this check; each protocol library chooses its own policy.
+
+The writer combines queued raw data and framed messages into vectored writes
+without concatenating payloads. A batch collects at most 256 operations and
+stops collecting once the payload byte threshold is reached. Each write window
+contains at most 64 I/O slices; large frames span multiple windows. Batch storage
+is reused, while frame headers and I/O slices use fixed-size arrays. Payload
+references are released after the batch finishes.
+
 ## Read Modes
 
 | Mode | Call | Description |

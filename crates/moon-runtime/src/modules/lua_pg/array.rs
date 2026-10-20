@@ -126,7 +126,8 @@ fn encode_level(
                 }
                 LuaType::Number => {
                     use std::io::Write;
-                    write!(buf, "{}", value.as_number().unwrap()).expect("Vec write");
+                    write!(buf, "{}", value.as_number().unwrap())
+                        .map_err(|err| format!("pg.array: number formatting failed: {err}"))?;
                 }
                 LuaType::Boolean => buf.extend_from_slice(if value.as_bool().unwrap() {
                     b"true"

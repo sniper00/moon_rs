@@ -32,13 +32,13 @@ fn select_hasher(s: &str) -> Option<Box<dyn DynDigest>> {
     }
 }
 
-fn to_hex_string(bytes: &[u8]) -> String {
+fn to_hex_string(bytes: &[u8]) -> Result<String, std::fmt::Error> {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
         use std::fmt::Write;
-        write!(&mut s, "{:02x}", byte).expect("Writing to a String cannot fail");
+        write!(&mut s, "{:02x}", byte)?;
     }
-    s
+    Ok(s)
 }
 
 fn hash(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -46,7 +46,7 @@ fn hash(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let data = crate::checked_bytes(lua, 2)?;
     if let Some(mut hasher) = select_hasher(hasher_type) {
         let res = use_hasher(&mut *hasher, data);
-        lua.push(to_hex_string(res.as_ref()));
+        lua.push(to_hex_string(res.as_ref()).map_err(|err| err.to_string())?);
         return Ok(1);
     }
 

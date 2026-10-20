@@ -19,7 +19,7 @@ High-performance HTTP/1.1 server built on `hyper`, with static file serving and 
 │    → hyper sends response to client                         │
 │                                                             │
 │  Static file path (direct, no Lua):                         │
-│    → file < 1MB: cached in memory (5s TTL)                  │
+│    → file ≤ 1MB: read into memory                          │
 │    → file > 1MB: streamed from disk                         │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -109,7 +109,10 @@ The Rust-level `httpd` module (used internally) provides:
 - **Semaphore-based connection limiting** (default 10,000 max connections).
 - **Body size limiting** (default 10 MB).
 - **File streaming** for large files (>1 MB threshold).
-- **In-memory file cache** with 5-second TTL and LRU eviction (max 10,000 entries).
+- **File metadata cache** with a 5-second TTL and at most 10,000 entries,
+  including concurrent misses. A full cache skips new keys while still allowing
+  existing entries to refresh. Expired entries are pruned at most once per TTL
+  when capacity is reached; file contents are not cached.
 - **Range request support** for streaming responses.
 
 ## Error Handling

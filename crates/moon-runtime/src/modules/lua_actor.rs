@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use std::{
     alloc::{self, Layout},
     ffi::{CString, c_int, c_void},
+    fmt::Write as _,
     ops::Deref,
     slice,
     sync::{
@@ -78,11 +79,13 @@ fn lua_actor_protect_init_impl(lua: &mut LuaStack<'_>) -> Result<c_int, String> 
 
         luaopen_custom_libs(state);
 
-        let source = CString::new((*param).source.as_str()).unwrap();
+        let source = CString::new((*param).source.as_str())
+            .map_err(|_| "actor source contains a NUL byte".to_string())?;
         if ffi::luaL_loadfile(state.as_ptr(), source.as_ptr()) != ffi::LUA_OK {
             return Ok(1);
         }
-        let params = CString::new((*param).params.as_str()).unwrap();
+        let params = CString::new((*param).params.as_str())
+            .map_err(|_| "actor params contain a NUL byte".to_string())?;
         if ffi::luaL_dostring(state.as_ptr(), params.as_ptr()) != ffi::LUA_OK {
             return Ok(1);
         }
@@ -631,8 +634,10 @@ fn lua_actor_log(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         }
     }
 
-    let mut content = LOGGER.make_line(true, Logger::u8_to_level(log_level), 256);
-    content.write_str(format!("{:08X}| ", unsafe { (*actor).id }).as_str());
+    let mut content = LOGGER
+        .make_line(true, Logger::u8_to_level(log_level), 256)
+        .map_err(|err| format!("log: {err}"))?;
+    write!(content, "{:08X}| ", unsafe { (*actor).id }).map_err(|err| format!("log: {err}"))?;
     for i in 3..=top {
         if i > 3 {
             content.write_str("    ");
@@ -658,7 +663,9 @@ fn lua_actor_log(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
             }
         }
         content.write(b':');
-        content.write_str(debug.currentline.to_string().as_str());
+        content
+            .write_chars(debug.currentline)
+            .map_err(|err| format!("log: {err}"))?;
         content.write(b')');
     }
 
@@ -854,20 +861,25 @@ fn server_stats(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         return Ok(1);
     }
 
-    let services: Vec<serde_json::Value> = CONTEXT
-        .actor_stats()
-        .into_iter()
-        .filter(|s| s.id != context::CLUSTER_ACTOR_ADDR)
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "name": s.name,
-                "memory": s.memory,
-                "messages": s.messages,
-                "cpu_ms": s.cpu_ms,
-            })
-        })
-        .collect();
+    let actors = CONTEXT.actor_stats();
+    let (mut memory, mut messages, mut cpu_ms) = (0i64, 0u64, 0u64);
+    let mut services = Vec::with_capacity(actors.len());
+    for actor in actors {
+        // Totals include the cluster actor, even though it is hidden from the
+        // service list, matching the individual statistics accessors.
+        memory += actor.memory;
+        messages += actor.messages;
+        cpu_ms += actor.cpu_ms;
+        if actor.id != context::CLUSTER_ACTOR_ADDR {
+            services.push(serde_json::json!({
+                "id": actor.id,
+                "name": actor.name,
+                "memory": actor.memory,
+                "messages": actor.messages,
+                "cpu_ms": actor.cpu_ms,
+            }));
+        }
+    }
 
     let stats = serde_json::json!({
         "service.count": CONTEXT.actor_count(),
@@ -881,9 +893,9 @@ fn server_stats(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         "time.offset": CONTEXT.time_offset(),
         "time.now": CONTEXT.now().timestamp_millis(),
         "uptime": CONTEXT.uptime_secs(),
-        "memory.total": CONTEXT.total_memory(),
-        "message.total": CONTEXT.total_messages(),
-        "cpu.total_ms": CONTEXT.total_cpu_ms(),
+        "memory.total": memory,
+        "message.total": messages,
+        "cpu.total_ms": cpu_ms,
         "services": services,
     });
 

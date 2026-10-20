@@ -5,14 +5,14 @@
 ---
 --- Covers every public API: connect, find_connection, query, query_params,
 --- pipe, insert_many, update_many, execute / execute_params / execute_pipe /
---- execute_insert_many / execute_update_many, stats, len, close.
+--- execute_insert_many / execute_update_many, array, NULL, stats, len, close.
 ---
 
 local moon = require("moon")
 local json = require("json")
 local pg   = require("moon.db.pg")
 
-local DB_URL = "postgres://postgres:123456@127.0.0.1:5432/postgres"
+local DB_URL = "postgres://bruce:7a5b48a3b271532772ff2aae78b3adc0@192.168.50.3:5432/postgres"
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -249,7 +249,70 @@ local function example_jsonb(db)
 end
 
 ---------------------------------------------------------------------------
--- 10. Pool concurrency (multiple coroutines)
+-- 10. PostgreSQL arrays (parameters, query results, bulk writes)
+---------------------------------------------------------------------------
+local function example_arrays(db)
+    section("PostgreSQL arrays")
+
+    -- This example uses one connection: temporary tables belong to a session.
+    assert_ok(db:query([[
+        CREATE TEMP TABLE array_demo (
+            id bigint PRIMARY KEY,
+            ids int4[], tags text[], amounts numeric[], matrix int4[]
+        )
+    ]]))
+
+    -- pg.array returns escaped array text for bound parameters. Plain Lua
+    -- tables still encode as JSON. Explicit casts also support empty arrays.
+    assert_ok(db:query_params([[
+        INSERT INTO array_demo VALUES ($1, $2::int4[], $3::text[],
+            $4::numeric[], $5::int4[])
+    ]], 1, pg.array({ 1, pg.NULL, 3 }),
+        pg.array({ "lua", "a,b", 'a"b', "NULL", pg.NULL }),
+        pg.array({ "12345678901234567890.123456789", "0.001" }),
+        pg.array({ { 1, 2 }, { 3, 4 } })))
+
+    -- Results become Lua sequences. NULL elements use pg.NULL (= json.null),
+    -- while numeric[] elements stay exact strings. Nested arrays must be
+    -- rectangular; arrays with non-one lower bounds are rejected.
+    local row = assert_ok(db:query("SELECT * FROM array_demo WHERE id = 1")).data[1]
+    assert(row.ids[2] == pg.NULL and #row.ids == 3)
+    assert(row.tags[4] == "NULL" and row.tags[5] == pg.NULL)
+    assert(row.amounts[1] == "12345678901234567890.123456789")
+    assert(row.matrix[2][1] == 3)
+    print("array query result:")
+    print_r(row)
+
+    assert_ok(db:insert_many("array_demo", { "id", "ids", "tags" }, {
+        { 2, pg.array({}), pg.array({}) },
+        { 3, pg.array({ 7, 8 }), pg.array({ "bulk" }) },
+    }))
+    local empty = assert_ok(db:query("SELECT ids FROM array_demo WHERE id = 2")).data[1]
+    assert(#empty.ids == 0)
+
+    -- set_types follows set_columns and supplies the casts needed when
+    -- UPDATE ... FROM (VALUES ...) would otherwise infer text parameters.
+    assert_ok(db:update_many("array_demo", "id", { "ids", "tags" }, {
+        { 2, pg.array({ 10, pg.NULL }), pg.array({ "updated" }) },
+        { 3, pg.array({ 20 }), pg.array({ "also updated" }) },
+    }, "bigint", { "int4[]", "text[]" }))
+
+    assert_ok(db:pipe({
+        { "UPDATE array_demo SET ids = $1::int4[] WHERE id = $2", pg.array({ 30 }), 3 },
+        { "INSERT INTO array_demo(id, ids) VALUES ($1, $2::int4[])", 4, pg.array({}) },
+    }))
+    local res = assert_ok(db:query_params(
+        "SELECT id, ids, tags FROM array_demo WHERE id = ANY($1::bigint[]) ORDER BY id",
+        pg.array({ 2, 3 })))
+    assert(#res.data == 2 and res.data[1].ids[2] == pg.NULL and res.data[2].ids[1] == 30)
+    print("arrays after bulk update and transactional pipeline:")
+    print_r(res.data)
+
+    assert_ok(db:query("DROP TABLE array_demo"))
+end
+
+---------------------------------------------------------------------------
+-- 11. Pool concurrency (multiple coroutines)
 ---------------------------------------------------------------------------
 local function example_concurrency()
     section("pool concurrency")
@@ -307,6 +370,7 @@ moon.async(function()
     example_fire_and_forget(db)
     example_stats(db)
     example_jsonb(db)
+    example_arrays(db)
 
     db:query("DROP TABLE IF EXISTS demo")
     db:close()

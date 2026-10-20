@@ -1,4 +1,5 @@
-use crate::lua_json::{JsonOptions, encode_table};
+use crate::db_cursor::{CursorHandle as SqlxCursorHandle, CursorSender, stream_batches};
+use crate::lua_json::{JsonOptions, encode_table, table_to_json_value};
 use crate::request_pool::{
     PendingCounter, QueuedRequest, dispatch_request, drain_queued_requests, notify_shutdown,
 };
@@ -24,7 +25,7 @@ use sqlx::{
     sqlite::{SqlitePoolOptions, SqliteRow},
 };
 use std::{ffi::c_int, sync::Arc, time::Duration};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 lazy_static! {
@@ -416,14 +417,16 @@ impl DatabasePool {
         Vec<u8>: for<'q> sqlx::Encode<'q, DB> + sqlx::Type<DB>,
     {
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        // SQLx encodes into owned driver arguments immediately. Borrowing keeps
+        // the original parameters available for retries without cloning them.
         for bind in binds {
             query = match bind {
                 QueryParams::Bool(value) => query.bind(*value),
                 QueryParams::Int(value) => query.bind(*value),
                 QueryParams::Float(value) => query.bind(*value),
-                QueryParams::Text(value) => query.bind(value.clone()),
-                QueryParams::Json(value) => query.bind(value.clone()),
-                QueryParams::Bytes(value) => query.bind(value.clone()),
+                QueryParams::Text(value) => query.bind(value),
+                QueryParams::Json(value) => query.bind(value),
+                QueryParams::Bytes(value) => query.bind(value),
             };
         }
         Ok(query)
@@ -496,21 +499,6 @@ where
 // Request / Response / Connection types
 // ---------------------------------------------------------------------------
 
-enum CursorSignal {
-    Next(ActorId, i64),
-    Close,
-}
-
-struct SqlxCursorHandle(Option<oneshot::Sender<CursorSignal>>);
-
-impl Drop for SqlxCursorHandle {
-    fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(CursorSignal::Close);
-        }
-    }
-}
-
 enum DatabaseRequest {
     Query(ActorId, i64, DatabaseQuery),
     QueryStream(ActorId, i64, DatabaseQuery, usize),
@@ -548,9 +536,9 @@ enum DatabaseResponse {
     PgRows(Vec<PgRow>),
     MysqlRows(Vec<MySqlRow>),
     SqliteRows(Vec<SqliteRow>),
-    PgBatch(Vec<PgRow>, Option<oneshot::Sender<CursorSignal>>),
-    MysqlBatch(Vec<MySqlRow>, Option<oneshot::Sender<CursorSignal>>),
-    SqliteBatch(Vec<SqliteRow>, Option<oneshot::Sender<CursorSignal>>),
+    PgBatch(Vec<PgRow>, Option<CursorSender>),
+    MysqlBatch(Vec<MySqlRow>, Option<CursorSender>),
+    SqliteBatch(Vec<SqliteRow>, Option<CursorSender>),
     Error(sqlx::Error),
     Timeout(String),
     Transaction,
@@ -689,74 +677,33 @@ async fn database_handler(
                 {}
             }
             DatabaseRequest::QueryStream(owner, session, query_op, batch_size) => {
-                let batch_size = *batch_size;
-                let mut current_owner = *owner;
-                let mut current_session = *session;
-
                 macro_rules! do_stream {
                     ($pool:expr, $variant:ident) => {{
-                        let query_result =
-                            DatabasePool::make_query(query_op.sql.clone(), &query_op.binds);
-                        match query_result {
-                            Ok(q) => {
-                                let mut stream = q.fetch($pool);
-                                loop {
-                                    let mut batch = Vec::with_capacity(batch_size);
-                                    let mut errored = false;
-                                    for _ in 0..batch_size {
-                                        match stream.try_next().await {
-                                            Ok(Some(row)) => batch.push(row),
-                                            Ok(None) => break,
-                                            Err(err) => {
-                                                CONTEXT.response_error(
-                                                    0,
-                                                    current_owner,
-                                                    -current_session,
-                                                    err.to_string(),
-                                                );
-                                                errored = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if errored {
-                                        break;
-                                    }
-
-                                    let cursor_exhausted = batch.len() < batch_size;
-                                    let (next_tx, next_rx) = if !cursor_exhausted {
-                                        let (tx, rx) = oneshot::channel();
-                                        (Some(tx), Some(rx))
-                                    } else {
-                                        (None, None)
-                                    };
-
-                                    let _ = CONTEXT.send_value(
-                                        protocol_type,
-                                        current_owner,
-                                        current_session,
-                                        DatabaseResponse::$variant(batch, next_tx),
-                                    );
-
-                                    // `next_rx` is `Some` iff the cursor isn't exhausted.
-                                    let Some(next_rx) = next_rx else { break };
-                                    match next_rx.await {
-                                        Ok(CursorSignal::Next(new_owner, new_session)) => {
-                                            current_owner = new_owner;
-                                            current_session = new_session;
-                                        }
-                                        _ => break,
-                                    }
+                        let result =
+                            match DatabasePool::make_query(query_op.sql.clone(), &query_op.binds) {
+                                Ok(q) => {
+                                    stream_batches(
+                                        q.fetch($pool),
+                                        *batch_size,
+                                        *owner,
+                                        *session,
+                                        |owner, session, batch, next_tx| {
+                                            CONTEXT
+                                                .send_value(
+                                                    protocol_type,
+                                                    owner,
+                                                    session,
+                                                    DatabaseResponse::$variant(batch, next_tx),
+                                                )
+                                                .is_none()
+                                        },
+                                    )
+                                    .await
                                 }
-                            }
-                            Err(err) => {
-                                CONTEXT.response_error(
-                                    0,
-                                    current_owner,
-                                    -current_session,
-                                    err.to_string(),
-                                );
-                            }
+                                Err(err) => Err((*owner, *session, err)),
+                            };
+                        if let Err((owner, session, err)) = result {
+                            CONTEXT.response_error(0, owner, -session, err.to_string());
                         }
                     }};
                 }
@@ -892,15 +839,11 @@ fn get_query_param(lua: &mut LuaStack<'_>, i: i32) -> Result<QueryParams, String
             Err(e) => QueryParams::Bytes(e.into_bytes()),
         },
         LuaType::Table => {
-            let mut buffer = Vec::new();
-            encode_table(&mut buffer, lua, i, 0, false, &options)?;
-            if !buffer.is_empty() && (buffer[0] == b'{' || buffer[0] == b'[') {
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buffer.as_slice()) {
-                    QueryParams::Json(value)
-                } else {
-                    QueryParams::Bytes(buffer)
-                }
+            if let Some(value) = table_to_json_value(lua, i, 0)? {
+                QueryParams::Json(value)
             } else {
+                let mut buffer = Vec::new();
+                encode_table(&mut buffer, lua, i, 0, false, &options)?;
                 QueryParams::Bytes(buffer)
             }
         }
@@ -1178,27 +1121,7 @@ fn sqlx_cursor_next(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         .as_userdata::<SqlxCursorHandle>()
         .ok_or_else(|| "invalid sqlx cursor handle".to_string())?;
     let handle = unsafe { handle_ptr.as_mut() };
-    if let Some(tx) = handle.0.take() {
-        let actor = LuaActor::from_lua_state(state);
-        let owner = unsafe { (*actor).id };
-        let session = unsafe { (*actor).next_session() };
-        // If the stream handler has already exited, its receiver is gone and the
-        // send fails. Surface that as an error rather than pushing a session that
-        // would never be answered (which would hang the awaiting coroutine).
-        if tx.send(CursorSignal::Next(owner, session)).is_err() {
-            return Ok(crate::lua_push_error_tuple(
-                state,
-                "sqlx cursor: stream handler is gone",
-            ));
-        }
-        laux::lua_push(state, session);
-        Ok(1)
-    } else {
-        Ok(crate::lua_push_error_tuple(
-            state,
-            "sqlx cursor: already consumed or closed",
-        ))
-    }
+    Ok(handle.next(state, "sqlx cursor"))
 }
 
 fn sqlx_cursor_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -1207,13 +1130,11 @@ fn sqlx_cursor_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         .as_userdata::<SqlxCursorHandle>()
         .ok_or_else(|| "invalid sqlx cursor handle".to_string())?;
     let handle = unsafe { handle_ptr.as_mut() };
-    if let Some(tx) = handle.0.take() {
-        let _ = tx.send(CursorSignal::Close);
-    }
+    handle.close();
     Ok(0)
 }
 
-fn push_cursor_handle(state: LuaState, next_tx: Option<oneshot::Sender<CursorSignal>>) {
+fn push_cursor_handle(state: LuaState, next_tx: Option<CursorSender>) {
     if let Some(tx) = next_tx {
         let methods = [
             lreg_try!("next", sqlx_cursor_next),
@@ -1320,67 +1241,5 @@ pub extern "C-unwind" fn luaopen_sqlx(state: LuaState) -> c_int {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use moon_base::laux::LuaGlobalState;
-    use std::ptr::NonNull;
-
-    #[test]
-    fn decimal_integer_preserves_fractions_and_range() {
-        for (text, expected) in [
-            ("42.000", Some(42)),
-            ("-42", Some(-42)),
-            ("1e3", Some(1000)),
-            ("0.001", None),
-            ("-1.9", None),
-            ("9223372036854775807", Some(i64::MAX)),
-            ("-9223372036854775808", Some(i64::MIN)),
-            ("9223372036854775808", None),
-            ("9223372036854775807.1", None),
-        ] {
-            assert_eq!(decimal_integer(&text.parse().unwrap()), expected, "{text}");
-        }
-    }
-
-    #[tokio::test]
-    async fn sqlite_rows_preserve_binary_and_timestamp_without_assuming_timezone() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(
-            "CREATE TABLE sample (payload BLOB, created TIMESTAMP)",
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(
-            "INSERT INTO sample VALUES (X'00FF41', '2026-10-17 12:34:56.123456')",
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        let rows = sqlx::query(sqlx::AssertSqlSafe("SELECT * FROM sample"))
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).unwrap();
-        let _owner = LuaGlobalState::new(state);
-        assert_eq!(process_rows::<Sqlite>(state, &rows), 1);
-        unsafe {
-            ffi::lua_rawgeti(state.as_ptr(), -1, 1);
-            ffi::lua_getfield(state.as_ptr(), -1, cstr!("payload"));
-        }
-        let lua = unsafe { LuaStack::from_raw(state) };
-        assert_eq!(lua.value(-1).as_bytes().unwrap(), b"\x00\xffA");
-        unsafe {
-            ffi::lua_settop(state.as_ptr(), 2);
-            ffi::lua_getfield(state.as_ptr(), -1, cstr!("created"));
-        }
-        assert_eq!(
-            lua.value(-1).as_str().unwrap(),
-            "2026-10-17T12:34:56.123456"
-        );
-    }
-}
+#[path = "../../tests/unit/modules/lua_sqlx.rs"]
+mod tests;

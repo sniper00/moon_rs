@@ -44,6 +44,8 @@ flowchart LR
 | `crates/moon-app` | binary entry point, bootstrap, signal handling |
 | `crates/moon-runtime` | actor runtime (context, messages, timer, logger) + all Rust→Lua native bindings |
 | `crates/moon-base` | foundation: embedded Lua 5.5 sources, Rust FFI, helper macros, shared Buffer |
+| `crates/*/tests/unit/` | Rust unit tests, organized to mirror each crate's source modules |
+| `crates/*/tests/*.rs` | Rust integration tests using public crate APIs |
 | `lualib/` | user-facing Lua APIs and wrappers |
 | `assets/` | examples, benchmarks, integration-style test scripts |
 | `docs/` | module-focused documentation |
@@ -72,6 +74,11 @@ cargo test
 # Lua integration-style script
 cargo run --release -- assets/test/test_socket.lua
 ```
+
+Rust unit tests live in each crate's `tests/unit/` directory and are loaded as
+child modules under `#[cfg(test)]`, preserving access to private implementation
+details. Production source files only declare these test modules. Run the full
+Rust suite, including optional modules, with `cargo test --workspace --all-features`.
 
 ## Feature Flags
 

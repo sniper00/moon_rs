@@ -1,3 +1,4 @@
+use crate::db_cursor::{CursorHandle, CursorSender, stream_batches};
 use crate::request_pool::{
     PendingCounter, QueuedRequest, dispatch_request, drain_queued_requests, notify_shutdown,
 };
@@ -19,7 +20,7 @@ use moon_base::{
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
 use std::{ffi::c_int, str::FromStr, time::Duration};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 lazy_static! {
     static ref DATABASE_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
@@ -112,24 +113,9 @@ impl QueuedRequest for DatabaseRequest {
     }
 }
 
-enum CursorSignal {
-    Next(ActorId, i64),
-    Close,
-}
-
 struct CursorBatch {
     docs: Vec<Document>,
-    next_tx: Option<oneshot::Sender<CursorSignal>>,
-}
-
-struct CursorHandle(Option<oneshot::Sender<CursorSignal>>);
-
-impl Drop for CursorHandle {
-    fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(CursorSignal::Close);
-        }
-    }
+    next_tx: Option<CursorSender>,
 }
 
 enum DatabaseResponse {
@@ -514,60 +500,27 @@ async fn database_handler(
             ) => {
                 let db = state.client.database(&db_name);
                 let coll: Collection<Document> = db.collection(&collection_name);
-                match coll.find(filter.clone()).with_options(*options).await {
-                    Ok(mut cur) => {
-                        let mut current_owner = owner;
-                        let mut current_session = session;
-                        loop {
-                            let mut batch = Vec::with_capacity(batch_size);
-                            let mut errored = false;
-                            for _ in 0..batch_size {
-                                match cur.try_next().await {
-                                    Ok(Some(doc)) => batch.push(doc),
-                                    Ok(None) => break,
-                                    Err(err) => {
-                                        CONTEXT.response_error(
-                                            0,
-                                            current_owner,
-                                            -current_session,
-                                            err.to_string(),
-                                        );
-                                        errored = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if errored {
-                                break;
-                            }
-
-                            let cursor_exhausted = batch.len() < batch_size;
-                            let (next_tx, next_rx) = if !cursor_exhausted {
-                                let (tx, rx) = oneshot::channel();
-                                (Some(tx), Some(rx))
-                            } else {
-                                (None, None)
-                            };
-
-                            let _ = CONTEXT.send_value(
-                                state.protocol_type,
-                                current_owner,
-                                current_session,
-                                DatabaseResponse::FindBatch(CursorBatch {
-                                    docs: batch,
-                                    next_tx,
-                                }),
-                            );
-
-                            // `next_rx` is `Some` iff the cursor isn't exhausted.
-                            let Some(next_rx) = next_rx else { break };
-                            match next_rx.await {
-                                Ok(CursorSignal::Next(new_owner, new_session)) => {
-                                    current_owner = new_owner;
-                                    current_session = new_session;
-                                }
-                                _ => break,
-                            }
+                match coll.find(filter).with_options(*options).await {
+                    Ok(cur) => {
+                        if let Err((owner, session, err)) = stream_batches(
+                            cur,
+                            batch_size,
+                            owner,
+                            session,
+                            |owner, session, docs, next_tx| {
+                                CONTEXT
+                                    .send_value(
+                                        state.protocol_type,
+                                        owner,
+                                        session,
+                                        DatabaseResponse::FindBatch(CursorBatch { docs, next_tx }),
+                                    )
+                                    .is_none()
+                            },
+                        )
+                        .await
+                        {
+                            CONTEXT.response_error(0, owner, -session, err.to_string());
                         }
                     }
                     Err(err) => {
@@ -1079,40 +1032,24 @@ fn lua_mongodb_close(lua: &mut LuaStack<'_>) -> c_int {
     0
 }
 
-fn cursor_next(lua: &mut LuaStack<'_>) -> c_int {
+fn cursor_next(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let state = lua.state();
     let mut handle_ptr = lua
         .value(1)
         .as_userdata::<CursorHandle>()
-        .expect("invalid cursor handle");
+        .ok_or_else(|| "invalid cursor handle".to_string())?;
     let handle = unsafe { handle_ptr.as_mut() };
-    if let Some(tx) = handle.0.take() {
-        let actor = LuaActor::from_lua_state(state);
-        let owner = unsafe { (*actor).id };
-        let session = unsafe { (*actor).next_session() };
-        // If the stream handler has already exited, its receiver is gone and the
-        // send fails. Surface that as an error rather than pushing a session that
-        // would never be answered (which would hang the awaiting coroutine).
-        if tx.send(CursorSignal::Next(owner, session)).is_err() {
-            return crate::lua_push_error_tuple(state, "cursor: stream handler is gone");
-        }
-        laux::lua_push(state, session);
-        1
-    } else {
-        crate::lua_push_error_tuple(state, "cursor: already consumed or closed")
-    }
+    Ok(handle.next(state, "cursor"))
 }
 
-fn cursor_close(lua: &mut LuaStack<'_>) -> c_int {
+fn cursor_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let mut handle_ptr = lua
         .value(1)
         .as_userdata::<CursorHandle>()
-        .expect("invalid cursor handle");
+        .ok_or_else(|| "invalid cursor handle".to_string())?;
     let handle = unsafe { handle_ptr.as_mut() };
-    if let Some(tx) = handle.0.take() {
-        let _ = tx.send(CursorSignal::Close);
-    }
-    0
+    handle.close();
+    Ok(0)
 }
 
 fn operators(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -1277,8 +1214,8 @@ fn push_mongodb_response(state: LuaState, result: DatabaseResponse) -> c_int {
             }
             if let Some(next_tx) = batch.next_tx {
                 let methods = [
-                    lreg!("next", cursor_next),
-                    lreg!("close", cursor_close),
+                    lreg_try!("next", cursor_next),
+                    lreg_try!("close", cursor_close),
                     lreg_null!(),
                 ];
                 laux::lua_newuserdata(
@@ -1539,85 +1476,5 @@ pub extern "C-unwind" fn luaopen_mongodb(state: LuaState) -> c_int {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use moon_base::laux::LuaGlobalState;
-    use std::ptr::{NonNull, null_mut};
-
-    fn new_state() -> (LuaState, LuaGlobalState) {
-        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).expect("Lua state allocation");
-        let owner = LuaGlobalState::new(state);
-        (state, owner)
-    }
-
-    unsafe fn rawset(state: LuaState, key: &str, push_value: impl FnOnce()) {
-        laux::lua_push(state, key);
-        push_value();
-        unsafe { ffi::lua_rawset(state.as_ptr(), -3) };
-    }
-
-    #[test]
-    fn nested_bson_conversion_restores_the_lua_stack() {
-        let (state, _owner) = new_state();
-        unsafe {
-            ffi::lua_createtable(state.as_ptr(), 0, 4);
-            rawset(state, "_id", || {
-                laux::lua_push(state, "507f1f77bcf86cd799439011")
-            });
-            rawset(state, "name", || laux::lua_push(state, "moon"));
-            rawset(state, "nested", || {
-                ffi::lua_createtable(state.as_ptr(), 0, 3);
-                rawset(state, "enabled", || laux::lua_push(state, true));
-                rawset(state, "values", || {
-                    ffi::lua_createtable(state.as_ptr(), 3, 0);
-                    for value in 1_i64..=3 {
-                        laux::lua_push(state, value);
-                        ffi::lua_rawseti(state.as_ptr(), -2, value);
-                    }
-                });
-                rawset(state, "empty", || {
-                    ffi::lua_createtable(state.as_ptr(), 0, 0)
-                });
-            });
-        }
-
-        let mut lua = unsafe { LuaStack::from_raw(state) };
-        let top = lua.top();
-        let document = table_to_doc(&mut lua, 1).expect("nested document conversion");
-
-        assert_eq!(lua.top(), top);
-        assert_eq!(
-            document,
-            doc! {
-                "_id": oid::ObjectId::from_str("507f1f77bcf86cd799439011").unwrap(),
-                "name": "moon",
-                "nested": {
-                    "enabled": true,
-                    "values": [1_i64, 2_i64, 3_i64],
-                    "empty": {},
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn nested_bson_error_restores_the_lua_stack() {
-        let (state, _owner) = new_state();
-        unsafe {
-            ffi::lua_createtable(state.as_ptr(), 0, 1);
-            rawset(state, "nested", || {
-                ffi::lua_createtable(state.as_ptr(), 0, 1);
-                rawset(state, "bad", || {
-                    ffi::lua_pushlightuserdata(state.as_ptr(), null_mut())
-                });
-            });
-        }
-
-        let mut lua = unsafe { LuaStack::from_raw(state) };
-        let top = lua.top();
-        let error = table_to_doc(&mut lua, 1).expect_err("unsupported nested Lua value");
-
-        assert_eq!(error, "Invalid type: lightuserdata");
-        assert_eq!(lua.top(), top);
-    }
-}
+#[path = "../../tests/unit/modules/lua_mongodb.rs"]
+mod tests;

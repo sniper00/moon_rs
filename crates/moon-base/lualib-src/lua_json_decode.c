@@ -73,10 +73,22 @@ static const char *l_str2int(const char *s, size_t len, lua_Integer *result) {
     return s+i;
 }
 
-static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt, size_t depth)
+/* Explicit decode failures must release the document before raising a Lua
+ * error, since luaL_error does not return through the recursive C frames. */
+static void check_decode_stack(lua_State* L, yyjson_doc* doc, const char* context)
+{
+    if (!lua_checkstack(L, 6))
+    {
+        yyjson_doc_free(doc);
+        luaL_error(L, "stack overflow (%s)", context);
+    }
+}
+
+static void decode_one(lua_State* L, yyjson_doc* doc, yyjson_val* value, const json_options* opt, size_t depth)
 {
     if (depth > MAX_DECODE_DEPTH)
     {
+        yyjson_doc_free(doc);
         luaL_error(L, "json.decode: too deep");
         return;
     }
@@ -86,14 +98,14 @@ static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt,
     {
     case YYJSON_TYPE_ARR:
     {
-        luaL_checkstack(L, 6, "json.decode.array");
+        check_decode_stack(L, doc, "json.decode.array");
         lua_createtable(L, (int)yyjson_arr_size(value), 0);
         lua_Integer pos = 1;
         yyjson_arr_iter iter;
         yyjson_arr_iter_init(value, &iter);
         while (nullptr != (value = yyjson_arr_iter_next(&iter)))
         {
-            decode_one(L, value, opt, depth + 1);
+            decode_one(L, doc, value, opt, depth + 1);
             lua_rawseti(L, -2, pos++);
         }
         if (opt->has_metatfield)
@@ -102,7 +114,7 @@ static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt,
     }
     case YYJSON_TYPE_OBJ:
     {
-        luaL_checkstack(L, 6, "json.decode.object");
+        check_decode_stack(L, doc, "json.decode.object");
         lua_createtable(L, 0, (int)yyjson_obj_size(value));
 
         yyjson_val* key, * val;
@@ -131,7 +143,7 @@ static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt,
                 {
                     lua_pushlstring(L, key_str, key_len);
                 }
-                decode_one(L, val, opt, depth + 1);
+                decode_one(L, doc, val, opt, depth + 1);
                 lua_rawset(L, -3);
             }
         }
@@ -197,10 +209,13 @@ LUALIB_API int lua_json_decode(lua_State* L)
     {
         luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);
         str = (const char*)lua_touserdata(L, 1);
-        len = luaL_checkinteger(L, 2);
+        lua_Integer raw_len = luaL_checkinteger(L, 2);
+        luaL_argcheck(L, raw_len >= 0, 2, "length must not be negative");
+        luaL_argcheck(L, (lua_Unsigned)raw_len <= SIZE_MAX, 2, "length is too large");
+        len = (size_t)raw_len;
     }
 
-    if (nullptr == str || str[0] == '\0')
+    if (len == 0 || nullptr == str || str[0] == '\0')
         return 0;
 
     lua_settop(L, 1);
@@ -218,7 +233,7 @@ LUALIB_API int lua_json_decode(lua_State* L)
     {
         return luaL_error(L, "decode error: %s code: %d at position: %d\n", err.msg, (int)err.code, (int)err.pos);
     }
-    decode_one(L, yyjson_doc_get_root(doc), opt, 0);
+    decode_one(L, doc, yyjson_doc_get_root(doc), opt, 0);
     yyjson_doc_free(doc);
     return 1;
 }

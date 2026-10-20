@@ -4,7 +4,9 @@
 use super::*;
 use crate::math::Vec2;
 
+#[path = "aoi/model.rs"]
 mod model;
+#[path = "aoi/regressions.rs"]
 mod regressions;
 
 const W: i32 = WATCHER;

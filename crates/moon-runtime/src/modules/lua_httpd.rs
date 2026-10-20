@@ -1,7 +1,7 @@
 use std::ffi::c_int;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -11,7 +11,9 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::Frame;
 use hyper::header::HeaderMap;
-use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
+use hyper::{
+    Method, Request, Response, Uri, body::Incoming, server::conn::http1, service::service_fn,
+};
 use hyper_util::rt::TokioIo;
 use lazy_static::lazy_static;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -162,7 +164,44 @@ struct CacheEntry {
 
 lazy_static! {
     static ref HTTP_SERVERS: DashMap<i64, CancellationToken> = DashMap::new();
-    static ref FILE_META_CACHE: DashMap<PathBuf, CacheEntry> = DashMap::new();
+}
+
+static FILE_META_CACHE: LazyLock<FileMetaCache> = LazyLock::new(FileMetaCache::new);
+
+struct FileMetaCache {
+    entries: DashMap<PathBuf, CacheEntry>,
+    // Serialize admission so concurrent misses cannot exceed the capacity.
+    last_cleanup: Mutex<Instant>,
+}
+
+impl FileMetaCache {
+    fn new() -> Self {
+        Self {
+            entries: DashMap::new(),
+            last_cleanup: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn update(&self, file_path: &Path, meta: Option<CachedFileMeta>) {
+        let mut last_cleanup = self.last_cleanup.lock().unwrap();
+        let now = Instant::now();
+        let value = CacheEntry {
+            meta,
+            cached_at: now,
+        };
+        if let Some(mut entry) = self.entries.get_mut(file_path) {
+            *entry = value;
+            return;
+        }
+        if self.entries.len() >= MAX_CACHE_ENTRIES && last_cleanup.elapsed() >= CACHE_TTL {
+            self.entries
+                .retain(|_, entry| now.duration_since(entry.cached_at) < CACHE_TTL);
+            *last_cleanup = now;
+        }
+        if self.entries.len() < MAX_CACHE_ENTRIES {
+            self.entries.insert(file_path.to_path_buf(), value);
+        }
+    }
 }
 
 /// Full path resolution: metadata -> canonicalize -> metadata.
@@ -247,21 +286,8 @@ async fn revalidate_meta(prev: &CachedFileMeta) -> Option<CachedFileMeta> {
     })
 }
 
-fn update_cache(file_path: &Path, meta: Option<CachedFileMeta>) {
-    if FILE_META_CACHE.len() >= MAX_CACHE_ENTRIES {
-        FILE_META_CACHE.retain(|_, e| e.cached_at.elapsed() < CACHE_TTL);
-    }
-    FILE_META_CACHE.insert(
-        file_path.to_path_buf(),
-        CacheEntry {
-            meta,
-            cached_at: Instant::now(),
-        },
-    );
-}
-
 async fn get_cached_meta(root: &Path, file_path: &Path) -> Option<CachedFileMeta> {
-    if let Some(entry) = FILE_META_CACHE.get(file_path) {
+    if let Some(entry) = FILE_META_CACHE.entries.get(file_path) {
         if entry.cached_at.elapsed() < CACHE_TTL {
             return entry.meta.clone();
         }
@@ -270,7 +296,7 @@ async fn get_cached_meta(root: &Path, file_path: &Path) -> Option<CachedFileMeta
             let prev = prev.clone();
             drop(entry);
             if let Some(refreshed) = revalidate_meta(&prev).await {
-                update_cache(file_path, Some(refreshed.clone()));
+                FILE_META_CACHE.update(file_path, Some(refreshed.clone()));
                 return Some(refreshed);
             }
         } else {
@@ -280,7 +306,7 @@ async fn get_cached_meta(root: &Path, file_path: &Path) -> Option<CachedFileMeta
 
     // Cache miss or revalidation failed — full resolution
     let meta = resolve_file_meta(root, file_path).await;
-    update_cache(file_path, meta.clone());
+    FILE_META_CACHE.update(file_path, meta.clone());
     meta
 }
 
@@ -437,10 +463,9 @@ fn hex_val(b: u8) -> Option<u8> {
 struct ResponseHandle(Option<oneshot::Sender<HttpSrvResponse>>);
 
 struct HttpSrvRequest {
-    method: String,
-    path: String,
-    query_string: String,
-    headers: Vec<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
     body: Bytes,
     response_tx: oneshot::Sender<HttpSrvResponse>,
 }
@@ -457,15 +482,13 @@ async fn handle_request(
     max_body_size: usize,
     static_dir: Option<Arc<PathBuf>>,
 ) -> Result<Response<HttpBody>, hyper::Error> {
-    let method = req.method().to_string();
-    let uri = req.uri().clone();
-    let path = uri.path().to_string();
-    let query_string = uri.query().unwrap_or("").to_string();
-
+    let (parts, request_body) = req.into_parts();
     if let Some(ref root) = static_dir {
-        if method == "GET" || method == "HEAD" {
-            let is_head = method == "HEAD";
-            if let Some(resp) = serve_static_file(root, &path, req.headers(), is_head).await {
+        if parts.method == Method::GET || parts.method == Method::HEAD {
+            let is_head = parts.method == Method::HEAD;
+            if let Some(resp) =
+                serve_static_file(root, parts.uri.path(), &parts.headers, is_head).await
+            {
                 if is_head {
                     // RFC 9110: a HEAD response must carry the same headers as the
                     // equivalent GET but no body. Drop the body, keep the headers.
@@ -477,13 +500,7 @@ async fn handle_request(
         }
     }
 
-    let headers: Vec<(String, String)> = req
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
-
-    let limited = Limited::new(req.into_body(), max_body_size);
+    let limited = Limited::new(request_body, max_body_size);
     let body = match limited.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => {
@@ -498,10 +515,9 @@ async fn handle_request(
         owner,
         0,
         HttpSrvRequest {
-            method,
-            path,
-            query_string,
-            headers,
+            method: parts.method,
+            uri: parts.uri,
+            headers: parts.headers,
             body,
             response_tx: tx,
         },
@@ -638,13 +654,13 @@ fn listen(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
 fn push_httpd_request(state: LuaState, req: HttpSrvRequest) -> c_int {
     LuaTable::new(state, 0, 5)
         .insert("method", req.method.as_str())
-        .insert("path", req.path.as_str())
-        .insert("query_string", req.query_string.as_str())
+        .insert("path", req.uri.path())
+        .insert("query_string", req.uri.query().unwrap_or(""))
         .insert("body", req.body.as_ref())
         .rawset_x("headers", || {
             let headers = LuaTable::new(state, 0, req.headers.len());
             for (k, v) in &req.headers {
-                headers.insert(k.as_str(), v.as_str());
+                headers.insert(k.as_str(), v.to_str().unwrap_or(""));
             }
         });
 
@@ -757,3 +773,7 @@ pub extern "C-unwind" fn luaopen_httpd(state: LuaState) -> c_int {
 
     1
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/modules/lua_httpd.rs"]
+mod tests;

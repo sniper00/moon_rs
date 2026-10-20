@@ -246,6 +246,8 @@ becomes false (i.e. on `cluster.shutdown`).
 - **Send path:** `ClusterFrame` keeps the header (`Vec<u8>`) and body
   (`Box<Buffer>`) separate. `write_task` emits the 4-byte length prefix, header,
   and body via a single vectored write (`write_vectored`) — no concatenation.
+  Its three iovecs use stack storage; partial writes advance the existing slices
+  through the shared socket/cluster I/O helper without allocating another Vec.
 - **Receive path:** `read_one_frame` reads directly into a `Box<Buffer>`. After
   the text header is parsed, `Buffer::consume()` advances the read position past
   the header, and the *same* buffer (now representing only the body) is handed to
@@ -259,7 +261,7 @@ becomes false (i.e. on `cluster.shutdown`).
 | `PING_INTERVAL_MS` | 5000 | Keepalive interval |
 | `CALL_TIMEOUT_S` | 10 | RPC call timeout (and timeout-checker interval) |
 | `MAX_FRAME_SIZE` | 512 MB | `LIMITS.max_network_read_bytes` |
-| `CLUSTER_WRITE_QUEUE_CAPACITY` | 64 Ki | `LIMITS.network_write_queue_capacity`; per-connection write backpressure bound |
+| `CLUSTER_WRITE_QUEUE_CAPACITY` | 65,536 frames | Cluster-specific per-connection limit enforced before enqueueing into the unbounded write channel |
 | `CLUSTER_ACTOR_ID` | `0xFFFF_FF00` | Reserved pseudo-actor that receives call responses |
 
 ## Running the Example
@@ -288,7 +290,8 @@ cargo run --release assets/test/test_cluster_selfconnect.lua
 
 | Path | Role |
 |------|------|
-| `crates/moon-runtime/src/modules/lua_cluster.rs` | Core Rust implementation + unit tests |
+| `crates/moon-runtime/src/modules/lua_cluster.rs` | Core Rust implementation |
+| `crates/moon-runtime/tests/unit/modules/lua_cluster.rs` | Rust unit tests |
 | `lualib/moon/cluster.lua` | Lua wrapper (local routing, seri pack/unpack, `on_close`) |
 | `assets/example/cluster/node.lua` | Example sender/receiver node |
 | `assets/example/cluster/cluster_etc.lua` | Example discovery HTTP server |
