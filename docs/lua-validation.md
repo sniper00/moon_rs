@@ -9,7 +9,7 @@ python3 assets/test/run_all.py
 
 The Python runner builds `moon-app`, runs each Lua regression in its own
 `target/debug/moon_rs` process, and starts disposable database containers.
-It uses the repository's bundled Lua 5.5 and default module features. The Moon
+It uses the repository's bundled Lua 5.5.1 and default module features. The Moon
 process runs on the host; database services run in Docker.
 
 ```sh

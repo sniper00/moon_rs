@@ -277,7 +277,16 @@ pub const LUAL_BUFFERSIZE: usize = 16 * mem::size_of::<*const ()>() * mem::size_
 // This ensures proper alignment for the buffer data.
 #[repr(C)]
 pub union luaL_BufferInit {
-    // Alignment matches LUAI_MAXALIGN
+    // Lua 5.5.1 includes long double in LUAI_MAXALIGN. On these targets
+    // libc supplies its alignment; MSVC's long double has double's layout.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "wasi",
+        all(windows, target_env = "gnu")
+    ))]
+    pub _align_max: mem::ManuallyDrop<libc::max_align_t>,
     pub _align_n: lua_Number,
     pub _align_u: c_double,
     pub _align_s: *mut c_void,

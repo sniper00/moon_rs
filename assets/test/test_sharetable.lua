@@ -22,6 +22,17 @@ if conf and conf.agent then
         assert(data.a == 1)
         assert(data.b == "hello")
         assert(#data.c == 5)
+        -- rawset must reject overwriting existing shared fields as well as additions.
+        for _, entry in ipairs({{data, "a", 9}, {data, "extra", 9}, {data.c, 1, 9}}) do
+            local ok, err = pcall(rawset, entry[1], entry[2], entry[3])
+            assert(not ok and tostring(err):find("shared table", 1, true), tostring(err))
+        end
+        -- Local array traversal must leave objects owned by the shared state alone.
+        local references = {data, data.c}
+        for _ = 1, 3 do
+            collectgarbage("collect")
+            assert(references[1].a == 1 and references[2][1] == 1 and #references[2] == 5)
+        end
         return true
     end
 
