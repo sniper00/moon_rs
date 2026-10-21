@@ -21,7 +21,7 @@ use tokio_tungstenite::{
     },
 };
 
-use moon_base::{
+use moon_lua_sys::{
     cstr, ffi,
     laux::{self, LuaStack, LuaState, LuaTable},
     lreg_null, lreg_try, luaL_newlib,

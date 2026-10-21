@@ -1,9 +1,9 @@
-use moon_base::laux;
-use moon_base::{
+use moon_lua_sys::laux;
+use moon_lua_sys::{
     cstr, ffi,
     laux::{LuaStack, LuaState},
 };
-use moon_base::{lreg, lreg_null};
+use moon_lua_sys::{lreg, lreg_null};
 use moon_runtime::{
     actor::LuaActor,
     context::{CONTEXT, Watchdog},

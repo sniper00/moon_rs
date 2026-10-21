@@ -6,7 +6,7 @@ import sys
 
 # usage: ab_zset.py [rounds] [base_binary] [other_binary]
 ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-BASE = sys.argv[2] if len(sys.argv) > 2 else "/tmp/moon_base"
+BASE = sys.argv[2] if len(sys.argv) > 2 else "/tmp/moon_lua_sys"
 OTHER = sys.argv[3] if len(sys.argv) > 3 else "/tmp/moon_pf"
 BINS = {"base": BASE, "prefetch": OTHER}
 SCRIPT = "assets/benchmark/benchmark_zset.lua"

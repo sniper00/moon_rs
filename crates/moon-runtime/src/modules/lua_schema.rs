@@ -27,8 +27,8 @@
 //!   so `load` may be called multiple times and readers on other actor threads
 //!   keep a valid `&'static` view (the previous schema is intentionally leaked).
 
-use moon_base::laux::{LuaStack, LuaStackValue, LuaState};
-use moon_base::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
+use moon_lua_sys::laux::{LuaStack, LuaStackValue, LuaState};
+use moon_lua_sys::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
 use std::collections::HashMap;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicPtr, Ordering};

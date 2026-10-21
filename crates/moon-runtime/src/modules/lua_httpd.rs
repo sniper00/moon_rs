@@ -23,8 +23,8 @@ use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
-use moon_base::laux::LuaState;
-use moon_base::{
+use moon_lua_sys::laux::LuaState;
+use moon_lua_sys::{
     cstr, ffi, laux,
     laux::{LuaStack, LuaTable},
     lreg, lreg_null, lreg_try, luaL_newlib,

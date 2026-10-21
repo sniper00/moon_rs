@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use moon_base::{
+use moon_lua_sys::{
     self, cstr,
     ffi::{self},
     laux::{self, LuaStack, LuaState, LuaTable},

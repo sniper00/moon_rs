@@ -1,4 +1,4 @@
-use moon_base::{
+use moon_lua_sys::{
     self, cstr,
     ffi::{self, luaL_Reg},
     laux::{self, LuaStack, LuaStackValue, LuaState, LuaTable, LuaType},
@@ -45,7 +45,7 @@ const JSON_ARRAY_META: *const c_char = cstr!("__array");
 const DEFAULT_CONCAT_BUFFER_SIZE: usize = 512;
 const MIN_CONCAT_BUFFER_SIZE: usize = 16;
 
-/// `#[repr(C)]` so the C JSON decoder (`lualib-src/lua_json_decode.c`) can read
+/// `#[repr(C)]` so the C JSON decoder (`lualib/lua_json_decode.c`) can read
 /// the same options struct out of the shared `json_options` userdata upvalue.
 /// The field order/types MUST stay in sync with the `json_options` struct there.
 #[repr(C)]

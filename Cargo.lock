@@ -2144,18 +2144,10 @@ dependencies = [
  "cc",
  "log",
  "mimalloc",
- "moon-base",
+ "moon-lua-sys",
  "moon-runtime",
  "rustls",
  "tokio",
-]
-
-[[package]]
-name = "moon-base"
-version = "0.1.0"
-dependencies = [
- "cc",
- "libc",
 ]
 
 [[package]]
@@ -2165,6 +2157,14 @@ dependencies = [
  "criterion",
  "pprof 0.15.0",
  "rustc-hash",
+]
+
+[[package]]
+name = "moon-lua-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -2193,7 +2193,7 @@ dependencies = [
  "md-5",
  "memchr",
  "mongodb",
- "moon-base",
+ "moon-lua-sys",
  "num_cpus",
  "percent-encoding",
  "phf",

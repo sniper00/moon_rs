@@ -1,5 +1,5 @@
 use base64::{Engine, engine};
-use moon_base::{
+use moon_lua_sys::{
     self, cstr, ffi,
     laux::{self, LuaStack, LuaState},
     lreg_null, lreg_try, luaL_newlib,

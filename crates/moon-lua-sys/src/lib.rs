@@ -1,4 +1,4 @@
-//! Low level bindings to Lua 5.4/5.3/5.2/5.1 (including LuaJIT) and Roblox Luau.
+//! Lua 5.5 bindings, native helpers, and shared runtime utilities.
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 #![allow(clippy::missing_safety_doc)]
@@ -8,7 +8,7 @@
 use std::os::raw::c_int;
 
 #[cfg(any(feature = "lua55", doc))]
-pub use lua55::*;
+pub use lua::*;
 
 #[cfg(feature = "lua55")]
 #[doc(hidden)]
@@ -60,9 +60,9 @@ mod macros;
 
 #[cfg(any(feature = "lua55", doc))]
 #[cfg_attr(docsrs, doc(cfg(feature = "lua55")))]
-pub mod lua55;
+pub mod lua;
 
-pub use lua55 as ffi;
+pub use lua as ffi;
 
 pub mod buffer;
 pub mod laux;

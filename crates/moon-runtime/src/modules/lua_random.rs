@@ -1,8 +1,8 @@
-use moon_base::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
+use moon_lua_sys::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
 use rand::RngExt;
 use std::ffi::c_int;
 
-use moon_base::laux::{LuaStack, LuaState};
+use moon_lua_sys::laux::{LuaStack, LuaState};
 
 fn table_to_i64_vec(lua: &LuaStack<'_>, index: c_int) -> Result<Vec<i64>, String> {
     let state = lua.state();

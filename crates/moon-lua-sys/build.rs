@@ -7,7 +7,7 @@ fn main() {
     // C++ extension crates) can locate the Lua C API headers via the Cargo
     // `links = "lua55"` metadata variable DEP_LUA55_INCLUDE.
     let lua_dir =
-        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("lua55");
+        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("lua");
     println!("cargo:include={}", lua_dir.display());
 
     // The Lua C sources (and the small C helpers) are only compiled and linked
@@ -17,9 +17,9 @@ fn main() {
     #[cfg(feature = "bundled")]
     {
         let mut builder = cc::Build::new();
-        builder.file("./lua55/onelua.c");
+        builder.file("./lua/onelua.c");
         builder.define("MAKE_LIB", None);
-        builder.include("./lua55");
+        builder.include("./lua");
         builder.std("c11");
 
         // Enable loading of Lua C dynamic extension libraries (require of
@@ -48,19 +48,19 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=dl");
 
         cc::Build::new()
-            .file("lualib-src/yyjson/yyjson.c")
-            .file("lualib-src/lua_json_decode.c")
-            .include("./lua55")
-            .include("lualib-src")
+            .file("lualib/yyjson/yyjson.c")
+            .file("lualib/lua_json_decode.c")
+            .include("./lua")
+            .include("lualib")
             .std("c11")
             .compile("lua_json_decode");
 
         cc::Build::new()
-            .file("lualib-src/lua_sharetable.c")
-            .include("./lua55")
+            .file("lualib/lua_sharetable.c")
+            .include("./lua")
             .std("c11")
             .compile("lua_sharetable");
     }
 
-    println!("cargo:rerun-if-changed=lualib-src");
+    println!("cargo:rerun-if-changed=lualib");
 }

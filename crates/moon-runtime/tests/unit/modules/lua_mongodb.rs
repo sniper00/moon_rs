@@ -1,5 +1,5 @@
 use super::*;
-use moon_base::laux::LuaGlobalState;
+use moon_lua_sys::laux::LuaGlobalState;
 use std::ptr::{NonNull, null_mut};
 
 fn new_state() -> (LuaState, LuaGlobalState) {

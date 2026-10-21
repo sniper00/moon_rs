@@ -1,7 +1,7 @@
 use crate::net_io::{read_buffer_exact, write_all_vectored};
 use dashmap::{DashMap, DashSet};
 use lazy_static::lazy_static;
-use moon_base::{
+use moon_lua_sys::{
     cstr, ffi,
     laux::{self, LuaStack, LuaState},
     lreg, lreg_null, lreg_try, luaL_newlib,

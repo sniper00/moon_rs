@@ -8,7 +8,7 @@ existing `lua_redis.rs` / `lua_pg.rs` pool drivers.
 ```rust
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use moon_base::{
+use moon_lua_sys::{
     cstr,
     laux::{self, LuaState, LuaTable},
     lreg, lreg_null, luaL_newlib,

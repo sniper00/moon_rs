@@ -69,7 +69,7 @@ fn concurrent_cache_misses_respect_capacity() {
 
 #[test]
 fn request_parts_decode_to_existing_lua_fields_without_string_staging() {
-    use moon_base::laux::LuaGlobalState;
+    use moon_lua_sys::laux::LuaGlobalState;
     use std::ptr::NonNull;
     let request = Request::builder()
         .method("POST")

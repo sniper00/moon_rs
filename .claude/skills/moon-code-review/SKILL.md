@@ -22,7 +22,7 @@ Rust modules (socket, HTTP, SQL, Redis, PG, etc.) are exposed through C FFI;
 async I/O completions are delivered back as actor messages.
 
 Key files:
-- `crates/moon-base/` — Lua 5.5 C sources + FFI bindings (`laux.rs`), macros, `Buffer`
+- `crates/moon-lua-sys/` — Lua 5.5 C sources + FFI bindings (`laux.rs`), macros, `Buffer`
 - `crates/moon-runtime/src/modules/lua_*.rs` — all native modules
 - `crates/moon-runtime/src/context.rs` — global `CONTEXT`, actor registry, `PTYPE_*`
 - `crates/moon-app/` — binary entry, Tokio setup, signal handling

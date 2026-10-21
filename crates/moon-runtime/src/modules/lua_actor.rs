@@ -1,6 +1,6 @@
 use crate::{lua_require, luaopen_custom_libs, not_null_wrapper};
 
-use moon_base::{
+use moon_lua_sys::{
     self, cstr,
     ffi::{self, luaL_Reg},
     laux::{self, LuaStack, LuaState, LuaThread, LuaType},
@@ -107,7 +107,7 @@ unsafe extern "C" fn allocator(
 
         if nsize == 0 {
             if !ptr.is_null() {
-                let layout = Layout::from_size_align_unchecked(osize, moon_base::SYS_MIN_ALIGN);
+                let layout = Layout::from_size_align_unchecked(osize, moon_lua_sys::SYS_MIN_ALIGN);
                 alloc::dealloc(ptr as *mut u8, layout);
                 actor.mem -= osize as isize;
             }
@@ -152,7 +152,7 @@ unsafe extern "C" fn allocator(
 
         if ptr.is_null() {
             // Allocate new memory
-            let new_layout = match Layout::from_size_align(nsize, moon_base::SYS_MIN_ALIGN) {
+            let new_layout = match Layout::from_size_align(nsize, moon_lua_sys::SYS_MIN_ALIGN) {
                 Ok(layout) => layout,
                 Err(_) => return std::ptr::null_mut(),
             };
@@ -164,7 +164,7 @@ unsafe extern "C" fn allocator(
         }
 
         // Reallocate memory
-        let old_layout = Layout::from_size_align_unchecked(osize, moon_base::SYS_MIN_ALIGN);
+        let old_layout = Layout::from_size_align_unchecked(osize, moon_lua_sys::SYS_MIN_ALIGN);
         let new_ptr = alloc::realloc(ptr as *mut u8, old_layout, nsize) as *mut c_void;
         if new_ptr.is_null() {
             alloc::handle_alloc_error(old_layout);

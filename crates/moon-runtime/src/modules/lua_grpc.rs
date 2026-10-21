@@ -58,7 +58,7 @@ use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Identity},
 };
 
-use moon_base::{
+use moon_lua_sys::{
     cstr, ffi,
     laux::{self, LuaStack, LuaState, LuaTable},
     lreg, lreg_null, lreg_try, luaL_newlib,

@@ -6,7 +6,7 @@ borrows, without adding unnecessary FFI calls, allocations, copies, or stack gua
 
 `docs/laux-refactor.md` and `docs/laux-context-cleanup.md` record the migration history. When
 writing or reviewing new code, treat this guide and the current implementation in
-`crates/moon-base/src/laux.rs` as the source of truth.
+`crates/moon-lua-sys/src/laux.rs` as the source of truth.
 
 ## Core Principle
 
@@ -53,8 +53,8 @@ Prefer business functions that receive `&mut LuaStack<'_>`, and let the registra
 raw ABI adaptation:
 
 ```rust
-use moon_base::laux::{self, LuaStack};
-use moon_base::{cstr, lreg_try, lreg_null};
+use moon_lua_sys::laux::{self, LuaStack};
+use moon_lua_sys::{cstr, lreg_try, lreg_null};
 use std::ffi::c_int;
 
 fn add(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
@@ -64,7 +64,7 @@ fn add(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     Ok(1)
 }
 
-static LIB: &[moon_base::laux::LuaReg] = &[
+static LIB: &[moon_lua_sys::laux::LuaReg] = &[
     lreg_try!("add", add),
     lreg_null!(),
 ];

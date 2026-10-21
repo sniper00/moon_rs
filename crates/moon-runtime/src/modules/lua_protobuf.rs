@@ -17,8 +17,8 @@ use std::ffi::CString;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use moon_base::laux::{LuaStack, LuaType};
-use moon_base::{cstr, ffi, laux, laux::LuaState, lreg_null, lreg_try, luaL_newlib};
+use moon_lua_sys::laux::{LuaStack, LuaType};
+use moon_lua_sys::{cstr, ffi, laux, laux::LuaState, lreg_null, lreg_try, luaL_newlib};
 use moon_runtime::buffer::Buffer;
 
 const MAX_RECURSION_DEPTH: usize = 128;

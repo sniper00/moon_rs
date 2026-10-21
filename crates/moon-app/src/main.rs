@@ -1,5 +1,5 @@
 use mimalloc::MiMalloc;
-use moon_base::{
+use moon_lua_sys::{
     self, cstr, ffi,
     laux::{self, LuaStack, LuaState},
 };

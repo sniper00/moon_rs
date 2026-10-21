@@ -1,6 +1,6 @@
 use super::*;
-use moon_base::ffi;
-use moon_base::laux::LuaGlobalState;
+use moon_lua_sys::ffi;
+use moon_lua_sys::laux::LuaGlobalState;
 use moon_runtime::buffer::Buffer;
 use moon_runtime::context::{self, Message, MessageBody};
 use std::ffi::CString;

@@ -40,12 +40,12 @@
 //! random jitter (1000..=10000) so externally observed ids do not reveal a fixed
 //! stride.
 
-use moon_base::{cstr, ffi, laux, lreg, lreg_null, lreg_try, luaL_newlib};
+use moon_lua_sys::{cstr, ffi, laux, lreg, lreg_null, lreg_try, luaL_newlib};
 use rand::RngExt;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use moon_base::laux::{LuaStack, LuaState};
+use moon_lua_sys::laux::{LuaStack, LuaState};
 
 // ---- UUID (type != 0): type(10) | serverid(16) | sequence(37) ----
 // type lives in the high bits so that `type == 0` (=> player UID) is detectable

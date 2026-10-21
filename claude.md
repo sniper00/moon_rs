@@ -12,7 +12,7 @@ Architecture: Lua actors (services) communicate via typed message passing, with 
 
 ```
 crates/
-  moon-base/      # Foundation: Lua 5.5 C sources + Rust FFI (laux.rs), macros, shared Buffer, yyjson JSON decoder
+  moon-lua-sys/      # Foundation: Lua 5.5 C sources + Rust FFI (laux.rs), macros, shared Buffer, yyjson JSON decoder
   moon-runtime/   # Actor server runtime (CONTEXT, message types, timer, logger) + ALL Rust→Lua native bindings (lua_socket, lua_httpc, lua_httpd, etc.)
   moon-app/       # Binary entry point (moon_rs), Tokio setup, signal handling, bootstrap
   moon-thrift/    # Standalone Lua C extension (cdylib), excluded from the workspace; built separately
@@ -58,7 +58,7 @@ cargo run --release assets/test/test_socket.lua
 
 ### Testing
 
-- **Rust unit tests:** inline `#[cfg(test)] mod tests` in `moon-runtime/src/lib.rs`, `lua_redis.rs`, `lua_pg.rs`, `moon-base/src/buffer.rs`
+- **Rust unit tests:** inline `#[cfg(test)] mod tests` in `moon-runtime/src/lib.rs`, `lua_redis.rs`, `lua_pg.rs`, `moon-lua-sys/src/buffer.rs`
 - **Test helpers:** `new_lua_vm()`, `run_lua()`, `run_lua_expr()` in `moon-runtime/src/lib.rs`
 - **Lua integration tests:** under `assets/test/` — run manually via `cargo run --release`
 - **No automated tests in CI** — CI only builds release binaries

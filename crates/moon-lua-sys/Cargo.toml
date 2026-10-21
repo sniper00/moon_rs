@@ -1,5 +1,5 @@
 [package]
-name = "moon-base"
+name = "moon-lua-sys"
 version = "0.1.0"
 edition = "2024"
 links = "lua55"

@@ -22,7 +22,7 @@ use crate::escape_print;
 
 use super::{actor::LuaActor, buffer::Buffer, log::Logger};
 
-use moon_base::ffi as lua_ffi;
+use moon_lua_sys::ffi as lua_ffi;
 
 // Defined in `moon-runtime/src/modules/lua_coroutine.rs`. The monitor installs this
 // hook on the active lua_State when a timeout is detected.

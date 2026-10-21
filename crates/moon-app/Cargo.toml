@@ -13,7 +13,7 @@ cc = "1.0"
 
 [dependencies]
 moon-runtime = { workspace = true }
-moon-base = { workspace = true }
+moon-lua-sys = { workspace = true }
 mimalloc = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }

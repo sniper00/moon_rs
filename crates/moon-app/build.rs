@@ -13,7 +13,7 @@ fn main() {
             // Create an import library (moon_rs.lib) so cdylib extensions can
             // link against moon_rs.exe and import all Lua C API symbols at
             // load time. A temporary .def is generated solely for lib.exe;
-            // the EXE exports are handled by LUA_BUILD_AS_DLL in moon-base.
+            // the EXE exports are handled by LUA_BUILD_AS_DLL in moon-lua-sys.
             let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
             let def_path = out_dir.join("_lua_exports.def");
             // target/<profile> = out_dir/../../..

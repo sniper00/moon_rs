@@ -1,7 +1,7 @@
 use crate::actor::LuaActor;
 use crate::context::ActorId;
 use futures_util::{TryStream, TryStreamExt};
-use moon_base::laux::{self, LuaState};
+use moon_lua_sys::laux::{self, LuaState};
 use std::ffi::c_int;
 use tokio::sync::oneshot;
 

@@ -14,8 +14,8 @@
 //! (and Redis) skiplist.
 
 use crate::hash::FxBuildHasher;
-use moon_base::laux::{LuaStack, LuaState};
-use moon_base::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
+use moon_lua_sys::laux::{LuaStack, LuaState};
+use moon_lua_sys::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
 use rand::RngExt;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int};

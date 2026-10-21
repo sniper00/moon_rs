@@ -5,7 +5,7 @@
 // through their original `moon_runtime::...` paths.
 extern crate self as moon_runtime;
 
-use moon_base::{
+use moon_lua_sys::{
     cstr, ffi,
     laux::{self, LuaStack, LuaState, LuaType},
 };
@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 // ---- Actor server runtime (formerly the `moon-runtime` crate) ----
 pub mod actor;
-// `Buffer` lives in the shared `moon-base` crate; re-export it so the
+// `Buffer` lives in the shared `moon-lua-sys` crate; re-export it so the
 // long-standing `moon_runtime::buffer` path keeps working.
 use buffer::Buffer;
-pub use moon_base::buffer;
+pub use moon_lua_sys::buffer;
 pub mod context;
 pub mod error;
 pub mod log;
@@ -455,7 +455,7 @@ macro_rules! lua_require {
 pub fn luaopen_custom_libs(state: LuaState) {
     unsafe extern "C-unwind" {
         fn luaopen_sharetable_core(L: *mut ffi::lua_State) -> c_int;
-        // C module amalgamated into the lua55 static lib (lua55/clonefunc.c via onelua.c).
+        // C module amalgamated into the lua55 static lib (lua/clonefunc.c via onelua.c).
         fn luaopen_clonefunc(L: *mut ffi::lua_State) -> c_int;
     }
 

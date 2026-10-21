@@ -3,7 +3,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-use moon_base::{
+use moon_lua_sys::{
     cstr,
     ffi::{self, LUA_TLIGHTUSERDATA},
     laux::{self, LuaNil, LuaStack, LuaState, LuaType},

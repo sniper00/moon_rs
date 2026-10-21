@@ -12,7 +12,7 @@ use mongodb::{
     options::{ClientOptions, CreateIndexOptions, FindOptions, IndexOptions, ReadConcern},
     results,
 };
-use moon_base::{
+use moon_lua_sys::{
     cstr, ffi,
     laux::{self, LuaArgs, LuaStack, LuaState, LuaTable, LuaType},
     lreg, lreg_null, lreg_try, luaL_newlib, push_lua_table,

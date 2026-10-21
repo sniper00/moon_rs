@@ -43,7 +43,10 @@ flowchart LR
 | --- | --- |
 | `crates/moon-app` | binary entry point, bootstrap, signal handling |
 | `crates/moon-runtime` | actor runtime (context, messages, timer, logger) + all Rust→Lua native bindings |
-| `crates/moon-base` | foundation: embedded Lua 5.5 sources, Rust FFI, helper macros, shared Buffer |
+| `crates/moon-lua-sys` | foundation: embedded Lua 5.5 sources, Rust FFI, helper macros, shared Buffer |
+| `crates/moon-lua-sys/lua` | embedded Lua C sources and headers |
+| `crates/moon-lua-sys/lualib` | project C helpers and yyjson |
+| `crates/moon-lua-sys/src/lua` | Rust Lua FFI declarations |
 | `crates/*/tests/unit/` | Rust unit tests, organized to mirror each crate's source modules |
 | `crates/*/tests/*.rs` | Rust integration tests using public crate APIs |
 | `lualib/` | user-facing Lua APIs and wrappers |

@@ -4,7 +4,7 @@
 //! configurations — allow dead code module-wide rather than annotating each.
 #![allow(dead_code)]
 
-use moon_base::laux::{self, LuaState, LuaTable};
+use moon_lua_sys::laux::{self, LuaState, LuaTable};
 use moon_runtime::context::{ActorId, CONTEXT};
 use std::sync::{
     Arc,

@@ -1,6 +1,6 @@
-use moon_base::laux::{FromLua, LuaNil, LuaStack, LuaState, LuaTable};
-use moon_base::luaL_newlib;
-use moon_base::{cstr, ffi, laux, lreg, lreg_null, lreg_try};
+use moon_lua_sys::laux::{FromLua, LuaNil, LuaStack, LuaState, LuaTable};
+use moon_lua_sys::luaL_newlib;
+use moon_lua_sys::{cstr, ffi, laux, lreg, lreg_null, lreg_try};
 use std::ffi::c_int;
 use std::{
     env, fs,

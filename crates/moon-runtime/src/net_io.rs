@@ -1,6 +1,6 @@
 use std::{future::poll_fn, io, io::IoSlice, pin::Pin};
 
-use moon_base::buffer::Buffer;
+use moon_lua_sys::buffer::Buffer;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 /// Read directly into spare capacity, publishing bytes only after a full read.

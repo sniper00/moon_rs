@@ -7,8 +7,8 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
 use lazy_static::lazy_static;
-use moon_base::laux::{LuaStack, LuaState};
-use moon_base::{
+use moon_lua_sys::laux::{LuaStack, LuaState};
+use moon_lua_sys::{
     cstr, ffi, laux,
     laux::{LuaArgs, LuaTable, LuaType},
     lreg, lreg_null, lreg_try, luaL_newlib, push_lua_table,

@@ -15,10 +15,10 @@
 //! `cdylib`, and installs it into `clib/<name>.<ext>` so moon_rs can load it via
 //! `require "<name>"`.
 //!
-//! ## ABI safety: `[patch]` redirect of `moon-base`
-//! External extensions declare `moon-base` as a git dependency on this repo.
+//! ## ABI safety: `[patch]` redirect of `moon-lua-sys`
+//! External extensions declare `moon-lua-sys` as a git dependency on this repo.
 //! At build time xtask injects a Cargo `[patch]` (via `--config`) that redirects
-//! that dependency to the **local working-copy** `crates/moon-base`, so every
+//! that dependency to the **local working-copy** `crates/moon-lua-sys`, so every
 //! extension is compiled against the exact same Lua 5.5 FFI / `Buffer` ABI as the
 //! host. The downloaded source is never modified.
 //!
@@ -35,7 +35,7 @@ const MANIFEST_FILE: &str = "extensions.toml";
 const LOCK_FILE: &str = "extensions.lock";
 const CACHE_DIR: &str = ".extensions";
 const CLIB_DIR: &str = "clib";
-const MOON_BASE_CRATE: &str = "crates/moon-base";
+const MOON_LUA_SYS_CRATE: &str = "crates/moon-lua-sys";
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -43,10 +43,10 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[derive(serde::Deserialize)]
 struct Manifest {
     /// Git URL this repo is published at; git-based extensions declare
-    /// `moon-base` from here, and it is the `[patch]` key xtask overrides with
+    /// `moon-lua-sys` from here, and it is the `[patch]` key xtask overrides with
     /// the local path. Optional (only needed for git extensions).
     #[serde(default)]
-    moon_base_git: Option<String>,
+    moon_lua_sys_git: Option<String>,
     #[serde(default)]
     extensions: BTreeMap<String, ExtSpec>,
 }
@@ -310,20 +310,20 @@ fn build_and_install(
         .args(["build", "--release", "--manifest-path"])
         .arg(&manifest_path);
 
-    // Git extensions declare `moon-base` as a git dependency; redirect it to the
+    // Git extensions declare `moon-lua-sys` as a git dependency; redirect it to the
     // local crate so they build against this repo's exact Lua FFI / Buffer ABI.
     // Locally-vendored (`path`) extensions already use a path dependency, so no
     // patch is needed.
     if spec.path.is_none() {
-        let moon_base_git = manifest
-            .moon_base_git
+        let moon_lua_sys_git = manifest
+            .moon_lua_sys_git
             .as_deref()
-            .ok_or("`moon_base_git` must be set in extensions.toml for git-based extensions")?;
-        let local_moon_base = repo_root.join(MOON_BASE_CRATE);
+            .ok_or("`moon_lua_sys_git` must be set in extensions.toml for git-based extensions")?;
+        let local_moon_lua_sys = repo_root.join(MOON_LUA_SYS_CRATE);
         let patch = format!(
-            "patch.\"{}\".moon-base.path=\"{}\"",
-            moon_base_git,
-            local_moon_base.display().to_string().replace('\\', "/")
+            "patch.\"{}\".moon-lua-sys.path=\"{}\"",
+            moon_lua_sys_git,
+            local_moon_lua_sys.display().to_string().replace('\\', "/")
         );
         cmd.arg("--config").arg(&patch);
     }

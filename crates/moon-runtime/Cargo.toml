@@ -35,7 +35,7 @@ cluster = ["httpc"]
 protobuf = []
 
 [dependencies]
-moon-base = { workspace = true }
+moon-lua-sys = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 num_cpus = { workspace = true }

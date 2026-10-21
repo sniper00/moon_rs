@@ -28,7 +28,7 @@ An extension is a shared library exposing a `luaopen_<module>` entry point. It i
 
 Three pieces make this work — all already wired up; you normally don't touch them:
 
-1. **Lua's dlopen loader is enabled.** `crates/moon-base/build.rs` defines
+1. **Lua's dlopen loader is enabled.** `crates/moon-lua-sys/build.rs` defines
    `LUA_USE_DLOPEN` + `LUA_USE_POSIX` on unix (and links `libdl` on Linux) so
    `loadlib.c` uses `dlopen`; Windows `luaconf.h` enables `LUA_DL_DLL`.
 
@@ -81,11 +81,11 @@ nm -u  clib/<n>.dylib | grep -E 'lua_|luaL_'   # lua_* must be undefined (host-b
 
 ## 3. Extension types
 
-All three depend on `moon-base` with `default-features = false, features =
+All three depend on `moon-lua-sys` with `default-features = false, features =
 ["lua55"]` (the `bundled` feature **off**, so no second copy of Lua is linked —
 only the FFI declarations + the shared `Buffer`), and are **excluded from the
 workspace** (so workspace feature-unification can't turn `bundled` back on).
-`moon-base`'s `links = "lua55"` exposes the header dir to your `build.rs` as
+`moon-lua-sys`'s `links = "lua55"` exposes the header dir to your `build.rs` as
 `DEP_LUA55_INCLUDE`.
 
 ### 3a. Rust cdylib — `crates/moon-thrift`
@@ -138,7 +138,7 @@ per `luaopen_*` entry.
 ### 3c. Quick manual build (no Rust crate)
 
 For a one-off pure-C module you can skip Cargo entirely and compile straight into
-`clib/` (headers at `crates/moon-base/lua55`):
+`clib/` (headers at `crates/moon-lua-sys/lua`):
 
 - **macOS:** `cc -O2 -fPIC -I<lua-headers> -bundle -undefined dynamic_lookup mod.c -o clib/mod.dylib`
 - **Linux:** `cc -O2 -fPIC -I<lua-headers> -shared mod.c -o clib/mod.so`
@@ -163,7 +163,7 @@ cargo xtask clean [name...]  # remove cached checkouts under .extensions/
 ### Git extensions (live in their own repos)
 
 ```toml
-moon_base_git = "https://github.com/.../moon_rs.git"   # the [patch] key (below)
+moon_lua_sys_git = "https://github.com/.../moon_rs.git"   # the [patch] key (below)
 
 [extensions.thrift]
 git = "https://github.com/.../moon-thrift.git"
@@ -172,8 +172,8 @@ lib = "thrift"
 ```
 
 `build` clones the locked commit and compiles it. **ABI safety:** the extension
-declares `moon-base` as a *git* dependency on `moon_base_git`; `xtask` injects a
-Cargo `[patch]` redirecting it to this repo's **local** `crates/moon-base`, so the
+declares `moon-lua-sys` as a *git* dependency on `moon_lua_sys_git`; `xtask` injects a
+Cargo `[patch]` redirecting it to this repo's **local** `crates/moon-lua-sys`, so the
 extension is built against the host's exact Lua FFI / `Buffer` ABI (a mismatch
 would corrupt memory across the `.so`/`.dylib` boundary). It also sets
 `MOON_HOST_TARGET_DIR` (where `moon_rs.lib` lives) for Windows builds.
@@ -191,10 +191,10 @@ lib  = "crypt"
 
 - `cargo xtask build crypt` builds it directly; `update` is a no-op
   ("nothing to lock") and `list` shows it as `[local]`.
-- It uses a **path** dependency on `moon-base`
-  (`{ path = "../../crates/moon-base", default-features = false, features = ["lua55"] }`),
-  so `xtask` skips the `moon_base_git` `[patch]` — the path dep already points at
-  the host's `moon-base`, preserving the ABI guarantee.
+- It uses a **path** dependency on `moon-lua-sys`
+  (`{ path = "../../crates/moon-lua-sys", default-features = false, features = ["lua55"] }`),
+  so `xtask` skips the `moon_lua_sys_git` `[patch]` — the path dep already points at
+  the host's `moon-lua-sys`, preserving the ABI guarantee.
 - Keep the source under `.extensions/<name>/` to match where cloned sources live.
   It is git-ignored — treat it as a local working copy / soon-to-be-own-repo.
 
@@ -209,7 +209,7 @@ cargo run --release assets/test/test_crypt.lua   # or test_thrift.lua, test_clib
 ## 5. End-to-end checklist for a new C/C++ extension
 
 1. Create `.extensions/<n>/` with `csrc/*.c`, `Cargo.toml` (`[lib] name = "<n>"`,
-   `crate-type = ["cdylib"]`, `moon-base` path dep with `default-features = false`),
+   `crate-type = ["cdylib"]`, `moon-lua-sys` path dep with `default-features = false`),
    `build.rs` (Rules A + B), and an empty `src/lib.rs`.
 2. Register a `path` entry in `extensions.toml` and confirm `cargo xtask list`.
 3. `cargo xtask build <n>` → installs `clib/<n>.<ext>`.
@@ -224,7 +224,7 @@ Windows PE DLLs must resolve every symbol at link time — there is no deferred
 runtime resolution. So the host EXE must export the Lua symbols, and an import
 library (`moon_rs.lib`) is generated for extensions to link against.
 
-**1. Host EXE exports Lua symbols.** `moon-base/build.rs` defines
+**1. Host EXE exports Lua symbols.** `moon-lua-sys/build.rs` defines
 `LUA_BUILD_AS_DLL` when compiling `onelua.c` on Windows:
 
 ```rust

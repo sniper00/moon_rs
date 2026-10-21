@@ -1,6 +1,6 @@
 //! Centralized message decode registry and helpers.
 
-use moon_base::laux::LuaState;
+use moon_lua_sys::laux::LuaState;
 use moon_runtime::{
     buffer::Buffer,
     context::{Message, MessageBody},
@@ -87,11 +87,11 @@ pub unsafe extern "C-unwind" fn decode_error_message(state: LuaState, m: *mut Me
         // the `Drop` of a taken `Box<Buffer>` and leak it.
         match borrow_buffer(m) {
             Ok(buf) => {
-                moon_base::laux::lua_push(state, false);
+                moon_lua_sys::laux::lua_push(state, false);
                 // Lossless for valid UTF-8; for invalid bytes preserve the rest of
                 // the message with U+FFFD substitution instead of dropping it all.
                 let message = String::from_utf8_lossy(buf.as_slice());
-                moon_base::laux::lua_push(state, message.as_ref());
+                moon_lua_sys::laux::lua_push(state, message.as_ref());
                 2
             }
             Err(e) => lua_push_error_tuple(state, &e),
@@ -104,7 +104,7 @@ pub unsafe extern "C-unwind" fn decode_integer_message(state: LuaState, m: *mut 
         let body = (*m).take_body();
         match body {
             MessageBody::ISize(_, v) => {
-                moon_base::laux::lua_push(state, v);
+                moon_lua_sys::laux::lua_push(state, v);
                 1
             }
             other => {
@@ -132,7 +132,7 @@ pub unsafe extern "C-unwind" fn decode_buffer_as_string_message(
         // the `Drop` of a taken `Box<Buffer>` and leak it.
         match borrow_buffer(m) {
             Ok(buf) => {
-                moon_base::laux::lua_push(state, buf.as_slice());
+                moon_lua_sys::laux::lua_push(state, buf.as_slice());
                 1
             }
             Err(e) => lua_push_error_tuple(state, &e),

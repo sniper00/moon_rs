@@ -198,7 +198,7 @@ async fn handle_write_releases_payloads_before_waiting_for_next_batch() {
 #[test]
 fn lua_close_preserves_success_and_empty_failure_returns() {
     let state = unsafe { LuaState::new(ffi::luaL_newstate()).unwrap() };
-    let _guard = moon_base::laux::LuaGlobalState::new(state);
+    let _guard = moon_lua_sys::laux::LuaGlobalState::new(state);
     let mut lua = unsafe { LuaStack::from_raw(state) };
     let fd = next_net_fd();
     laux::lua_push(state, fd);

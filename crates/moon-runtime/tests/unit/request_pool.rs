@@ -22,7 +22,7 @@ impl QueuedRequest for TestMessage {
 
 #[test]
 fn lua_dispatch_preserves_results_and_counts_only_requests() {
-    let state = laux::LuaState::new(unsafe { moon_base::ffi::luaL_newstate() }).unwrap();
+    let state = laux::LuaState::new(unsafe { moon_lua_sys::ffi::luaL_newstate() }).unwrap();
     let _owner = laux::LuaGlobalState::new(state);
     let mut lua = unsafe { laux::LuaStack::from_raw(state) };
     let (tx, mut rx) = mpsc::channel(1);
