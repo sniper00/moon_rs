@@ -37,6 +37,7 @@ LClosure *luaF_newLclosure (lua_State *L, int nupvals) {
   GCObject *o = luaC_newobj(L, LUA_VLCL, sizeLclosure(nupvals));
   LClosure *c = gco2lcl(o);
   c->p = NULL;
+  c->redirect = NULL;
   c->nupvalues = cast_byte(nupvals);
   while (nupvals--) c->upvals[nupvals] = NULL;
   return c;

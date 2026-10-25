@@ -708,8 +708,13 @@ typedef struct CClosure {
 typedef struct LClosure {
   ClosureHeader;
   struct Proto *p;
+  UpVal *redirect;  /* optional closed cell containing this instance's latest body */
   UpVal *upvals[1];  /* list of upvalues */
 } LClosure;
+
+/* All generations of one closure instance share a single target cell. This
+** lookup never follows a chain and must only happen when entering a call. */
+#define currentclosure(cl) ((cl)->redirect ? clLvalue((cl)->redirect->v.p) : (cl))
 
 
 typedef union Closure {

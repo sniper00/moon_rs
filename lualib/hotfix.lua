@@ -1,1188 +1,791 @@
---[[
-================================================================================
-Lua Hot Update System
-================================================================================
-
-This module implements a runtime hot-update system for Lua modules, allowing
-you to update function implementations without restarting the program.
-
-Key Features:
-  1. Update existing function implementations in-place
-  2. Add new functions to running modules
-  3. Maintain upvalue consistency across updates
-  4. Support multiple rounds of hotfixes
-  5. Atomic updates with rollback on failure
-
-How It Works:
-  The hotfix system operates in four key phases:
-
-  Phase 1: Collect Old Module Upvalue Environment
-    - collect_all_uv(old_module) collects all upvalue info from old module
-    - Returns {upvalue_name -> {func, index, id, value}}
-    - Purpose: Build upvalue index for later connection
-
-  Phase 2: Validation (hotfix.diff)
-    - Compare old and new versions, generate diff mapping
-    - Rules:
-       Allow: Modify existing function implementations
-       Allow: Add new functions
-       Allow: Functions can add/remove upvalues
-       Forbid: Delete existing functions (breaks external references)
-       Forbid: New functions reference upvalues not in old module
-
-  Phase 3: New Function Handling
-    - Parse source code to get function names (avoid executing initialization)
-    - Check that new functions' upvalues exist in old module
-
-  Phase 4: Execute Replacement (using upvaluejoin)
-    For each function to update:
-      1. Lookup Phase: Search for same-named upvalue info in old module by name
-         - upvalues[uvname] returns {func, index, id, value}
-         - func: the function that owns this upvalue
-         - index: the position of this upvalue in that function
-      2. Join Phase: Use upvaluejoin to make new function's upvalue reference
-         the memory location of old function's upvalue at that position
-         - upvaluejoin(new_func, i, old_uv.func, old_uv.index)
-         - IMPORTANT: Indices i and old_uv.index may be DIFFERENT
-         - Connection is based on NAME, not position
-      3. Assignment Phase: Assign new function to module position
-         - Module table: Module.table[key] = new_function
-         - Upvalue: setupvalue(parent_func, index, new_function)
-
-  Key: upvaluejoin matches upvalues by NAME. We look up the upvalue info
-  (func and index) by name, then join to that specific location.
-
-Architecture:
-  - Three-phase update process: Parse → Check → Apply
-  - Parse: Compare old/new versions, identify changes (no side effects)
-  - Check: Validate upvalue compatibility (no side effects)
-  - Apply: Update functions atomically (only phase with side effects)
-  - Weak table tracking for memory efficiency
-  - Upvalue environment preservation across updates
-
-Core Concepts:
-  1. Function Prototypes: Internal bytecode pointers used to identify changes
-  2. Upvalue Linking: Finding upvalue info (func, index) by NAME in old module,
-     then using upvaluejoin to make new function's upvalue reference the
-     memory location of that upvalue in the old function
-  3. Origin Tracking: Remembering original functions across multiple hotfixes
-  4. Transaction Pattern: Collect all updates, then apply atomically
-
-Limitations:
-  - Cannot modify module-level local variables directly
-    (But can modify their VALUES through upvalue linking)
-  - New functions can only reference upvalues that exist in old module
-    (Cannot introduce new dependencies at runtime)
-  - Function signature changes must maintain upvalue compatibility
-    (New function can have fewer upvalues, but not new ones)
-  - Cannot remove functions (only add or update)
-    (Removing would break existing references)
-
-Example Usage:
-  -- Initial load
-  local mymodule = hotfix.require("game.logic.player")
-
-  -- Later, after modifying game/logic/player.lua
-  local ok, result = hotfix.update("game.logic.player")
-  if ok then
-    print("Hotfix successful")
-  else
-    print("Hotfix failed:", result)
-  end
-
-================================================================================
-]] --
-
-local clonefunc = require "clonefunc"
-local getupvalue = debug.getupvalue
-local upvalueid = debug.upvalueid
-local upvaluejoin = debug.upvaluejoin
-local setupvalue = debug.setupvalue
-local getinfo = debug.getinfo
-local proto = clonefunc.proto
-local clone = clonefunc.clone
-
+-- Update Lua functions in declaration order without rerunning initialization.
+-- Existing module tables and captured state survive. Cached references execute
+-- the latest target on their next call; active frames keep their old bodies.
+local core = require "hotfix.core"
+local getupvalue, upvalueid = debug.getupvalue, debug.upvalueid
+local upvaluejoin, setupvalue = debug.upvaluejoin, debug.setupvalue
+local proto, clone = core.proto, core.clone
+local resolve, redirect = core.resolve, core.redirect
 local hotfix = {}
+local modules, searchers = {}, {}
 
---[[
-================================================================================
-Module State Tracking
-================================================================================
-]] --
+-- Recover static bindings from compiler output, without running module code.
+-- Lua-version details are confined to this reader and core.code. Module
+-- source, custom load() calls and official bytecode all use the same path.
+local op, modes = core.opcodes, core.opmodes
 
--- Current loader functions for each module
--- Updated after each successful hotfix
-local loaders = {}
-
--- Original loader functions
--- Never updated, used for fallback compatibility checking
-local origin = {}
-
--- Mapping: new_function → original_function
--- Weak keys allow intermediate versions to be garbage collected
--- Strong values preserve the original function across multiple hotfixes
---
--- Why This Exists - Supporting Multiple Hotfix Rounds:
---   When we hotfix v1 → v2, the module table now has v2 references.
---   But old code may still have v1 references (callbacks, upvalues, etc).
---   When we hotfix v2 → v3, we must update v1 (not v2) to affect those old refs.
---
--- Example Across Multiple Hotfixes:
---   Round 1: v1 → v2
---     - origin_functions[v2] = v1
---     - Module table: module.foo = v2
---     - Old references still point to v1
---     - We update v1's upvalues
---
---   Round 2: v2 → v3
---     - origin_functions[v2] = v1 (lookup to find original)
---     - origin_functions[v3] = v1 (new entry, still points to original)
---     - Module table: module.foo = v3
---     - Old references still point to v1
---     - We update v1's upvalues again (not v2!)
---
--- Garbage Collection:
---   Weak keys allow v2 to be GC'd when no longer referenced
---   Strong values ensure v1 is NEVER GC'd (it's the canonical version)
-local origin_functions = setmetatable({}, { __mode = "k" })
-
--- Custom module searchers
-local searchers = {}
-
---[[
-================================================================================
-Utility Functions
-================================================================================
-]] --
-
---[[
-Check if two functions have compatible upvalue signatures.
-
-Compatibility Rules:
-  - f2 can have fewer upvalues than f1 (removing upvalues is safe)
-  - f2 cannot add new upvalues not in f1 (new dependencies are unsafe)
-  - _ENV is always ignored in comparison (global environment is special)
-
-Why This Matters:
-  When replacing f1 with f2, all upvalues of f2 must already exist in f1's
-  environment. Otherwise, f2 would reference non-existent state, leading to
-  runtime errors or undefined behavior.
-
-@param f1 function - Old version function
-@param f2 function - New version function
-@param upvalues table - Map of allowed new upvalues for adding functions
-@return boolean - true if compatible, false otherwise
-]] --
-local function same_proto(f1, f2, upvalues)
-	local uv = {}
-	local i = 1
-
-	-- Step 1: Collect all upvalues from f1 (old function)
-	-- Build a set of all upvalue names that f1 currently uses
-	while true do
-		local name = getupvalue(f1, i)
-		if name == nil then break end
-		if name ~= "_ENV" then
-			uv[name] = true
-		end
-		i = i + 1
-	end
-
-	-- Step 2: Check f2's upvalues against f1
-	-- Verify that f2 (new function) doesn't reference upvalues that don't exist
-	i = 1
-	while true do
-		local name = getupvalue(f2, i)
-		if name == nil then
-			return true -- f2 can have fewer upvalues - this is safe
-		end
-		-- If f2 references an upvalue that:
-		--   1. Doesn't exist in f1 (uv[name] == nil)
-		--   2. AND not allowed as new upvalue (upvalues[name] == nil)
-		--   3. AND not _ENV (special case)
-		-- Then it's incompatible
-		if name ~= "_ENV" and uv[name] == nil and upvalues[name] == nil then
-			return false -- f2 adds a new upvalue, incompatible
-		end
-		uv[name] = nil
-		i = i + 1
-	end
+local function atom(value)
+    if value.path and not value.path:find("[", 1, true) then
+        return "[=" .. value.path .. "]"
+    end
+    local key = value.literal
+    if type(key) == "string" then
+        if key:match("^[%a_][%w_]*$") then return key end
+        return "[#" .. key:gsub(".", function(c) return ("%02x"):format(c:byte()) end) .. "]"
+    elseif type(key) == "number" and math.type(key) == "integer" then
+        return "[" .. key .. "]"
+    end
 end
 
---[[
-Generate function location info for debugging.
-
-@param f function - The function to get info from
-@return string - Format: "filepath(line_number)"
-]] --
-local function funcinfo(f)
-	local info = getinfo(f, "S")
-	return string.format("%s(%d)", info.short_src, info.linedefined)
+local function field(base, key)
+    local suffix = atom(key)
+    if base and suffix then return base == "" and suffix or base .. "." .. suffix end
 end
 
---[[
-================================================================================
-Core Algorithm: Diff Generation
-================================================================================
-
-Compare two module loader functions and generate a mapping from old function
-prototypes to new function implementations.
-
-What is a Function Prototype?
-  In Lua's internal implementation, each function has a "prototype" - a unique
-  pointer to its bytecode structure. Functions with identical code share the
-  same prototype. We use this to identify which functions have changed:
-  - Same prototype = unchanged function (reuse old version)
-  - Different prototype = changed function (needs update)
-
-Algorithm Flow:
-  1. Compare function prototypes (proto pointers) using clonefunc.proto()
-  2. Check child function count (new code can ADD functions, but not REMOVE)
-  3. Verify upvalue compatibility (new function can't depend on non-existent state)
-  4. Recursively process child functions (handle nested functions)
-  5. Collect newly added functions (functions that don't exist in old version)
-
-The diff map is the core data structure that drives the hotfix process:
-  diff[old_proto] = new_function
-This allows us to later find all instances of old functions and replace them.
-]] --
-
---- @param m1 function @ Old module loader
---- @param m2 function @ New module loader
---- @param upvalues table @ Allowed upvalues for new functions
---- @return table, table|nil, table @ Map of old_proto -> new_func, Array of error messages (nil if no errors), Array of new functions
-function hotfix.diff(m1, m2, upvalues)
-	local diff = {}
-	local err = nil
-	local newfuncs = {}
-
-	local function diff_(a, b)
-		-- Get function prototype and child count
-		-- proto: Internal pointer to function prototype (lightuserdata)
-		--        Two functions with identical bytecode share the same proto
-		-- n: Number of child functions (nested functions defined inside this function)
-		local p1, n1 = proto(a)
-		local p2, n2 = proto(b)
-
-		-- proto() returns nil for C functions or if clonefunc doesn't support this function
-		if p1 == nil or p2 == nil then
-			err = err or {}
-			table.insert(err, funcinfo(a) .. "/" .. funcinfo(b))
-			return
-		end
-
-		-- Check child function count
-		-- RULE: New version can have MORE children (adding functions is OK)
-		--       New version CANNOT have FEWER children (removing functions breaks references)
-		--
-		-- Why? If old code has: local f1, f2, f3 = ...
-		--      And new code has: local f1, f2 = ...
-		--      Then f3 is removed, but existing code may still call f3
-		if n1 > n2 then
-			err = err or {}
-			table.insert(err, funcinfo(a) .. "/" .. funcinfo(b))
-			return
-		end
-
-		-- Check upvalue compatibility
-		-- Ensures new function can be safely substituted for old function
-		-- by verifying that all upvalues referenced by 'b' exist in 'a'
-		if not same_proto(a, b, upvalues) then
-			err = err or {}
-			table.insert(err, string.format("incompatible upvalue in %s -> %s", funcinfo(a), funcinfo(b)))
-		end
-
-		-- Store mapping: old prototype -> new function
-		-- This is the core of the diff - it tells us which functions changed
-		-- Later, we'll use this to find all instances of old functions
-		diff[p1] = b
-
-		-- Recursively process existing child functions (1 to n1)
-		-- These are functions that exist in both old and new versions
-		-- We need to check if their implementations changed
-		for i = 1, n1 do
-			diff_(clone(a, i), clone(b, i))
-		end
-
-		-- Collect newly added child functions (n1+1 to n2)
-		-- These are functions that only exist in the new version
-		-- They need special handling - we'll add them to the module table
-		for i = n1 + 1, n2 do
-			newfuncs[#newfuncs + 1] = clone(b, i)
-		end
-	end
-
-	diff_(m1, m2)
-	return diff, err, newfuncs
-end
-
---[[
-================================================================================
-Module Loading & Registration
-================================================================================
-]] --
-
---[[
-Add a custom module searcher.
-
-@param fn function - Searcher function that returns (loader, extra_arg)
-]] --
-function hotfix.addsearcher(fn)
-	searchers[#searchers + 1] = fn
-end
-
---[[
-Find loader function for a module using registered searchers.
-
-@param name string - Module name
-@return function - Loader function
-@return any - Extra argument for loader
-]] --
-local function findloader(name)
-	local msg = {}
-	for _, loader in ipairs(searchers) do
-		local f, extra = loader(name)
-		local t = type(f)
-		if t == "function" then
-			return f, extra
-		elseif t == "string" then
-			table.insert(msg, f)
-		end
-	end
-	error(string.format("module '%s' not found:%s", name, table.concat(msg)))
-end
-
---[[
-Parse module source file to extract function definitions and their locations.
-
-Purpose:
-  When we add new functions during a hotfix, we need to know their names to
-  add them to the module table. However, clonefunc.clone() returns functions
-  by index without names. This function bridges that gap by parsing the source
-  file to build a mapping from function locations to function names.
-
-How It Works:
-  1. Loads source file content (preferably from cache)
-  2. Scans each line looking for function declarations
-  3. Pattern matches: "function ModuleName.FunctionName("
-  4. Builds map: "filepath(line_number)" -> "function_name"
-
-Caching Strategy:
-  - First tries moon.env() which caches file content
-  - Falls back to reading file directly if cache unavailable
-  - Cache reduces disk I/O during multiple hotfixes
-
-Example:
-  Given source line at mymodule.lua:42:
-    function mymodule.calculate(x, y)
-
-  Returns:
-    { ["mymodule.lua(42)"] = "calculate" }
-
-@param filepath string - Source file path
-@param modname string - Module name (used in pattern matching)
-@return table|nil - Map of "filepath(line)" -> "function_name"
-@return string|nil - Error message if parsing failed
-]] --
-function hotfix.parse_module_functions(filepath, modname)
-	-- Try to use cached content, avoid open too many files
-	local ok, cache = pcall(function()
-		local moon = require("moon")
-		return moon.env(filepath)
-	end)
-
-	local content
-	if ok and cache then
-		print("Using cached function lines for:", filepath)
-		content = cache
-	else
-		local file = io.open(filepath, "rb")
-        if not file then
-            return nil, "Cannot open file: " .. filepath
+local function analyze(data, children, code, constants, ranges, maxstack)
+    local instructions, conditional, boundaries, coverage = {}, {}, {}, {}
+    for pc = 0, #code // 4 - 1 do instructions[pc] = string.unpack("=I4", code, pc * 4 + 1) end
+    local count = #code // 4
+    for pc = 0, count - 1 do
+        local word = instructions[pc]
+        local opcode, bx = word & 127, word >> 15
+        local target
+        if opcode == op.JMP then target = pc + 1 + (word >> 7) - 0xffffff
+        elseif opcode == op.FORPREP then target = pc + bx + 2
+        elseif opcode == op.TFORPREP then target = pc + bx + 1
+        elseif opcode == op.FORLOOP or opcode == op.TFORLOOP then target = pc + 1 - bx end
+        if target then
+            local first, last = math.max(0, math.min(pc, target)), math.min(count, math.max(pc, target))
+            if first < last then
+                coverage[first], coverage[last] = (coverage[first] or 0) + 1, (coverage[last] or 0) - 1
+            end
         end
-        content = file:read("*a")
-        file:close()
-	end
-
-	-- Parse source file
-	local functions = {}
-	-- Escape dots in module name for pattern matching
-	-- Example: "game.logic" becomes "game%.logic"
-	local escaped_modname = modname:gsub("%.", "%%.")
-	local pattern = "function%s+" .. escaped_modname .. "%.(%w+)%s*%("
-	local line_num = 0
-
-	for line in content:gmatch("[^\n]*") do
-		line_num = line_num + 1
-		local func_name = line:match(pattern)
-		if func_name then
-			-- Store mapping: "filepath(line)" -> "function_name"
-			functions[string.format("%s(%d)", filepath, line_num)] = func_name
-		end
-	end
-
-	return functions
+    end
+    local depth = 0
+    for pc = 0, count - 1 do depth = depth + (coverage[pc] or 0); conditional[pc] = depth > 0 end
+    for _, position in ipairs(ranges) do boundaries[position] = true end
+    local registers, active, links, dependents = {}, {}, {}, {}
+    local declarations = {}
+    for _, name in ipairs(data.locals) do declarations[name] = (declarations[name] or 0) + 1 end
+    for name, occurrences in pairs(declarations) do
+        if occurrences > 1 then links[name] = "?" end
+    end
+    local unknown = {}
+    local function literal(value) return { literal = value } end
+    local function read(register)
+        local id = active[register]
+        if id then return { path = data.locals[id] } end
+        return registers[register] or unknown
+    end
+    local function link(path, source, uncertain)
+        if uncertain then source = "?" end
+        if source == path then return end
+        if source then
+            if links[path] and links[path] ~= source then source = "?" end
+            links[path] = source
+        elseif links[path] then links[path] = "?" end
+    end
+    local function depends(binding, path)
+        return binding == path or binding:sub(1, #path + 1) == path .. "."
+            or binding:find("[=" .. path .. "]", 1, true)
+            or binding:find("[=" .. path .. ".", 1, true)
+    end
+    local function watch(child, name)
+        local function prefixes(path)
+            while path do
+                local entries = dependents[path] or {}
+                dependents[path], entries[child] = entries, true
+                path = path:match("^(.*)%.[^.]+$")
+            end
+        end
+        prefixes(name)
+        for symbol in name:gmatch("%[=([^%]]+)%]") do prefixes(symbol) end
+    end
+    local function invalidate(path, value)
+        if not path or value.path == path then return end
+        -- An alias is a snapshot, not a live reference to the source variable
+        -- or field. Rebinding that source must not redirect the alias's path.
+        for destination, source in pairs(links) do
+            if depends(source, path) then links[destination] = "?" end
+        end
+        for child in pairs(dependents[path] or {}) do
+            if child.name and depends(child.name, path) then child.name, child.kind = nil, 5 end
+        end
+    end
+    local bind
+    bind = function(value, path, kind, uncertain, seen)
+        if not path then return end
+        uncertain = uncertain or value.uncertain
+        if value.path then link(path, value.path, uncertain); return end
+        link(path, nil, uncertain)
+        if value.fn then
+            local child = children[value.fn]
+            child.name, child.kind = path, (uncertain or value.conditional) and 5 or kind
+            watch(child, path)
+        elseif value.fields then
+            seen = seen or {}
+            if seen[value] then return end
+            seen[value] = true
+            for _, entry in ipairs(value.fields) do
+                bind(entry.value, field(path, entry.key), kind == 3 and 3 or 2,
+                    uncertain or entry.conditional, seen)
+            end
+        end
+    end
+    local function write(register, value, pc)
+        if conditional[pc] then
+            local copy = {}
+            for key, item in pairs(value) do copy[key] = item end
+            copy.uncertain = true
+            value = copy
+        end
+        registers[register] = value
+        if active[register] then
+            local path = data.locals[active[register]]
+            invalidate(path, value)
+            bind(value, path, 1, conditional[pc])
+        end
+    end
+    local function synchronize(pc)
+        if not boundaries[pc] then return end
+        local nextactive, register = {}, 0
+        for i = 1, #data.locals do
+            if ranges[i * 2 - 1] <= pc and pc < ranges[i * 2] then
+                nextactive[register] = i
+                if active[register] ~= i then bind(registers[register] or unknown, data.locals[i], 1, conditional[pc - 1]) end
+                register = register + 1
+            end
+        end
+        active = nextactive
+    end
+    local function upvalue(index)
+        local capture = data.upvalues[index + 1]
+        return capture and { path = capture.name == "_ENV" and "" or capture.name } or unknown
+    end
+    local function get(base, key)
+        if base.path == "" and declarations[key.literal] then links[key.literal] = "?" end
+        return { path = field(base.path, key), uncertain = base.uncertain or key.uncertain }
+    end
+    local function set(base, key, value, pc)
+        local uncertain = conditional[pc] or base.uncertain or key.uncertain
+        if base.path then
+            local path = field(base.path, key)
+            invalidate(path, value)
+            bind(value, path, 2, uncertain)
+        elseif base.fields then
+            base.fields[#base.fields + 1] = { key = key, value = value, conditional = uncertain }
+            bind(value, field("$", key), 3, uncertain)
+        end
+    end
+    local returnroot
+    local function returned(value)
+        local root = not value.uncertain and (value.path or (value.fields and "$")) or false
+        if returnroot == nil then returnroot = root
+        elseif returnroot ~= root then returnroot = false end
+        data.root = returnroot or nil
+        if value.fields then bind(value, "$", 2, value.uncertain)
+        elseif value.fn then bind(value, "@return", 4) end
+    end
+    for pc = 0, count - 1 do
+        synchronize(pc)
+        local word = instructions[pc]
+        local opcode, a, b, c = word & 127, (word >> 7) & 255, (word >> 16) & 255, word >> 24
+        local bx, k = word >> 15, (word & 0x8000) ~= 0
+        local function constant(index) return literal(constants[index + 1]) end
+        local function rk(index) return k and constant(index) or read(index) end
+        if opcode == op.MOVE then write(a, read(b), pc)
+        elseif opcode == op.LOADI or opcode == op.LOADF then write(a, literal(bx - 65535), pc)
+        elseif opcode == op.LOADK then write(a, constant(bx), pc)
+        elseif opcode == op.LOADKX then write(a, constant(instructions[pc + 1] >> 7), pc)
+        elseif opcode == op.LOADFALSE or opcode == op.LFALSESKIP then write(a, literal(false), pc)
+        elseif opcode == op.LOADTRUE then write(a, literal(true), pc)
+        elseif opcode == op.LOADNIL then for i = a, a + b do write(i, unknown, pc) end
+        elseif opcode == op.GETUPVAL then write(a, upvalue(b), pc)
+        elseif opcode == op.SETUPVAL then
+            local value, path = read(a), upvalue(b).path
+            invalidate(path, value); bind(value, path, 1, conditional[pc])
+        elseif opcode == op.GETTABUP then write(a, get(upvalue(b), constant(c)), pc)
+        elseif opcode == op.GETFIELD then write(a, get(read(b), constant(c)), pc)
+        elseif opcode == op.GETI then write(a, get(read(b), literal(c)), pc)
+        elseif opcode == op.GETTABLE then write(a, get(read(b), read(c)), pc)
+        elseif opcode == op.SETTABUP then set(upvalue(a), constant(b), rk(c), pc)
+        elseif opcode == op.SETFIELD then set(read(a), constant(b), rk(c), pc)
+        elseif opcode == op.SETI then set(read(a), literal(b), rk(c), pc)
+        elseif opcode == op.SETTABLE then set(read(a), read(b), rk(c), pc)
+        elseif opcode == op.NEWTABLE then write(a, { fields = {} }, pc)
+        elseif opcode == op.SETLIST then
+            local n, offset = (word >> 16) & 63, word >> 22
+            if k then offset = offset + (instructions[pc + 1] >> 7) * 1024 end
+            if n == 0 then n = maxstack - a - 1 end
+            for i = 1, n do set(read(a), literal(offset + i), read(a + i), pc) end
+        elseif opcode == op.CLOSURE then write(a, { fn = bx + 1, conditional = conditional[pc] }, pc)
+        elseif opcode == op.SELF then
+            local base = read(b)
+            write(a + 1, base, pc); write(a, get(base, constant(c)), pc)
+        elseif opcode == op.CALL or opcode == op.VARARG then
+            for i = a, maxstack - 1 do write(i, unknown, pc) end
+        elseif opcode == op.RETURN1 or (opcode == op.RETURN and b == 2) then returned(read(a))
+        elseif opcode == op.TFORCALL then
+            for i = a + 4, a + 3 + c do write(i, unknown, pc) end
+        elseif opcode == op.FORPREP then
+            for i = a, a + 2 do registers[i] = unknown end
+        elseif (modes[opcode] & 8) ~= 0 then write(a, unknown, pc) end
+    end
+    local serialized = {}
+    for destination, source in pairs(links) do serialized[#serialized + 1] = destination .. "\t" .. source .. "\n" end
+    table.sort(serialized)
+    data.links = #serialized > 0 and table.concat(serialized) or nil
 end
 
---[[
-Load a module with hotfix support.
-
-This is similar to require() but registers the module with the hotfix system.
-
-@param name string - Module name
-@return any - Module return value
-]] --
-function hotfix.require(name)
-	assert(type(name) == "string")
-	local _LOADED = assert(debug.getregistry()._LOADED, "_LOADED not found")
-	if _LOADED[name] then
-		return _LOADED[name]
-	end
-	local loader, arg = findloader(name)
-	local ret = loader(name, arg) or true
-	loaders[name] = loader
-	origin[name] = loader
-	_LOADED[name] = ret
-	return ret
+local function index_bindings(loader, recursive)
+    local result = {}
+    local function visit(path)
+        local data = core.info(loader, path)
+        data.kind = 0
+        result[path] = data
+        local children = {}
+        for i = 1, data.children do children[i] = visit(path .. string.pack("<I4", i)) end
+        -- Runtime additions need only module-level bindings. The offline
+        -- order checker also analyzes nested declarations for diagnostics.
+        if recursive ~= false or path == "" then analyze(data, children, core.code(loader, path)) end
+        return data
+    end
+    visit("")
+    return result
 end
 
---[[
-Register a module with hotfix support.
+-- Binding metadata is used only to locate newly added fields, never to match
+-- existing closures. All reads during key resolution use captured state.
 
-Used for modules that are already loaded but need hotfix support.
-
-@param name string - Module name
-@param loader function - Module loader function
-@param ret any - Module return value
-@return any - Module return value
-]] --
-function hotfix.register(name, loader, ret)
-	assert(type(name) == "string")
-	local _LOADED = assert(debug.getregistry()._LOADED, "_LOADED not found")
-	if _LOADED[name] then
-		return _LOADED[name]
-	end
-	loaders[name] = loader
-	origin[name] = loader
-	_LOADED[name] = ret
-	return ret
+local function parts(path)
+    local result, position = {}, 1
+    while position <= #path do
+        local value, last
+        if path:sub(position, position) == "[" then
+            last = assert(path:find("]", position, true), "invalid export path")
+            local key = path:sub(position + 1, last - 1)
+            if key:sub(1, 1) == "=" then value = { symbol = key:sub(2) }
+            elseif key:sub(1, 1) == "#" then
+                value = key:sub(2):gsub("%x%x", function(byte) return string.char(tonumber(byte, 16)) end)
+            else value = assert(tonumber(key), "invalid export key") end
+        else
+            local first
+            first, last = path:find("[^.%[%]]+", position)
+            assert(first == position, "invalid export path")
+            value = path:sub(first, last)
+        end
+        result[#result + 1] = value
+        position = last + 2
+    end
+    return result
 end
 
---[[
-================================================================================
-Upvalue Collection & Management
-================================================================================
-]] --
-
---[[
-Recursively collect upvalues from a function and its nested functions.
-
-Purpose:
-  This builds a complete map of all upvalues in the module, which is needed
-  to properly link new functions to the existing upvalue environment. When
-  we hotfix a module, new function implementations must share the same upvalue
-  state as the old functions to maintain consistency.
-
-Upvalue Structure:
-  Each entry in the 'uv' table has this structure:
-  {
-    func: function - The function that owns this upvalue
-    index: number - Upvalue index in the function (1-based)
-    id: lightuserdata - Unique upvalue ID from debug.upvalueid()
-    value: any - Current value of the upvalue
-  }
-
-Collection Strategy:
-  1. Direct upvalues: Collect from function f
-  2. Function-type upvalues: Recursively collect (if from same source file)
-  3. Table-type upvalues: Collect if table contains functions from same source
-  4. _ENV: Always collected but treated specially (global environment)
-
-Special Cases:
-  - _ENV: Always ignored in validation to avoid conflicts with global environment
-  - Functions from other files: Skipped to avoid collecting framework code
-  - Method tables: Only collect if ALL values are functions from same source
-
-Why Check Source Files?
-  We only want to hotfix functions from the module being updated, not framework
-  functions or functions from other modules. Checking source file ensures we
-  don't accidentally modify unrelated code.
-
-@param f function - Function to collect upvalues from
-@param uv table - Accumulator for upvalue information (modified in-place)
-@param source string - Source file path for filtering (only collect from this file)
-]] --
-local function collect_uv(f, uv, source)
-	local i = 1
-	while true do
-		local name, value = getupvalue(f, i)
-		if name == nil then break end
-		local id = upvalueid(f, i)
-
-		-- Special handling for _ENV
-		-- _ENV is the global environment table, always available
-		-- We collect it but don't validate it strictly
-		if name == "_ENV" then
-			uv[name] = { func = f, index = i, id = id, value = value }
-			goto continue
-		end
-
-		if uv[name] then
-			-- Upvalue already collected from another function
-			-- Verify consistency: same upvalue name MUST have same ID
-			-- If they differ, it means we have ambiguous local variables
-			-- This should never happen in well-formed Lua code
-			assert(uv[name].id == id, string.format("ambiguity local value %s", name))
-		else
-			-- New upvalue, store it
-			uv[name] = { func = f, index = i, id = id, value = value }
-
-			-- Recursively collect from function-type upvalues
-			if type(value) == "function" then
-				-- IMPORTANT: Only process if function is from the same source file
-				-- This prevents us from collecting and modifying framework functions
-				if getinfo(value, "S").short_src == source then
-					collect_uv(value, uv, source)
-				end
-			-- Collect from table-type upvalues (method tables)
-			-- Only if ALL values are functions from the same source file
-			-- This handles cases like: local methods = { foo = function() ... end }
-			elseif type(value) == "table" then
-				for k, v in next, value do
-					if type(v) == "function" then
-						-- Skip this table if it contains functions from other source files
-						-- This prevents collecting framework method tables
-						if getinfo(v, "S").short_src ~= source then
-							break
-						end
-						collect_uv(v, uv, source)
-					elseif k ~= "__index" then
-						-- Table must contain only functions (except __index metamethod)
-						-- If we find other types, stop processing this table
-						break
-					end
-				end
-			end
-		end
-		::continue::
-		i = i + 1
-	end
-end
-
---[[
-Collect all upvalues from module's root functions.
-
-@param root table - Module table containing functions
-@param source string - Source file path
-@param proto_map table - Diff mapping
-@return table - Complete upvalue map
-]] --
-local function collect_all_uv(root, source)
-	local upvalue_funcs = {}
-	for _, v in pairs(root) do
-		if type(v) == "function" then
-			collect_uv(v, upvalue_funcs, source)
-		end
-	end
-
-	-- Ensure _ENV exists
-	if not upvalue_funcs["_ENV"] then
-		upvalue_funcs["_ENV"] = { func = collect_uv, index = 1 }
-	end
-	return upvalue_funcs
-end
-
---[[
-================================================================================
-Function Linking
-================================================================================
-]] --
-
---[[
-Link new function's upvalues to old module's upvalues.
-
-Purpose:
-  When we add a new function during a hotfix, it must share state with the
-  existing module. This is achieved by making the new function's upvalues
-  point to the SAME memory locations as the old module's upvalues through
-  NAME MATCHING.
-
-How Upvalue Linking Works:
-  In Lua, upvalues are shared references. upvaluejoin matches upvalues by NAME:
-    debug.upvaluejoin(new_func, i, old_func, j)
-  This makes new_func's upvalue at index i point to the same memory location
-  as old_func's upvalue at index j, IF they have the SAME NAME.
-
-Process:
-  1. Iterate through all upvalues of the new function, getting name (uvname)
-  2. Look up same-named upvalue info in old module: upvalues[uvname]
-     - Returns {func, index, id, value} - the function that owns this upvalue
-  3. If found and name != "_ENV", use upvaluejoin to connect them
-     - upvaluejoin(new_func, i, old_uv.func, old_uv.index)
-     - Makes new function's i-th upvalue reference old function's upvalue
-  4. If upvalue is a function, recursively link it (nested functions)
-  5. Ensure _ENV is properly set (global environment access)
-
-Key Point - Name Matching and Info Lookup:
-  upvalues[uvname] looks up by NAME and returns the INFO about which function
-  owns this upvalue and at what index position. Then upvaluejoin uses this info
-  to connect new function's upvalue to the exact memory location in old function.
-  Only upvalues with matching names can be found and joined.
-
-  IMPORTANT: The index positions may be DIFFERENT in new and old functions!
-  - Lookup is based on NAME: upvalues[uvname] searches by name
-  - Connection uses the INDICES from lookup: upvaluejoin(new_f, i, old_f, j)
-  - Same name "counter" could be at index 2 in new_func and index 1 in old_func
-
-Example:
-  Old module: local counter = 0
-              function old_func()
-                  -- "counter" is old_func's 1st upvalue (index=1)
-                  counter = counter + 1
-              end
-
-  New function: local config = {}  -- new_func's 1st upvalue (index=1)
-                local counter = 0  -- new_func's 2nd upvalue (index=2)
-                function new_func()
-                    -- "counter" is new_func's 2nd upvalue (index=2)
-                    counter = counter + 1
+local function index_exports(index)
+    local root = index.root
+    local links, children, fields, identities, bound = {}, {}, {}, {}, {}
+    for dest, source in (root.data.links or ""):gmatch("([^\t\n]+)\t([^\n]+)\n") do
+        local old = links[dest]
+        links[dest] = source ~= "?" and (old == nil or old == source) and source or false
+    end
+    local function canonical(path, ancestors)
+        if ancestors and ancestors[path] then return end
+        local original, seen = path, {}
+        while path do
+            local first, rest = path:match("^([^.]+)(.*)$")
+            local key, alias, suffix = path, links[path], ""
+            if alias == nil then key, alias, suffix = first, links[first], rest end
+            if alias == false or seen[key] then return end
+            if alias == nil then
+                if not path:find("[=", 1, true) then return path end
+                local nested, valid = {}, true
+                for name in pairs(ancestors or {}) do nested[name] = true end
+                nested[original] = true
+                local result = path:gsub("%[=([^%]]+)%]", function(symbol)
+                    local origin = canonical(symbol, nested)
+                    if not origin then valid = false; return "" end
+                    return "[=" .. origin .. "]"
+                end)
+                if valid then return result end
+                return
+            end
+            seen[key], path = true, alias .. suffix
+        end
+    end
+    local function add(node, path, owner, alias)
+        local field = { node = node, path = parts(path), owner = owner, alias = alias, binding = (owner or "$") .. ":" .. path }
+        for _, part in ipairs(field.path) do
+            if type(part) == "table" then
+                field.dynamic = true
+                local origin = parts(part.symbol)
+                local first = origin[1]
+                part.origins = {}
+                if root.locals[first] == 1 then
+                    table.remove(origin, 1)
+                    part.origins[1] = { capture = "$::" .. first, path = origin }
+                elseif not root.locals[first] then part.origins[1] = { capture = "$::_ENV", path = origin } end
+                for alias in pairs(links) do
+                    if alias ~= first and root.locals[alias] == 1 then
+                        local source = canonical(alias)
+                        if source == part.symbol or (source and part.symbol:sub(1, #source + 1) == source .. ".") then
+                            part.origins[#part.origins + 1] = { capture = "$::" .. alias, path = parts(part.symbol:sub(#source + 2)) }
+                        end
+                    end
                 end
-
-  Lookup and Join Process:
-  → upvalues["counter"] returns {func: old_func, index: 1, ...}
-  → upvaluejoin(new_func, 2, old_func, 1)  -- Note: indices 2 and 1 differ!
-  → Both functions' "counter" upvalues now point to SAME memory
-  → They share the same counter variable despite different index positions
-
-@param f function - New function to link
-@param upvalues table - Old module's upvalue map {name -> {func, index, id, value}}
-]] --
-local function link_func_upvalue(f, upvalues)
-	if type(f) ~= "function" then return end
-
-	local i = 1
-	while true do
-		local uvname, value = getupvalue(f, i)
-		if uvname == nil then break end
-
-		if type(value) == "function" then
-			-- Recursively link nested functions
-			-- Nested functions may also have upvalues that need linking
-			link_func_upvalue(value, upvalues)
-		elseif upvalues[uvname] and uvname ~= "_ENV" then
-			-- Look up same-named upvalue INFO in old module by name
-			-- upvalues[uvname] returns {func, index, id, value}
-			-- This tells us which function owns this upvalue and at what position
-			local old_uv = upvalues[uvname]
-
-			-- Use upvaluejoin to connect new function's upvalue to old function's upvalue
-			-- upvaluejoin(new_func, i, old_uv.func, old_uv.index)
-			-- Makes new_func's i-th upvalue reference the same memory location
-			-- as old_uv.func's old_uv.index-th upvalue
-			upvaluejoin(f, i, old_uv.func, old_uv.index)
-
-			-- Now both functions' same-named upvalues point to SAME memory
-			-- Example: If old_uv = {func: old_func, index: 1, ...}
-			-- Then new_func's "data" upvalue now points to old_func's 1st upvalue's memory
-		end
-		i = i + 1
-	end
-
-	-- Ensure _ENV is properly set
-	-- _ENV is the environment table that provides access to globals
-	-- Every function needs a valid _ENV to access global functions and tables
-	i = 1
-	while true do
-		local uvname, value = getupvalue(f, i)
-		if uvname == nil then break end
-		if uvname == "_ENV" then
-			-- If _ENV is nil, set it from the old module or global _ENV
-			if value == nil and upvalues["_ENV"] then
-				setupvalue(f, i, upvalues["_ENV"].value or _ENV)
-			end
-			break
-		end
-		i = i + 1
-	end
+            end
+        end
+        fields[#fields + 1], bound[node.key] = field, true
+        if alias then identities[field.binding] = true end
+    end
+    local module = root.data.root and canonical(root.data.root)
+    for _, node in ipairs(index.top) do
+        local name = node.data.name and canonical(node.data.name)
+        if name then
+            -- Ambiguous aliases cannot be used to add fields. They do not
+            -- prevent body updates to closures already present at runtime.
+            if children[name] ~= nil then children[name] = false else children[name] = node end
+            if node.data.kind == 2 then
+                local prefix = module and module .. "."
+                if prefix and name:sub(1, #prefix) == prefix then add(node, name:sub(#prefix + 1))
+                else
+                    local owner, rest = name:match("^([^.]+)%.(.+)$")
+                    if owner and root.locals[owner] == 1 then add(node, rest, "$::" .. owner) end
+                end
+            end
+        end
+    end
+    if module then
+        local prefix = module .. "."
+        for dest, source in pairs(links) do
+            local first, rest = dest:match("^([^.]+)(.*)$")
+            local base = canonical(first)
+            local destination = base and base .. rest
+            local target = source and canonical(source)
+            local node = target and children[target]
+            if node and destination and destination:sub(1, #prefix) == prefix then
+                add(node, destination:sub(#prefix + 1), nil, true)
+            end
+        end
+    end
+    return fields, identities, bound
 end
 
---[[
-Check if new function only references upvalues that exist in old module BY NAME.
-
-This validation ensures that new functions don't introduce dependencies
-on upvalues that don't exist in the running module. Since upvaluejoin matches
-by NAME, we check if each upvalue name in the new function exists in old module.
-
-Process:
-  1. Iterate through new function's upvalues, get name (uvname)
-  2. Check if upvalues[uvname] exists (name lookup in old module)
-  3. If not found and name != "_ENV", it's a missing upvalue
-  4. Recursively check nested functions
-
-@param f function - New function to check
-@param funcname string - Function name for error messages
-@param upvalues table - Old module's upvalue map {name -> {func, index, id, value}}
-@return boolean - true if valid
-@return string|nil - Error message if invalid
-]] --
-local function check_func_upvalue(f, funcname, upvalues)
-	if type(f) ~= "function" then
-		return true
-	end
-
-	local missing_upvalues = {}
-	local i = 1
-	while true do
-		local uvname, value = getupvalue(f, i)
-		if uvname == nil then break end
-
-		if type(value) == "function" then
-			-- Recursively check nested functions
-			local ok, errmsg = check_func_upvalue(value, funcname, upvalues)
-			if not ok then
-				return false, errmsg
-			end
-		elseif not upvalues[uvname] and uvname ~= "_ENV" then
-			-- Upvalue doesn't exist in old module
-			table.insert(missing_upvalues, uvname)
-		end
-		i = i + 1
-	end
-
-	if #missing_upvalues > 0 then
-		return false, string.format(
-			"New function '%s' references upvalue(s) not exist in old module: %s",
-			funcname or "unknown",
-			table.concat(missing_upvalues, ", ")
-		)
-	end
-	return true
+-- Check declaration order without executing loaders or changing module state.
+function hotfix.check_order(oldloader, newloader)
+    local beforebindings, afterbindings = index_bindings(oldloader), index_bindings(newloader)
+    local errors, uncertain = {}, {}
+    local function visit(path, label)
+        local old, new = beforebindings[path], afterbindings[path]
+        if new.children < old.children then
+            errors[#errors + 1] = label .. ": declarations removed"
+        end
+        local counts = {}
+        for i = 1, old.children do
+            local name = beforebindings[path .. string.pack("<I4", i)].name
+            if name then counts[name] = (counts[name] or 0) + 1 end
+        end
+        for i = 1, math.min(old.children, new.children) do
+            local child = path .. string.pack("<I4", i)
+            local before, after = beforebindings[child], afterbindings[child]
+            local location = label .. "/" .. i
+            if before.name and after.name and before.name ~= after.name then
+                errors[#errors + 1] = location .. ": " .. before.name .. " -> " .. after.name
+            elseif not before.name or not after.name or counts[before.name] > 1 then
+                uncertain[#uncertain + 1] = location .. ": anonymous or repeated binding requires review"
+            end
+            visit(child, location)
+        end
+    end
+    visit("", "$")
+    return #errors == 0 and #uncertain == 0, errors, uncertain
 end
 
---[[
-================================================================================
-Core Hotfix Logic: Upvalue Reference Redirection
-================================================================================
-
-This is the heart of the hotfix system. We make new functions' upvalues reference
-the same memory locations as old module's upvalues through NAME MATCHING, then
-assign new functions to module positions.
-
-The Two-Step Process:
-  Step 1: Upvalue Linking (via upvaluejoin)
-    - For each upvalue in new function, get its name (uvname)
-    - Look up same-named upvalue in old module: upvalues[uvname]
-    - Use upvaluejoin to make them point to SAME memory location
-    - This creates SHARED STATE between new and old functions
-
-  Step 2: Function Assignment
-    - Module table: Module.table[key] = new_function
-    - Upvalue: setupvalue(parent_func, index, new_function)
-
-Key Insight - Name Matching:
-  upvaluejoin works by NAME, not position. If new function has upvalue "counter"
-  and old module has upvalue "counter", they can be joined. If names don't match,
-  they can't be joined (validation will fail).
-
-Example:
-  Old module:
-    local counter = 0  -- This upvalue is named "counter"
-    function M.get() return counter end
-
-  New function:
-    function M.increment() counter = counter + 1 end  -- References "counter" by name
-
-  After hotfix:
-    - upvalues["counter"] finds old module's counter upvalue
-    - upvaluejoin makes new function's "counter" point to SAME memory
-    - Both functions share the same counter variable
-    - Module.increment = new_function (assigned to module table)
-
-Algorithm:
-  1. Find the original version of each function (via origin_functions)
-  2. Make new function's same-named upvalues reference old module's upvalues
-  3. For function-type upvalues, recursively process them
-  4. Collect all updates in a transaction table
-  5. Apply all updates atomically
-
-Why Transaction Pattern?
-  We collect all updates first, then apply atomically. This ensures
-  all-or-nothing semantics - if anything fails, no partial updates occur.
-
-@param root table - Module table containing functions
-@param proto_map table - Diff mapping (old_proto -> new_func) from hotfix.diff()
-@param upvalues table - Complete upvalue map {name -> {func, index, id, value}}
-]] --
-local function hotfix_(root, proto_map, upvalues)
-	local exclude = {}
-
-	--[[
-	Make function's same-named upvalues reference old module's upvalues.
-
-	Critical Implementation Detail:
-	  We ALWAYS work with the ORIGINAL function, not intermediate versions.
-	  This is essential for supporting multiple rounds of hotfixes.
-
-	Process:
-	  1. Resolve to original function via origin_functions
-	  2. For each upvalue in the function, get its name
-	  3. Look up same-named upvalue in old module: global[name]
-	  4. Use upvaluejoin to make them point to SAME memory location
-	  5. Recursively process function-type upvalues
-
-	Example - Multiple Hotfixes:
-	  Round 1: v1 → v2
-	    - Make v2's same-named upvalues reference old module
-	    - origin_functions[v2] = v1
-
-	  Round 2: v2 → v3
-	    - Module now has v2, but we process original v1
-	    - origin_functions[v2] = v1, so we find and update v1
-	    - Make v1's same-named upvalues reference old module (keep in sync)
-	    - origin_functions[v3] = v1 (still points to original)
-
-	  Without this, Round 2 would only update v2, and old references to v1
-	  would stay stale.
-
-	@param global table - Old module's upvalue map {name -> {func, index, id, value}}
-	@param f function - Function to update (will be resolved to original)
-	]] --
-	local function update_func(global, f)
-		if exclude[f] then return end
-		exclude[f] = true
-
-		-- Critical: Always use the ORIGINAL function, not intermediate versions
-		-- This is why origin_functions exists - to support multiple hotfixes
-		--
-		-- Example: v1 → v2 → v3
-		--   After 2nd hotfix, module.foo points to v2
-		--   origin_functions[v2] = v1
-		--   We need to update v1's upvalues, not v2's
-		--   Because all old references still point to v1
-		f = origin_functions[f] or f
-
-		local oldf = nil
-		local i = 1
-		while true do
-			local name, value = getupvalue(f, i)
-			if name == nil then
-				oldf = f
-				break
-			end
-
-			if type(value) == "function" then
-				-- Recursively update function-type upvalues
-				-- These are nested functions that also need updating
-				update_func(global, value)
-			else
-				-- Make this upvalue reference old module's SAME-NAMED upvalue
-				-- global[name] looks up by NAME to find matching upvalue in old module
-				-- upvaluejoin makes them point to the SAME memory location
-				local old_uv = global[name]
-				if old_uv then
-					upvaluejoin(f, i, old_uv.func, old_uv.index)
-				end
-			end
-			i = i + 1
-		end
-
-		-- Store mapping: new version -> original version
-		-- Don't overwrite if already exists (preserve original across multiple hotfixes)
-		-- This ensures that after v1→v2→v3, we still know v1 is the original
-		origin_functions[f] = origin_functions[f] or oldf
-
-		-- Set _ENV if needed
-		-- Every function needs _ENV to access global functions and tables
-		i = 1
-		while true do
-			local name, value = getupvalue(f, i)
-			if name == nil then break end
-			if name == "_ENV" then
-				if value == nil then
-					setupvalue(f, i, _ENV)
-				end
-				break
-			end
-			i = i + 1
-		end
-	end
-
-	--[[
-	Update all functions in a table structure.
-
-	This handles both:
-	1. Direct function values in tables (e.g., module.foo = function() end)
-	2. Function-type upvalues in the upvalue map (local f = function() end)
-
-	For each function found:
-	  - Look up its prototype in the diff map
-	  - If changed, call update_func to update its upvalues
-	  - Record the update in transaction table (for atomic application)
-
-	Transaction Structure:
-	  Key: { uptable = table, key = name } for table entries
-	       OR upvalue structure for upvalue entries
-	  Value: New function implementation
-
-	@param oldfuncs table - Table containing functions to update
-	@param newproto table - Diff mapping (old_proto -> new_func)
-	@param res table - Transaction accumulator (modified in-place)
-	]] --
-	local function update_funcs(oldfuncs, newproto, res)
-		for name, v in next, oldfuncs do
-			if type(v) == "function" then
-				-- Direct function in table (e.g., module.foo)
-				-- Check if this function's prototype appears in the diff
-				local newf = newproto[proto(v)]
-				if newf then
-					-- Function has changed, update it
-					update_func(upvalues, newf)
-					-- Schedule update: module[name] = newf
-					res[{ uptable = oldfuncs, key = name }] = newf
-				end
-			elseif type(v) == "table" and v.value and v.func then
-				-- Upvalue structure from collect_uv
-				-- Format: { func = f, index = i, id = id, value = value }
-				local tp = type(v.value)
-				if tp == "function" then
-					-- Function-type upvalue (local f = function() end)
-					local newf = newproto[proto(v.value)]
-					if newf then
-						-- Function has changed, update it
-						update_func(upvalues, newf)
-						-- Schedule update: setupvalue(v.func, v.index, newf)
-						res[v] = newf
-					end
-				elseif tp == "table" and name ~= "_ENV" then
-					-- Table-type upvalue (local methods = { ... })
-					-- Recursively process functions within this table
-					update_funcs(v.value, newproto, res)
-				end
-			end
-		end
-	end
-
-	-- Transaction pattern: collect all updates first, then apply atomically
-	-- This ensures all-or-nothing semantics - either all updates succeed or none do
-	-- Phase 1: Collect all updates (above)
-	-- Phase 2: Apply all updates (below)
-	local transactions = {}
-	update_funcs(upvalues, proto_map, transactions)
-	update_funcs(root, proto_map, transactions)
-
-	-- Apply all updates atomically
-	-- At this point, all function upvalues have been updated via update_func
-	-- Now we update the table references to point to the new functions
-	for k, v in pairs(transactions) do
-		if k.uptable then
-			-- Update function in table: module[key] = new_function
-			k.uptable[k.key] = v
-		else
-			-- Update function-type upvalue: setupvalue(func, index, new_function)
-			setupvalue(k.func, k.index, v)
-		end
-	end
+-- State binding and update commit.
+local function fail(message)
+    error(message, 0)
 end
 
---[[
-================================================================================
-Main Entry Point: hotfix.update
-================================================================================
+local function cell(f, i)
+    local value
+    local function hold() return value end
+    upvaluejoin(hold, 1, f, i)
+    return { func = hold, index = 1, id = upvalueid(hold, 1) }
+end
 
-Update a loaded module with a new version.
+local function read(c)
+    local _, value = getupvalue(c.func, c.index)
+    return value
+end
 
-This is the main API for performing hotfixes. It implements a three-phase
-process to ensure safe, atomic updates:
+-- Function order is a source contract: existing children retain their ordinal;
+-- newly declared functions are appended in their own lexical parent.
+local function index_loader(loader)
+    local bindings = index_bindings(loader, false)
+    local index = { byproto = {}, bykey = {}, declarations = {}, top = {}, persistent = { ["$::_ENV"] = true } }
+    local function visit(path, key, parent)
+        local data = bindings[path]
+        local node = { prototype_path = path, key = key, data = data,
+            modulelevel = parent == index.root, captures = {}, locals = {}, scope = {} }
+        if not parent then index.root = node end
+        if node.modulelevel then index.top[#index.top + 1] = node end
+        for i, name in ipairs(data.locals) do
+            node.locals[name] = (node.locals[name] or 0) + 1
+            if data.localscope[i] then node.scope[name] = true end
+        end
+        for i, uv in ipairs(data.upvalues) do
+            if not uv.name then fail("hotfix requires unstripped upvalue names") end
+            if not parent then
+                if uv.name ~= "_ENV" then fail("invalid module loader capture: " .. uv.name) end
+                node.captures[i] = "$::_ENV"
+            elseif uv.instack then
+                -- Shared declarations use a lexical-owner key. Shadowed names
+                -- remain private to each closure; joining its actual old cell
+                -- preserves sharing without merging independent instances.
+                local owner = parent.locals[uv.name] == 1 and parent.key or node.key
+                node.captures[i] = owner .. "::" .. uv.name
+                if parent == index.root and owner == "$" and parent.scope[uv.name] then
+                    index.persistent[node.captures[i]] = true
+                end
+            else
+                node.captures[i] = parent.captures[uv.index]
+                if not node.captures[i] then fail("invalid capture origin: " .. uv.name) end
+            end
+            if uv.name == "_ENV" then node.environment = i end
+        end
+        if node.modulelevel and data.kind == 1 then
+            index.declarations["$::" .. data.name] = node
+        end
+        node.descriptor = { key = key, captures = node.captures, environment = node.environment, children = data.children }
+        index.byproto[data.proto], index.bykey[key] = node, node
+        for i = 1, data.children do visit(path .. string.pack("<I4", i), key .. "/" .. i, node) end
+        if not parent then node.data = { root = data.root, links = data.links }
+        else
+            node.data = node.modulelevel and { kind = data.kind, name = data.name } or nil
+            node.locals, node.scope = nil, nil
+        end
+    end
+    visit("", "$", nil)
+    return index
+end
 
-Phase 1: Parse & Validate
-  - Parse source file to get function names
-  - Generate diff between old and new versions
-  - Check for compatibility issues
-  - NO side effects, NO module state changes
+local function compact_index(index)
+    for id, node in pairs(index.byproto) do index.byproto[id] = node.descriptor end
+    return { byproto = index.byproto, root = index.root.descriptor, persistent = index.persistent }
+end
 
-Phase 2: Check New Functions
-  - Verify new functions only reference existing upvalues
-  - Collect all validation errors
-  - Still NO state changes
+function hotfix.addsearcher(fn)
+    assert(type(fn) == "function", "searcher must be a function")
+    searchers[#searchers + 1] = fn
+end
 
-Phase 3: Apply Updates
-  - Update existing functions (hotfix_)
-  - Add new functions to module
-  - Link upvalues
-  - This is the only phase that modifies state
+-- The built-in loader reads fresh source, bypassing Moon's loadfile code cache.
+local function findloader(name, environment)
+    local messages = {}
+    for _, searcher in ipairs(searchers) do
+        local f, extra = searcher(name)
+        if type(f) == "function" then return f, extra end
+        if type(f) == "string" then messages[#messages + 1] = f end
+    end
+    local path, err = package.searchpath(name, package.path)
+    if path then
+        local file, openerr = io.open(path, "rb")
+        if not file then fail(openerr) end
+        local source = file:read("a")
+        file:close()
+        local f, loaderr = load(source, "@" .. path, "t", environment or _ENV)
+        if not f then fail(loaderr) end
+        return f, path
+    end
+    messages[#messages + 1] = err or ""
+    fail("module '" .. name .. "' not found:" .. table.concat(messages))
+end
 
-If any phase fails, the function returns false and the module remains
-unchanged. This provides atomic update semantics.
+local function collect(record)
+    local cells, functions = {}, {}
+    for key, entries in pairs(record.cells) do
+        cells[key] = {}
+        for id, c in pairs(entries) do cells[key][id] = c end
+    end
+    local seen = {}
+    local _, environment = next(record.cells["$::_ENV"] or {})
+    if environment and type(read(environment)) == "table" then seen[read(environment)] = true end
+    local walk
+    walk = function(value)
+        local kind = type(value)
+        if kind == "function" then
+            local original = value
+            value = resolve(value)
+            local node = record.functions[value] or record.index.byproto[proto(value)]
+            if not node then return end -- foreign Lua and C functions are untouched
+            if functions[value] then return end
+            record.functions[value] = node
+            local captures = {}
+            functions[value] = { node = node, captures = captures, representative = original }
+            for i, key in ipairs(node.captures) do
+                local id = upvalueid(value, i)
+                local entries = cells[key] or {}
+                cells[key] = entries
+                local c = entries[id] or cell(value, i)
+                entries[id] = c
+                captures[key] = c
+                if node.environment ~= i then
+                    walk(read(c))
+                end
+            end
+        elseif kind == "table" and not seen[value] then
+            seen[value] = true
+            for _, item in next, value do walk(item) end
+            walk(debug.getmetatable(value))
+        end
+    end
+    walk(record.root)
+    for key, entries in pairs(record.cells) do
+        if key ~= "$::_ENV" then
+            for _, c in pairs(entries) do walk(read(c)) end
+        end
+    end
+    -- Keep known instances reachable only through external references updatable.
+    -- Snapshot before walk() can discover another current target.
+    local tracked = {}
+    for f in pairs(record.functions) do tracked[#tracked + 1] = f end
+    for _, f in ipairs(tracked) do walk(f) end
+    return cells, functions
+end
 
-@param name string - Module name
-@param updatename string|nil - Name to search for update (defaults to name)
-@return boolean - Success status
-@return any - Module table on success, error message on failure
+function hotfix.register(name, loader, root)
+    assert(type(name) == "string", "module name must be a string")
+    assert(type(loader) == "function" and proto(loader), "loader must be a Lua function")
+    assert(type(root) == "table", "hotfix module must return a table")
+    local loaded = debug.getregistry()._LOADED
+    if modules[name] then return modules[name].root end
+    if loaded[name] ~= nil and loaded[name] ~= root then fail("module already loaded with a different value: " .. name) end
+    local index = index_loader(loader)
+    local _, fields = index_exports(index)
+    local record = { root = root, loader = loader, index = compact_index(index), exports = fields, cells = {},
+        functions = setmetatable({}, { __mode = "k" }) }
+    -- Anchor the actual loader environment even when exported functions use no globals.
+    for i, key in ipairs(record.index.root.captures) do
+        local c = cell(loader, i)
+        record.cells[key] = { [c.id] = c }
+    end
+    local cells = collect(record)
+    for key, entries in pairs(cells) do
+        if record.index.persistent[key] then record.cells[key] = entries end
+    end
+    modules[name], loaded[name] = record, root
+    return root
+end
 
-Usage Example:
-  local ok, result = hotfix.update("game.logic.player")
-  if ok then
-    print("Hotfix successful")
-  else
-    print("Hotfix failed:", result)
-  end
-]] --
+function hotfix.require(name)
+    assert(type(name) == "string", "module name must be a string")
+    local loaded = debug.getregistry()._LOADED
+    if loaded[name] then return loaded[name] end
+    local loader, extra = findloader(name)
+    local root = loader(name, extra)
+    return hotfix.register(name, loader, root)
+end
+
+-- Kept for callers that inspect structural compatibility. State validation is
+-- performed against actual closure instances by update(), not prototype names.
+function hotfix.diff(oldloader, newloader)
+    local ok, mapping, errors, added = pcall(function()
+        local old, new = index_loader(oldloader), index_loader(newloader)
+        local result, missing, additions = {}, {}, {}
+        for key, node in pairs(old.bykey) do
+            local replacement = new.bykey[key]
+            if replacement then result[proto(oldloader, node.prototype_path)] = clone(newloader, replacement.prototype_path)
+            else missing[#missing + 1] = "removed function: " .. key end
+        end
+        for key, node in pairs(new.bykey) do
+            if not old.bykey[key] then additions[#additions + 1] = clone(newloader, node.prototype_path) end
+        end
+        return result, #missing > 0 and missing or nil, additions
+    end)
+    if not ok then return {}, { tostring(mapping) }, {} end
+    return mapping, errors, added
+end
+
+local function prepare(record, loader)
+    local newindex = index_loader(loader)
+    for key in pairs(record.index.persistent) do newindex.persistent[key] = true end
+    local oldpaths = {}
+    for _, node in pairs(record.index.byproto) do
+        oldpaths[node.key] = true
+        local replacement = newindex.bykey[node.key]
+        if not replacement or replacement.descriptor.children < node.children then fail("removed function: " .. node.key) end
+    end
+    local fields, identities, bound = index_exports(newindex)
+    for binding in pairs(record.exports) do identities[binding] = true end
+    for _, node in ipairs(newindex.top) do
+        if not oldpaths[node.key] and node.data.kind ~= 1 and not bound[node.key] then
+            fail("new function has no static export binding: " .. node.key)
+        end
+    end
+    local cells, functions = collect(record)
+    local plan, replacements, fresh, prepared, extra_cells = {}, {}, {}, {}, {}
+    local additions = {}
+    local function addfield(parent, key, f)
+        local keys = additions[parent] or {}
+        additions[parent] = keys
+        if keys[key] then
+            if keys[key] ~= f then fail("conflicting additions to field: " .. tostring(key)) end
+            return
+        end
+        keys[key] = f
+        plan[#plan + 1] = { target = parent, key = key, new = f }
+    end
+    local function unique(key)
+        local entries = cells[key]
+        local found
+        for _, c in pairs(entries or {}) do
+            if found then fail("ambiguous state binding: " .. key) end
+            found = c
+        end
+        return found
+    end
+    local build
+    build = function(node, old)
+        if old and replacements[old] then return replacements[old] end
+        if not old and fresh[node] then return fresh[node] end
+        local f = clone(loader, node.prototype_path)
+        if old then replacements[old] = f end
+        if not old then fresh[node] = f end
+        prepared[f] = node.descriptor
+        local own = old and functions[old].captures or {}
+        for i, key in ipairs(node.captures) do
+            local c = own[key] or unique(key) or extra_cells[key]
+            if not c then
+                local declaration = newindex.declarations[key]
+                if declaration and declaration.modulelevel then
+                    local value
+                    local function hold() return value end
+                    c = { func = hold, index = 1, id = upvalueid(hold, 1) }
+                    extra_cells[key] = c -- publish before binding recursive helpers
+                    setupvalue(hold, 1, build(declaration))
+                else
+                    fail("missing state binding for " .. node.key .. ": " .. key)
+                end
+            end
+            upvaluejoin(f, i, c.func, c.index)
+        end
+        return f
+    end
+    local function replace(old)
+        if replacements[old] then return replacements[old] end
+        local key = functions[old].node.key
+        local node = newindex.bykey[key]
+        if not node then fail("removed live function: " .. key) end
+        return build(node, old)
+    end
+    for old in pairs(functions) do
+        plan[#plan + 1] = { func = old, old = old, new = replace(old) }
+    end
+    local function existing_export(node)
+        local existing
+        for candidate, instance in pairs(functions) do
+            if instance.node.key == node.key then
+                if existing then fail("ambiguous exported closure: " .. node.key) end
+                existing = candidate
+            end
+        end
+        return existing
+    end
+    local function fieldkey(part)
+        if type(part) ~= "table" then return part, true end
+        local found, available
+        for _, origin in ipairs(part.origins) do
+            local c = unique(origin.capture)
+            local value = c and read(c)
+            for _, key in ipairs(origin.path) do
+                if type(value) ~= "table" then value = nil; break end
+                value = rawget(value, key)
+            end
+            local kind = type(value)
+            if (kind == "string" or kind == "number" or kind == "boolean") and value == value then
+                if available and found ~= value then fail("ambiguous enum key state: " .. part.symbol) end
+                found, available = value, true
+            end
+        end
+        return found, available
+    end
+    local function preparefield(field)
+        if record.exports[field.binding] or (not field.alias and oldpaths[field.node.key]) then return end
+        local node, path = field.node, field.path
+        local keys = path
+        if field.dynamic then
+            keys = {}
+            for i, part in ipairs(path) do
+                local key, available = fieldkey(part)
+                if not available then
+                    fail("missing enum key state: " .. part.symbol)
+                end
+                keys[i] = key
+            end
+        end
+        local parent = record.root
+        if field.owner then
+            local owner = unique(field.owner)
+            if not owner or type(read(owner)) ~= "table" then fail("missing method table: " .. field.owner) end
+            parent = read(owner)
+        end
+        for i = 1, #keys - 1 do
+            parent = rawget(parent, keys[i])
+            if type(parent) ~= "table" then fail("missing parent table for " .. node.key) end
+        end
+        local key = keys[#keys]
+        local old = rawget(parent, key)
+        if old ~= nil and type(old) ~= "function" then fail("field is not a function: " .. node.key) end
+        if old then
+            local instance = functions[resolve(old)]
+            if not instance or instance.node.key ~= node.key then fail("field binding changed: " .. node.key) end
+        else
+            local existing = existing_export(node)
+            addfield(parent, key, existing and functions[existing].representative or build(node))
+        end
+    end
+    for _, field in ipairs(fields) do preparefield(field) end
+    -- Persist only module-level cells; factory instances remain collectible.
+    local persistent = {}
+    for key, entries in pairs(cells) do
+        if newindex.persistent[key] then persistent[key] = entries end
+    end
+    for key, c in pairs(extra_cells) do persistent[key] = { [c.id] = c } end
+    return { writes = plan, index = compact_index(newindex), exports = identities, functions = prepared, cells = persistent, loader = loader }
+end
+
+local function commit(record, plan)
+    local applied = 0
+    -- Create the weak registry before publishing any target or table changes.
+    -- Needed closures remain anchored by planned writes and their captures.
+    local tracked = setmetatable(plan.functions, { __mode = "k" })
+    local function assign(item, value)
+        if item.func then redirect(item.func, value)
+        else rawset(item.target, item.key, value) end
+    end
+    local ok, err = pcall(function()
+        for i, item in ipairs(plan.writes) do
+            assign(item, item.new)
+            applied = i
+        end
+    end)
+    if not ok then
+        for i = applied, 1, -1 do assign(plan.writes[i], plan.writes[i].old) end
+        fail(err)
+    end
+    -- Every live alias reaches its current target through the shared slot.
+    record.functions, record.exports = tracked, plan.exports
+    record.loader, record.index, record.cells = plan.loader, plan.index, plan.cells
+    return record.root
+end
+
 function hotfix.update(name, updatename)
-	assert(type(name) == "string")
-	updatename = updatename or name
-	local _LOADED = debug.getregistry()._LOADED
-
-	if not _LOADED then
-		return false, "no module loaded"
-	end
-
-	local root = _LOADED[name]
-
-	-- Module not loaded yet, just load it normally
-	if root == nil then
-		return true, hotfix.require(name)
-	end
-
-	-- Module not registered with hotfix system
-	if loaders[name] == nil then
-		return false, "Can't find last version : " .. name
-	end
-
-	local loader = findloader(updatename)
-
-	--[[
-	================================================================================
-	Phase 1: Parse and Validate (No State Changes)
-	================================================================================
-
-	In this phase we:
-	  1. Collect all upvalues from the currently running module
-	  2. Generate diff between old and new module versions
-	  3. Check for compatibility issues
-	  4. Parse source file to identify new function names
-
-	Critical: NO side effects, NO module state changes
-	If any check fails, we return early with error - module remains unchanged
-	]] --
-
-	local upvalues = collect_all_uv(root, name)
-
-	-- Generate diff between old and new versions
-	-- This compares function structures without executing any code
-	-- Returns:
-	--   diff: Map of old_proto -> new_func (which functions changed)
-	--   err: Array of error messages (compatibility issues)
-	--   newfuncs: Array of new functions (functions added in new version)
-	local diff, err, newfuncs = hotfix.diff(loaders[name], loader, upvalues)
-	if err and #err > 0 then
-		return false, table.concat(err, "\n")
-	end
-
-	-- If new functions were added, parse source file to get their names
-	-- We need names to add them to the module table (module.new_func = ...)
-	if #newfuncs > 0 then
-		local module_name = name:match("([^/]+)%.lua$") or name
-		local parsed_funcs, parse_err = hotfix.parse_module_functions(name, module_name)
-		if not parsed_funcs then
-			return false, "Cannot parse source file: " .. (parse_err or "unknown error")
-		end
-
-		-- Build map: function_name -> function_object
-		-- This converts newfuncs from array of functions to named map
-		local newfuns_err = {}
-		local newfuns_map = {}
-		for _, newf in ipairs(newfuncs) do
-			local info = funcinfo(newf)
-			local function_name = parsed_funcs and parsed_funcs[info]
-			if not function_name then
-				table.insert(newfuns_err, "Cannot find new function name for " .. info)
-			else
-				newfuns_map[function_name] = newf
-			end
-		end
-
-		if #newfuns_err > 0 then
-			return false, table.concat(newfuns_err, "\n")
-		end
-
-		newfuncs = newfuns_map
-	end
-
-	--[[
-	================================================================================
-	Phase 2: Check New Functions (Still No State Changes)
-	================================================================================
-
-	Validate that new functions only reference upvalues that exist in the
-	running module. This prevents runtime errors from missing dependencies.
-
-	Example:
-	  Old module: local counter = 0
-	  New function: function new_func() counter = counter + 1 end
-	  ✓ Valid - 'counter' exists
-
-	  New function: function bad_func() missing_var = 1 end
-	  ✗ Invalid - 'missing_var' doesn't exist
-
-	Critical: Still NO state changes
-	]] --
-	local check_errors = {}
-
-	-- Validate that new functions only reference existing upvalues
-	-- This prevents adding functions that depend on nonexistent state
-	for fn_name, fn_ptr in pairs(newfuncs) do
-		local ok, errmsg = check_func_upvalue(fn_ptr, fn_name, upvalues)
-		if not ok then
-			table.insert(check_errors, errmsg)
-		end
-	end
-
-	if #check_errors > 0 then
-		return false, table.concat(check_errors, "\n")
-	end
-
-	--[[
-	================================================================================
-	Phase 3: Apply Updates (NOW we modify state)
-	================================================================================
-
-	All validation passed. Now we actually modify the running module:
-	  1. Update existing functions by redirecting their upvalues (hotfix_)
-	  2. Update the loader reference (for next hotfix round)
-	  3. Add new functions to module table
-	  4. Link new functions' upvalues to existing module state
-
-	This is the ONLY phase that modifies state. If we reach here, we're
-	committed to applying all changes.
-	]] --
-
-	-- Update existing functions
-	-- This modifies the original functions' upvalues to point to new implementations
-	-- After this, calling any old function reference will execute new code
-	hotfix_(root, diff, upvalues)
-	loaders[name] = loader
-
-	-- If no new functions, we're done
-	if not next(newfuncs) then
-		return true, _LOADED[name]
-	end
-
-	print(string.format("hotfix: module '%s' updated with %d new functions", name, #newfuncs))
-
-	-- Add new functions to module
-	-- Link their upvalues to the existing module environment
-	local added = {}
-	for k, v in pairs(newfuncs) do
-		link_func_upvalue(v, upvalues)  -- Make v share state with old module
-		root[k] = v                      -- Add to module table
-		table.insert(added, k)           -- Track for logging
-	end
-
-	if #added > 0 then
-		print(string.format("hotfix: added %d new fields: %s", #added, table.concat(added, ", ")))
-	end
-
-	return true, _LOADED[name]
+    assert(type(name) == "string", "module name must be a string")
+    local acquired
+    local ok, result = pcall(function()
+        if debug.getregistry()._LOADED[name] == nil then return hotfix.require(name) end
+        local record = modules[name]
+        if not record then fail("module is not registered for hotfix: " .. name) end
+        if record.updating then fail("module is already updating: " .. name) end
+        record.updating, acquired = true, record
+        if record.root ~= debug.getregistry()._LOADED[name] then fail("loaded module was replaced: " .. name) end
+        local _, environment_cell = next(record.cells["$::_ENV"] or {})
+        if not environment_cell then fail("module environment is unavailable") end
+        local environment = read(environment_cell)
+        local loader = findloader(updatename or name, environment)
+        return commit(record, prepare(record, loader))
+    end)
+    if acquired then acquired.updating = nil end
+    if not ok then return false, tostring(result) end
+    return true, result
 end
 
 return hotfix

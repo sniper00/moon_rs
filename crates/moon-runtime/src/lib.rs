@@ -453,10 +453,12 @@ macro_rules! lua_require {
 }
 
 pub fn luaopen_custom_libs(state: LuaState) {
+    // LuaState is NonNull<lua_State>, which has the raw pointer's ABI.
+    // The registration wrappers below ensure the state is non-null.
     unsafe extern "C-unwind" {
-        fn luaopen_sharetable_core(L: *mut ffi::lua_State) -> c_int;
-        // C module amalgamated into the lua55 static lib (lua/clonefunc.c via onelua.c).
-        fn luaopen_clonefunc(L: *mut ffi::lua_State) -> c_int;
+        fn luaopen_sharetable_core(state: LuaState) -> c_int;
+        // C module amalgamated into the lua static lib (lua/lhotfix.c via onelua.c).
+        fn luaopen_hotfix_core(state: LuaState) -> c_int;
     }
 
     #[cfg(feature = "httpc")]
@@ -491,18 +493,8 @@ pub fn luaopen_custom_libs(state: LuaState) {
     lua_require!(state, "cluster.core", lua_cluster::luaopen_cluster);
     #[cfg(feature = "grpc")]
     lua_require!(state, "grpc.core", lua_grpc::luaopen_grpc);
-    unsafe {
-        ffi::luaL_requiref(
-            state.as_ptr(),
-            cstr!("sharetable.core"),
-            luaopen_sharetable_core,
-            0,
-        );
-        ffi::lua_pop(state.as_ptr(), 1);
-
-        ffi::luaL_requiref(state.as_ptr(), cstr!("clonefunc"), luaopen_clonefunc, 0);
-        ffi::lua_pop(state.as_ptr(), 1);
-    }
+    lua_require!(state, "sharetable.core", luaopen_sharetable_core);
+    lua_require!(state, "hotfix.core", luaopen_hotfix_core);
 }
 
 /// Eagerly build the process-wide message-decoder table.

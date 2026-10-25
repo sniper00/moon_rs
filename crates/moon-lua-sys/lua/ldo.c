@@ -678,7 +678,12 @@ int luaD_pretailcall (lua_State *L, CallInfo *ci, StkId func,
     case LUA_VLCF:  /* light C function */
       return precallC(L, func, status, fvalue(s2v(func)));
     case LUA_VLCL: {  /* Lua function */
-      Proto *p = clLvalue(s2v(func))->p;
+      LClosure *cl = clLvalue(s2v(func));
+      if (l_unlikely(cl->redirect)) {
+        cl = currentclosure(cl);
+        setclLvalue2s(L, func, cl);
+      }
+      Proto *p = cl->p;
       int fsize = p->maxstacksize;  /* frame size */
       int nfixparams = p->numparams;
       int i;
@@ -727,7 +732,12 @@ CallInfo *luaD_precall (lua_State *L, StkId func, int nresults) {
       return NULL;
     case LUA_VLCL: {  /* Lua function */
       CallInfo *ci;
-      Proto *p = clLvalue(s2v(func))->p;
+      LClosure *cl = clLvalue(s2v(func));
+      if (l_unlikely(cl->redirect)) {
+        cl = currentclosure(cl);
+        setclLvalue2s(L, func, cl);
+      }
+      Proto *p = cl->p;
       int narg = cast_int(L->top.p - func) - 1;  /* number of real arguments */
       int nfixparams = p->numparams;
       int fsize = p->maxstacksize;  /* frame size */

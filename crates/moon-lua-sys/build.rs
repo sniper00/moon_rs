@@ -63,4 +63,5 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=lualib");
+    println!("cargo:rerun-if-changed=lua");
 }

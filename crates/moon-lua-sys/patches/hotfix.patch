@@ -1,0 +1,102 @@
+diff --git a/crates/moon-lua-sys/lua/ldo.c b/crates/moon-lua-sys/lua/ldo.c
+--- a/crates/moon-lua-sys/lua/ldo.c
++++ b/crates/moon-lua-sys/lua/ldo.c
+@@ -678,7 +678,12 @@
+     case LUA_VLCF:  /* light C function */
+       return precallC(L, func, status, fvalue(s2v(func)));
+     case LUA_VLCL: {  /* Lua function */
+-      Proto *p = clLvalue(s2v(func))->p;
++      LClosure *cl = clLvalue(s2v(func));
++      if (l_unlikely(cl->redirect)) {
++        cl = currentclosure(cl);
++        setclLvalue2s(L, func, cl);
++      }
++      Proto *p = cl->p;
+       int fsize = p->maxstacksize;  /* frame size */
+       int nfixparams = p->numparams;
+       int i;
+@@ -727,7 +732,12 @@
+       return NULL;
+     case LUA_VLCL: {  /* Lua function */
+       CallInfo *ci;
+-      Proto *p = clLvalue(s2v(func))->p;
++      LClosure *cl = clLvalue(s2v(func));
++      if (l_unlikely(cl->redirect)) {
++        cl = currentclosure(cl);
++        setclLvalue2s(L, func, cl);
++      }
++      Proto *p = cl->p;
+       int narg = cast_int(L->top.p - func) - 1;  /* number of real arguments */
+       int nfixparams = p->numparams;
+       int fsize = p->maxstacksize;  /* frame size */
+diff --git a/crates/moon-lua-sys/lua/lfunc.c b/crates/moon-lua-sys/lua/lfunc.c
+--- a/crates/moon-lua-sys/lua/lfunc.c
++++ b/crates/moon-lua-sys/lua/lfunc.c
+@@ -37,6 +37,7 @@
+   GCObject *o = luaC_newobj(L, LUA_VLCL, sizeLclosure(nupvals));
+   LClosure *c = gco2lcl(o);
+   c->p = NULL;
++  c->redirect = NULL;
+   c->nupvalues = cast_byte(nupvals);
+   while (nupvals--) c->upvals[nupvals] = NULL;
+   return c;
+diff --git a/crates/moon-lua-sys/lua/lgc.c b/crates/moon-lua-sys/lua/lgc.c
+--- a/crates/moon-lua-sys/lua/lgc.c
++++ b/crates/moon-lua-sys/lua/lgc.c
+@@ -672,11 +672,12 @@
+ static l_mem traverseLclosure (global_State *g, LClosure *cl) {
+   int i;
+   markobjectN(g, cl->p);  /* mark its prototype */
++  markobjectN(g, cl->redirect);
+   for (i = 0; i < cl->nupvalues; i++) {  /* visit its upvalues */
+     UpVal *uv = cl->upvals[i];
+     markobjectN(g, uv);  /* mark upvalue */
+   }
+-  return 1 + cl->nupvalues;
++  return 1 + cl->nupvalues + (cl->redirect != NULL);
+ }
+ 
+ 
+diff --git a/crates/moon-lua-sys/lua/lobject.h b/crates/moon-lua-sys/lua/lobject.h
+--- a/crates/moon-lua-sys/lua/lobject.h
++++ b/crates/moon-lua-sys/lua/lobject.h
+@@ -708,9 +708,14 @@
+ typedef struct LClosure {
+   ClosureHeader;
+   struct Proto *p;
++  UpVal *redirect;  /* optional closed cell containing this instance's latest body */
+   UpVal *upvals[1];  /* list of upvalues */
+ } LClosure;
+ 
++/* All generations of one closure instance share a single target cell. This
++** lookup never follows a chain and must only happen when entering a call. */
++#define currentclosure(cl) ((cl)->redirect ? clLvalue((cl)->redirect->v.p) : (cl))
++
+ 
+ typedef union Closure {
+   CClosure c;
+diff --git a/crates/moon-lua-sys/lua/ltests.c b/crates/moon-lua-sys/lua/ltests.c
+--- a/crates/moon-lua-sys/lua/ltests.c
++++ b/crates/moon-lua-sys/lua/ltests.c
+@@ -458,6 +458,12 @@
+   GCObject *clgc = obj2gco(cl);
+   int i;
+   checkobjrefN(g, clgc, cl->p);
++  checkobjrefN(g, clgc, cl->redirect);
++  if (cl->redirect) {
++    lua_assert(!upisopen(cl->redirect));
++    lua_assert(ttisLclosure(cl->redirect->v.p));
++    lua_assert(clLvalue(cl->redirect->v.p)->redirect == cl->redirect);
++  }
+   for (i=0; i<cl->nupvalues; i++) {
+     UpVal *uv = cl->upvals[i];
+     if (uv) {
+diff --git a/crates/moon-lua-sys/lua/onelua.c b/crates/moon-lua-sys/lua/onelua.c
+--- a/crates/moon-lua-sys/lua/onelua.c
++++ b/crates/moon-lua-sys/lua/onelua.c
+@@ -134,3 +134,5 @@
+ #ifdef MAKE_LUAC
+ #include "luac.c"
+ #endif
++
++#include "lhotfix.c"

@@ -125,7 +125,9 @@ impl BoxedValue {
             value,
         });
         Self {
-            ptr: NonNull::from(Box::leak(payload)).cast(),
+            // SAFETY: Box::into_raw returns a non-null pointer. This owner
+            // reconstructs the Box in Drop or into_inner.
+            ptr: unsafe { NonNull::new_unchecked(Box::into_raw(payload)) }.cast(),
         }
     }
 

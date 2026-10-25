@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LOCAL = ["buffer", "json", "seri", "schema", "random", "uuid", "zset", "tobeclose",
          "sharetable", "service", "request_pool", "socket", "socket_frame", "http",
          "httpd", "websocket", "cluster", "cluster_selfconnect", "grpc",
-         "grpc/test_grpc_server", "grpc/test_grpc_close", "runtime_libraries", "http_stream", "watchdog"]
+         "grpc/test_grpc_server", "grpc/test_grpc_close", "runtime_libraries", "hotfix", "http_stream", "watchdog"]
 
 
 def free_port():
@@ -57,7 +57,7 @@ def main():
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
     selected = set(args.only or ["local", "postgres", "mysql", "mongodb", "redis", "etcd"])
     if not args.skip_build:
-        subprocess.run(["cargo", "build", "-p", "moon-app", "--locked"], cwd=ROOT, check=True)
+        subprocess.run(["cargo", "build", "--workspace", "--all-features", "--locked"], cwd=ROOT, check=True)
     results = {}
 
     def lua(test, settings=None, timeout=60):

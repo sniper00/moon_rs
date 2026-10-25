@@ -135,4 +135,4 @@
 #include "luac.c"
 #endif
 
-#include "clonefunc.c"
+#include "lhotfix.c"

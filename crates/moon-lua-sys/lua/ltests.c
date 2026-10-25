@@ -458,6 +458,12 @@ static void checkLclosure (global_State *g, LClosure *cl) {
   GCObject *clgc = obj2gco(cl);
   int i;
   checkobjrefN(g, clgc, cl->p);
+  checkobjrefN(g, clgc, cl->redirect);
+  if (cl->redirect) {
+    lua_assert(!upisopen(cl->redirect));
+    lua_assert(ttisLclosure(cl->redirect->v.p));
+    lua_assert(clLvalue(cl->redirect->v.p)->redirect == cl->redirect);
+  }
   for (i=0; i<cl->nupvalues; i++) {
     UpVal *uv = cl->upvals[i];
     if (uv) {
